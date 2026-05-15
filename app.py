@@ -19,7 +19,6 @@ cache = {
     "updated_at": None
 }
 
-
 def fetch_deals():
     print("⏰ Buscando negócios do Agendor...")
     all_deals = []
@@ -28,7 +27,12 @@ def fetch_deals():
 
     while True:
         try:
-            params = {"per_page": 100, "page": page, "withCustomFields": "true"}
+            params = {
+                "per_page": 100,
+                "page": page,
+                "withCustomFields": "true",
+                "withProducts": "true"       # ← incluir produtos
+            }
             r = requests.get(
                 f"{AGENDOR_BASE}/deals",
                 headers=HEADERS,
@@ -59,7 +63,6 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"✅ Cache atualizado: {len(all_deals)} negócios às {cache['updated_at']}")
 
-
 @app.route("/")
 def index():
     return jsonify({
@@ -68,7 +71,6 @@ def index():
         "cached_deals": len(cache["deals"]),
         "updated_at": cache["updated_at"]
     })
-
 
 @app.route("/deals")
 def deals():
@@ -80,16 +82,13 @@ def deals():
         }
     })
 
-
 @app.route("/funnels")
 def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
-
 # Busca imediata ao iniciar + agendamento de 1 em 1 hora
 fetch_deals()
-
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals, "interval", hours=1)
 scheduler.start()
