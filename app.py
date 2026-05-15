@@ -19,19 +19,34 @@ cache = {
     "updated_at": None
 }
 
+def fetch_products_for_deal(deal_id):
+    """Busca produtos de um negócio específico."""
+    try:
+        r = requests.get(
+            f"{AGENDOR_BASE}/deals/{deal_id}/products",
+            headers=HEADERS,
+            timeout=15
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("data", [])
+    except Exception as e:
+        print(f"Erro ao buscar produtos do negócio {deal_id}: {e}")
+    return []
+
 def fetch_deals():
     print("⏰ Buscando negócios do Agendor...")
     all_deals = []
     page = 1
     total_count = None
 
+    # 1) Busca todos os negócios
     while True:
         try:
             params = {
                 "per_page": 100,
                 "page": page,
-                "withCustomFields": "true",
-                "withProducts": "true"       # ← incluir produtos
+                "withCustomFields": "true"
             }
             r = requests.get(
                 f"{AGENDOR_BASE}/deals",
@@ -57,6 +72,21 @@ def fetch_deals():
         if not next_link or len(page_deals) == 0:
             break
         page += 1
+
+    # 2) Para negócios ganhos (dealStatus.id == 2), busca produtos separadamente
+    won_deals = [d for d in all_deals if d.get("dealStatus", {}).get("id") == 2]
+    print(f"🔍 Buscando produtos de {len(won_deals)} negócios ganhos...")
+
+    for i, deal in enumerate(won_deals):
+        deal_id = deal.get("id")
+        products = fetch_products_for_deal(deal_id)
+        if products:
+            deal["products_entities"] = products
+            print(f"  [{i+1}/{len(won_deals)}] Negócio {deal_id}: {len(products)} produto(s)")
+        # Pequena pausa para não sobrecarregar a API
+        time.sleep(0.1)
+
+    print(f"✅ Produtos carregados para negócios ganhos.")
 
     cache["deals"] = all_deals
     cache["total"] = total_count or len(all_deals)
