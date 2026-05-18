@@ -31,13 +31,9 @@ def fetch_products_for_deal(deal_id):
         print(f"Erro produtos negócio {deal_id}: {e}")
     return []
 
-def fetch_deals():
-    print("Buscando negocios do Agendor...")
-    all_deals = []
-    page = 1
-    total_count = None
-
-    while True:
+def fetch_page(page):
+    """Busca uma página com até 3 tentativas."""
+    for attempt in range(3):
         try:
             params = {
                 "per_page": 100,
@@ -48,12 +44,26 @@ def fetch_deals():
                 f"{AGENDOR_BASE}/deals",
                 headers=HEADERS,
                 params=params,
-                timeout=30
+                timeout=60
             )
             r.raise_for_status()
-            data = r.json()
+            return r.json()
         except Exception as e:
-            print(f"Erro na pagina {page}: {e}")
+            print(f"Tentativa {attempt+1}/3 falhou na pagina {page}: {e}")
+            if attempt < 2:
+                time.sleep(5)
+    return None
+
+def fetch_deals():
+    print("Buscando negocios do Agendor...")
+    all_deals = []
+    page = 1
+    total_count = None
+
+    while True:
+        data = fetch_page(page)
+        if data is None:
+            print(f"Pagina {page} falhou 3 vezes, encerrando busca.")
             break
 
         page_deals = data.get("data", [])
@@ -68,11 +78,12 @@ def fetch_deals():
         if not next_link or len(page_deals) == 0:
             break
         page += 1
+        time.sleep(0.2)  # pausa entre páginas
 
     # Busca produtos dos ganhos
     won_deals = [d for d in all_deals if d.get("dealStatus", {}).get("id") == 2]
     print(f"Buscando produtos de {len(won_deals)} negocios ganhos...")
-    for i, deal in enumerate(won_deals):
+    for deal in won_deals:
         products = fetch_products_for_deal(deal.get("id"))
         if products:
             deal["products_entities"] = products
@@ -107,10 +118,9 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
-# Agendamento — sem fetch imediato no startup para não travar a porta
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals, "interval", hours=1, id="fetch_job")
-scheduler.add_job(fetch_deals, "date", id="startup_fetch")  # roda uma vez imediatamente via scheduler
+scheduler.add_job(fetch_deals, "date", id="startup_fetch")
 scheduler.start()
 
 if __name__ == "__main__":
