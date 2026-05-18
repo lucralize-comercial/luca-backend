@@ -4,7 +4,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 import os
 import time
-import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -22,15 +21,10 @@ cache = {
 def fetch_page(page):
     for attempt in range(3):
         try:
-            params = {
-                "per_page": 100,
-                "page": page,
-                "withCustomFields": "true"
-            }
             r = requests.get(
                 f"{AGENDOR_BASE}/deals",
                 headers=HEADERS,
-                params=params,
+                params={"per_page": 100, "page": page, "withCustomFields": "true"},
                 timeout=60
             )
             r.raise_for_status()
@@ -61,7 +55,6 @@ def fetch_deals():
         all_deals.extend(page_deals)
         print(f"Pagina {page}: {len(page_deals)} negocios ({len(all_deals)}/{total_count})")
 
-        # Salva incrementalmente a cada 10 páginas
         if page % 10 == 0:
             cache["deals"] = list(all_deals)
             cache["total"] = total_count or len(all_deals)
@@ -82,7 +75,6 @@ def fetch_deals():
 def index():
     return jsonify({
         "status": "ok",
-        "message": "Proxy Agendor rodando!",
         "cached_deals": len(cache["deals"]),
         "updated_at": cache["updated_at"]
     })
@@ -91,10 +83,7 @@ def index():
 def deals():
     return jsonify({
         "data": cache["deals"],
-        "meta": {
-            "totalCount": cache["total"],
-            "updated_at": cache["updated_at"]
-        }
+        "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]}
     })
 
 @app.route("/funnels")
@@ -102,11 +91,10 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
-# Fetch em thread separada — servidor sobe imediatamente
-threading.Thread(target=fetch_deals, daemon=True).start()
-
+# Scheduler cuida do fetch inicial e do agendamento
 scheduler = BackgroundScheduler()
-scheduler.add_job(fetch_deals, "interval", hours=1)
+scheduler.add_job(fetch_deals, "interval", hours=1, id="fetch_recorrente")
+scheduler.add_job(fetch_deals, "date", id="fetch_inicial")  # roda imediatamente via scheduler
 scheduler.start()
 
 if __name__ == "__main__":
