@@ -1,9 +1,11 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 import requests
 import os
 import time
+import sys
 
 app = Flask(__name__)
 CORS(app)
@@ -18,6 +20,9 @@ cache = {
     "updated_at": None
 }
 
+def log(msg):
+    print(msg, flush=True)  # flush=True garante que o log aparece imediatamente no Render
+
 def fetch_page(page):
     for attempt in range(3):
         try:
@@ -30,35 +35,37 @@ def fetch_page(page):
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            print(f"Tentativa {attempt+1}/3 falhou na pagina {page}: {e}")
+            log(f"Tentativa {attempt+1}/3 falhou na pagina {page}: {e}")
             if attempt < 2:
-                time.sleep(5)
+                time.sleep(10)
     return None
 
 def fetch_deals():
-    print("Buscando negocios do Agendor...")
+    log("Buscando negocios do Agendor...")
     all_deals = []
     page = 1
     total_count = None
 
     while True:
+        log(f"Buscando pagina {page}...")
         data = fetch_page(page)
         if data is None:
-            print(f"Pagina {page} falhou 3 vezes, encerrando.")
+            log(f"Pagina {page} falhou 3 vezes, encerrando.")
             break
 
         page_deals = data.get("data", [])
         if total_count is None:
             total_count = data.get("meta", {}).get("totalCount", 0)
-            print(f"Total na API: {total_count}")
+            log(f"Total na API: {total_count}")
 
         all_deals.extend(page_deals)
-        print(f"Pagina {page}: {len(page_deals)} negocios ({len(all_deals)}/{total_count})")
+        log(f"Pagina {page}: {len(page_deals)} negocios ({len(all_deals)}/{total_count})")
 
         if page % 10 == 0:
             cache["deals"] = list(all_deals)
             cache["total"] = total_count or len(all_deals)
             cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            log(f"Cache parcial salvo: {len(all_deals)} negocios")
 
         next_link = data.get("links", {}).get("next")
         if not next_link or len(page_deals) == 0:
@@ -69,7 +76,7 @@ def fetch_deals():
     cache["deals"] = all_deals
     cache["total"] = total_count or len(all_deals)
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}")
+    log(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}")
 
 @app.route("/")
 def index():
@@ -91,10 +98,9 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
-# Scheduler cuida do fetch inicial e do agendamento
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals, "interval", hours=1, id="fetch_recorrente")
-scheduler.add_job(fetch_deals, "date", id="fetch_inicial")  # roda imediatamente via scheduler
+scheduler.add_job(fetch_deals, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.start()
 
 if __name__ == "__main__":
