@@ -4,7 +4,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 import os
 import time
-import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -33,7 +32,7 @@ def fetch_products_for_deal(deal_id):
     return []
 
 def fetch_deals():
-    print("⏰ Buscando negócios do Agendor...")
+    print("Buscando negocios do Agendor...")
     all_deals = []
     page = 1
     total_count = None
@@ -54,7 +53,7 @@ def fetch_deals():
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            print(f"Erro na página {page}: {e}")
+            print(f"Erro na pagina {page}: {e}")
             break
 
         page_deals = data.get("data", [])
@@ -63,29 +62,26 @@ def fetch_deals():
             print(f"Total na API: {total_count}")
 
         all_deals.extend(page_deals)
-        print(f"Página {page}: {len(page_deals)} negócios ({len(all_deals)}/{total_count})")
+        print(f"Pagina {page}: {len(page_deals)} negocios ({len(all_deals)}/{total_count})")
 
         next_link = data.get("links", {}).get("next")
         if not next_link or len(page_deals) == 0:
             break
         page += 1
 
-    # Atualiza cache antes de buscar produtos (servidor já responde)
-    cache["deals"] = all_deals
-    cache["total"] = total_count or len(all_deals)
-    cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"✅ Cache atualizado: {len(all_deals)} negócios às {cache['updated_at']}")
-
-    # Busca produtos dos ganhos em background
+    # Busca produtos dos ganhos
     won_deals = [d for d in all_deals if d.get("dealStatus", {}).get("id") == 2]
-    print(f"🔍 Buscando produtos de {len(won_deals)} negócios ganhos...")
+    print(f"Buscando produtos de {len(won_deals)} negocios ganhos...")
     for i, deal in enumerate(won_deals):
-        deal_id = deal.get("id")
-        products = fetch_products_for_deal(deal_id)
+        products = fetch_products_for_deal(deal.get("id"))
         if products:
             deal["products_entities"] = products
         time.sleep(0.1)
-    print(f"✅ Produtos carregados.")
+
+    cache["deals"] = all_deals
+    cache["total"] = total_count or len(all_deals)
+    cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}")
 
 @app.route("/")
 def index():
@@ -111,11 +107,10 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
-# Busca inicial em thread separada para não travar o servidor
-threading.Thread(target=fetch_deals, daemon=True).start()
-
+# Agendamento — sem fetch imediato no startup para não travar a porta
 scheduler = BackgroundScheduler()
-scheduler.add_job(fetch_deals, "interval", hours=1)
+scheduler.add_job(fetch_deals, "interval", hours=1, id="fetch_job")
+scheduler.add_job(fetch_deals, "date", id="startup_fetch")  # roda uma vez imediatamente via scheduler
 scheduler.start()
 
 if __name__ == "__main__":
