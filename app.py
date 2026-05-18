@@ -4,6 +4,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 import os
 import time
+import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -77,28 +78,6 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}")
 
-    # Busca produtos dos ganhos
-    won_deals = [d for d in all_deals if d.get("dealStatus", {}).get("id") == 2]
-    print(f"Buscando produtos de {len(won_deals)} negocios ganhos...")
-    for deal in won_deals:
-        try:
-            r = requests.get(
-                f"{AGENDOR_BASE}/deals/{deal.get('id')}/products",
-                headers=HEADERS,
-                timeout=15
-            )
-            if r.status_code == 200:
-                products = r.json().get("data", [])
-                if products:
-                    deal["products_entities"] = products
-        except Exception as e:
-            print(f"Erro produtos {deal.get('id')}: {e}")
-        time.sleep(0.1)
-
-    cache["deals"] = all_deals
-    cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"Cache final com produtos: {len(all_deals)} negocios")
-
 @app.route("/")
 def index():
     return jsonify({
@@ -123,8 +102,7 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
-# Fetch no startup em thread separada para não bloquear a porta
-import threading
+# Fetch em thread separada — servidor sobe imediatamente
 threading.Thread(target=fetch_deals, daemon=True).start()
 
 scheduler = BackgroundScheduler()
