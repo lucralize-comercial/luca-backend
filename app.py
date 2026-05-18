@@ -95,9 +95,37 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache final: {len(all_deals)} negocios", flush=True)
 
+fetch_running = False
+fetch_started_at = None
+
+def fetch_deals_safe():
+    global fetch_running, fetch_started_at
+    if fetch_running:
+        print("Fetch ja em andamento, ignorando.", flush=True)
+        return
+    fetch_running = True
+    fetch_started_at = time.time()
+    try:
+        fetch_deals()
+    finally:
+        fetch_running = False
+
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "cached_deals": len(cache["deals"]), "updated_at": cache["updated_at"]})
+    return jsonify({
+        "status": "ok",
+        "cached_deals": len(cache["deals"]),
+        "updated_at": cache["updated_at"],
+        "fetch_running": fetch_running
+    })
+
+@app.route("/refresh", methods=["POST"])
+def refresh():
+    global fetch_running
+    if fetch_running:
+        return jsonify({"status": "running", "message": "Fetch já em andamento"}), 202
+    scheduler.add_job(fetch_deals_safe, "date", id="fetch_manual", replace_existing=True)
+    return jsonify({"status": "started", "message": "Atualização iniciada"}), 200
 
 @app.route("/deals")
 def deals():
@@ -109,8 +137,8 @@ def funnels():
     return jsonify(r.json())
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(fetch_deals, "interval", hours=1, id="fetch_recorrente")
-scheduler.add_job(fetch_deals, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
+scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
+scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.start()
 
 if __name__ == "__main__":
