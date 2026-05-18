@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 import requests
 import os
 import time
-import sys
 
 app = Flask(__name__)
 CORS(app)
@@ -14,14 +13,7 @@ AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f2
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 
-cache = {
-    "deals": [],
-    "total": 0,
-    "updated_at": None
-}
-
-def log(msg):
-    print(msg, flush=True)  # flush=True garante que o log aparece imediatamente no Render
+cache = {"deals": [], "total": 0, "updated_at": None}
 
 def fetch_page(page):
     for attempt in range(3):
@@ -35,37 +27,36 @@ def fetch_page(page):
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            log(f"Tentativa {attempt+1}/3 falhou na pagina {page}: {e}")
+            print(f"Tentativa {attempt+1}/3 falhou na pagina {page}: {e}", flush=True)
             if attempt < 2:
-                time.sleep(10)
+                time.sleep(5)
     return None
 
 def fetch_deals():
-    log("Buscando negocios do Agendor...")
+    print("Buscando negocios do Agendor...", flush=True)
     all_deals = []
     page = 1
     total_count = None
 
     while True:
-        log(f"Buscando pagina {page}...")
+        print(f"Buscando pagina {page}...", flush=True)
         data = fetch_page(page)
         if data is None:
-            log(f"Pagina {page} falhou 3 vezes, encerrando.")
+            print(f"Pagina {page} falhou, encerrando.", flush=True)
             break
 
         page_deals = data.get("data", [])
         if total_count is None:
             total_count = data.get("meta", {}).get("totalCount", 0)
-            log(f"Total na API: {total_count}")
+            print(f"Total na API: {total_count}", flush=True)
 
         all_deals.extend(page_deals)
-        log(f"Pagina {page}: {len(page_deals)} negocios ({len(all_deals)}/{total_count})")
+        print(f"Pagina {page}: {len(page_deals)} negocios ({len(all_deals)}/{total_count})", flush=True)
 
         if page % 10 == 0:
             cache["deals"] = list(all_deals)
             cache["total"] = total_count or len(all_deals)
             cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            log(f"Cache parcial salvo: {len(all_deals)} negocios")
 
         next_link = data.get("links", {}).get("next")
         if not next_link or len(page_deals) == 0:
@@ -76,22 +67,41 @@ def fetch_deals():
     cache["deals"] = all_deals
     cache["total"] = total_count or len(all_deals)
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    log(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}")
+    print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}", flush=True)
+
+    # Busca produtos só dos ganhos dos últimos 90 dias
+    cutoff = datetime.utcnow() - timedelta(days=180)
+    won_recent = [
+        d for d in all_deals
+        if d.get("dealStatus", {}).get("id") == 2
+        and d.get("wonAt") and datetime.strptime(d["wonAt"][:10], "%Y-%m-%d") > cutoff
+    ]
+    print(f"Buscando produtos de {len(won_recent)} negocios ganhos recentes...", flush=True)
+    for deal in won_recent:
+        try:
+            r = requests.get(
+                f"{AGENDOR_BASE}/deals/{deal['id']}/products",
+                headers=HEADERS, timeout=15
+            )
+            if r.status_code == 200:
+                products = r.json().get("data", [])
+                if products:
+                    deal["products_entities"] = products
+        except Exception as e:
+            print(f"Erro produtos {deal['id']}: {e}", flush=True)
+        time.sleep(0.1)
+
+    cache["deals"] = all_deals
+    cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"Cache final: {len(all_deals)} negocios", flush=True)
 
 @app.route("/")
 def index():
-    return jsonify({
-        "status": "ok",
-        "cached_deals": len(cache["deals"]),
-        "updated_at": cache["updated_at"]
-    })
+    return jsonify({"status": "ok", "cached_deals": len(cache["deals"]), "updated_at": cache["updated_at"]})
 
 @app.route("/deals")
 def deals():
-    return jsonify({
-        "data": cache["deals"],
-        "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]}
-    })
+    return jsonify({"data": cache["deals"], "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]}})
 
 @app.route("/funnels")
 def funnels():
