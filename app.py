@@ -21,7 +21,7 @@ def fetch_page(page):
             r = requests.get(
                 f"{AGENDOR_BASE}/deals",
                 headers=HEADERS,
-                params={"per_page": 100, "page": page, "withCustomFields": "true"},
+                params={"per_page": 100, "page": page, "withCustomFields": "true", "order_by": "updatedAt", "order_dir": "desc"},
                 timeout=60
             )
             r.raise_for_status()
