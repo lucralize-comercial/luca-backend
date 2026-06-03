@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
@@ -11,7 +11,7 @@ CORS(app)
 
 AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f20159a")
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
-HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
+HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}", "Content-Type": "application/json"}
 
 cache = {"deals": [], "total": 0, "updated_at": None}
 
@@ -69,7 +69,6 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}", flush=True)
 
-    # Busca produtos só dos ganhos dos últimos 90 dias
     cutoff = datetime.utcnow() - timedelta(days=180)
     won_recent = [
         d for d in all_deals
@@ -110,6 +109,8 @@ def fetch_deals_safe():
     finally:
         fetch_running = False
 
+# ── Rotas existentes do dashboard ──────────────────────────────────────────
+
 @app.route("/")
 def index():
     return jsonify({
@@ -135,6 +136,47 @@ def deals():
 def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
+
+# ── Rotas novas para o formulário de negócios ───────────────────────────────
+
+@app.route("/deal_stages")
+def deal_stages():
+    params = request.args.to_dict()
+    r = requests.get(f"{AGENDOR_BASE}/deal_stages", headers=HEADERS, params=params, timeout=30)
+    return jsonify(r.json()), r.status_code
+
+@app.route("/users")
+def users():
+    r = requests.get(f"{AGENDOR_BASE}/users", headers=HEADERS, timeout=30)
+    return jsonify(r.json()), r.status_code
+
+@app.route("/products")
+def products():
+    r = requests.get(f"{AGENDOR_BASE}/products", headers=HEADERS, timeout=30)
+    return jsonify(r.json()), r.status_code
+
+@app.route("/organizations")
+def organizations_get():
+    params = request.args.to_dict()
+    r = requests.get(f"{AGENDOR_BASE}/organizations", headers=HEADERS, params=params, timeout=30)
+    return jsonify(r.json()), r.status_code
+
+@app.route("/organizations", methods=["POST"])
+def organizations_post():
+    r = requests.post(f"{AGENDOR_BASE}/organizations", headers=HEADERS, json=request.get_json(), timeout=30)
+    return jsonify(r.json()), r.status_code
+
+@app.route("/organizations/<int:org_id>/deals", methods=["POST"])
+def org_deals_post(org_id):
+    r = requests.post(f"{AGENDOR_BASE}/organizations/{org_id}/deals", headers=HEADERS, json=request.get_json(), timeout=30)
+    return jsonify(r.json()), r.status_code
+
+@app.route("/people", methods=["POST"])
+def people_post():
+    r = requests.post(f"{AGENDOR_BASE}/people", headers=HEADERS, json=request.get_json(), timeout=30)
+    return jsonify(r.json()), r.status_code
+
+# ───────────────────────────────────────────────────────────────────────────
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
