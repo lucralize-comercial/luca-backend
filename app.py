@@ -136,9 +136,22 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
+@app.route("/test-history")
+def test_history():
+    return jsonify({"ok": True, "msg": "rota simples funcionando"})
+
 @app.route("/deals/<int:deal_id>/history-raw")
 def deal_history_raw(deal_id):
-    """Retorna historico bruto de um deal para diagnostico."""
+    r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/history", headers=HEADERS, timeout=15)
+    if r.status_code == 200:
+        return jsonify(r.json())
+    return jsonify({"error": r.status_code, "text": r.text[:500]}), r.status_code
+
+@app.route("/deal-history")
+def deal_history_query():
+    deal_id = request.args.get("id", "")
+    if not deal_id:
+        return jsonify({"error": "id obrigatorio"}), 400
     r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/history", headers=HEADERS, timeout=15)
     if r.status_code == 200:
         return jsonify(r.json())
