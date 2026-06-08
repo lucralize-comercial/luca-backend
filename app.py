@@ -14,7 +14,12 @@ AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# Funis para buscar histórico (ajuste conforme necessário)
+FUNIS_HISTORICO = ["Funil Comercial"]
+HISTORICO_MESES = 6
+
 cache = {"deals": [], "total": 0, "updated_at": None}
+history_cache = {"data": [], "updated_at": None}  # histórico processado por deal
 
 def fetch_page(page):
     for attempt in range(3):
@@ -32,6 +37,22 @@ def fetch_page(page):
             if attempt < 2:
                 time.sleep(5)
     return None
+
+def fetch_deal_history(deal_id):
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                f"{AGENDOR_BASE}/deals/{deal_id}/history",
+                headers=HEADERS, timeout=15
+            )
+            if r.status_code == 200:
+                return r.json().get("data", [])
+            return []
+        except Exception as e:
+            print(f"Erro historico deal {deal_id}: {e}", flush=True)
+            if attempt < 1:
+                time.sleep(2)
+    return []
 
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
@@ -70,6 +91,7 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}", flush=True)
 
+    # Busca produtos dos ganhos recentes
     cutoff = datetime.utcnow() - timedelta(days=180)
     won_recent = [
         d for d in all_deals
@@ -95,6 +117,33 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache final: {len(all_deals)} negocios", flush=True)
 
+    # Busca histórico de movimentação dos deals dos funis relevantes
+    cutoff_hist = datetime.utcnow() - timedelta(days=HISTORICO_MESES * 30)
+    deals_para_historico = [
+        d for d in all_deals
+        if d.get("dealStage", {}).get("funnel", {}).get("name") in FUNIS_HISTORICO
+        and d.get("startTime") and datetime.strptime(d["startTime"][:10], "%Y-%m-%d") > cutoff_hist
+    ]
+    print(f"Buscando historico de {len(deals_para_historico)} deals do Funil Comercial...", flush=True)
+    hist_data = []
+    for deal in deals_para_historico:
+        events = fetch_deal_history(deal["id"])
+        hist_data.append({
+            "deal_id": deal["id"],
+            "title": deal.get("title", ""),
+            "startTime": deal.get("startTime"),
+            "wonAt": deal.get("wonAt"),
+            "lostAt": deal.get("lostAt"),
+            "dealStatus": deal.get("dealStatus", {}),
+            "currentStage": deal.get("dealStage", {}),
+            "events": events
+        })
+        time.sleep(0.15)
+
+    history_cache["data"] = hist_data
+    history_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"Historico processado: {len(hist_data)} deals", flush=True)
+
 fetch_running = False
 fetch_started_at = None
 
@@ -116,7 +165,9 @@ def index():
         "status": "ok",
         "cached_deals": len(cache["deals"]),
         "updated_at": cache["updated_at"],
-        "fetch_running": fetch_running
+        "fetch_running": fetch_running,
+        "history_cached": len(history_cache["data"]),
+        "history_updated_at": history_cache["updated_at"]
     })
 
 @app.route("/refresh", methods=["POST"])
@@ -136,16 +187,18 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
+@app.route("/history-cache")
+def history_cache_route():
+    """Retorna histórico de movimentação dos deals do Funil Comercial (últimos 6 meses)."""
+    return jsonify({
+        "data": history_cache["data"],
+        "total": len(history_cache["data"]),
+        "updated_at": history_cache["updated_at"]
+    })
+
 @app.route("/test-history")
 def test_history():
     return jsonify({"ok": True, "msg": "rota simples funcionando"})
-
-@app.route("/dealhistory/<deal_id>")
-def deal_history_by_path(deal_id):
-    r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/history", headers=HEADERS, timeout=15)
-    if r.status_code == 200:
-        return jsonify(r.json())
-    return jsonify({"error": r.status_code, "text": r.text[:200]}), r.status_code
 
 @app.route("/chat", methods=["POST"])
 def chat():
