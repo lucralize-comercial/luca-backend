@@ -237,6 +237,14 @@ def chat():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/deals/<int:deal_id>/history-raw")
+def deal_history_raw(deal_id):
+    """Retorna histórico bruto de um deal para diagnóstico."""
+    r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/history", headers=HEADERS, timeout=15)
+    if r.status_code == 200:
+        return jsonify(r.json())
+    return jsonify({"error": r.status_code, "text": r.text[:500]}), r.status_code
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
