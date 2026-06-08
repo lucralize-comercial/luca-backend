@@ -12,11 +12,9 @@ CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS
 AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f20159a")
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
-
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 cache = {"deals": [], "total": 0, "updated_at": None}
-stage_history_cache = {}  # { deal_id: [ {stage_id, stage_name, entered_at}, ... ] }
 
 def fetch_page(page):
     for attempt in range(3):
@@ -34,35 +32,6 @@ def fetch_page(page):
             if attempt < 2:
                 time.sleep(5)
     return None
-
-def fetch_deal_history(deal_id):
-    """Busca o histórico de movimentação de um deal entre etapas."""
-    for attempt in range(2):
-        try:
-            r = requests.get(
-                f"{AGENDOR_BASE}/deals/{deal_id}/history",
-                headers=HEADERS,
-                timeout=15
-            )
-            if r.status_code == 200:
-                data = r.json().get("data", [])
-                # Filtra apenas eventos de mudança de etapa
-                stage_events = []
-                for event in data:
-                    if event.get("type") in ("dealStageChanged", "deal_stage_changed", "stageChanged"):
-                        stage_events.append({
-                            "stage_id": event.get("dealStage", {}).get("id") or event.get("stageId"),
-                            "stage_name": event.get("dealStage", {}).get("name") or event.get("stageName"),
-                            "entered_at": event.get("createdAt") or event.get("date")
-                        })
-                return stage_events
-            elif r.status_code == 404:
-                return []
-        except Exception as e:
-            print(f"Erro histórico deal {deal_id}: {e}", flush=True)
-            if attempt < 1:
-                time.sleep(2)
-    return []
 
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
@@ -101,7 +70,6 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}", flush=True)
 
-    # Busca produtos dos ganhos recentes
     cutoff = datetime.utcnow() - timedelta(days=180)
     won_recent = [
         d for d in all_deals
@@ -148,8 +116,7 @@ def index():
         "status": "ok",
         "cached_deals": len(cache["deals"]),
         "updated_at": cache["updated_at"],
-        "fetch_running": fetch_running,
-        "stage_history_cached": len(stage_history_cache)
+        "fetch_running": fetch_running
     })
 
 @app.route("/refresh", methods=["POST"])
@@ -169,53 +136,13 @@ def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
-@app.route("/deals/<int:deal_id>/history")
-def deal_history(deal_id):
-    """Retorna histórico de movimentação de um deal, com cache."""
-    if deal_id not in stage_history_cache:
-        stage_history_cache[deal_id] = fetch_deal_history(deal_id)
-    return jsonify({"data": stage_history_cache[deal_id], "deal_id": deal_id})
-
-@app.route("/funnel-history")
-def funnel_history():
-    """
-    Retorna para cada deal do funil especificado, as etapas que ele passou
-    e quando entrou em cada uma — baseado no histórico da API.
-    Parâmetros: funnel_name (obrigatório), date_from, date_to (YYYY-MM-DD)
-    """
-    funnel_name = request.args.get("funnel_name", "")
-    date_from = request.args.get("date_from", "")
-    date_to = request.args.get("date_to", "")
-
-    deals_do_funil = [
-        d for d in cache["deals"]
-        if d.get("dealStage", {}).get("funnel", {}).get("name") == funnel_name
-        or any(
-            (d.get("startTime", "") or "")[:10] >= date_from
-            for _ in [1] if date_from
-        )
-    ]
-
-    # Filtra por data de início se informado
-    if date_from:
-        deals_do_funil = [d for d in deals_do_funil if (d.get("startTime") or "")[:10] >= date_from]
-    if date_to:
-        deals_do_funil = [d for d in deals_do_funil if (d.get("startTime") or "")[:10] <= date_to]
-
-    result = []
-    for deal in deals_do_funil[:200]:  # limita a 200 deals por chamada
-        deal_id = deal["id"]
-        if deal_id not in stage_history_cache:
-            stage_history_cache[deal_id] = fetch_deal_history(deal_id)
-            time.sleep(0.15)
-        result.append({
-            "deal_id": deal_id,
-            "title": deal.get("title"),
-            "startTime": deal.get("startTime"),
-            "history": stage_history_cache[deal_id]
-        })
-
-    return jsonify({"data": result, "total": len(result)})
+@app.route("/deals/<int:deal_id>/history-raw")
+def deal_history_raw(deal_id):
+    """Retorna historico bruto de um deal para diagnostico."""
+    r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/history", headers=HEADERS, timeout=15)
+    if r.status_code == 200:
+        return jsonify(r.json())
+    return jsonify({"error": r.status_code, "text": r.text[:500]}), r.status_code
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -236,14 +163,6 @@ def chat():
         return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-@app.route("/deals/<int:deal_id>/history-raw")
-def deal_history_raw(deal_id):
-    """Retorna histórico bruto de um deal para diagnóstico."""
-    r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/history", headers=HEADERS, timeout=15)
-    if r.status_code == 200:
-        return jsonify(r.json())
-    return jsonify({"error": r.status_code, "text": r.text[:500]}), r.status_code
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
