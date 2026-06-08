@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
@@ -12,6 +12,8 @@ CORS(app)
 AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f20159a")
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 cache = {"deals": [], "total": 0, "updated_at": None}
 
@@ -134,6 +136,26 @@ def deals():
 def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "ANTHROPIC_API_KEY não configurada"}), 500
+    try:
+        payload = request.get_json()
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01"
+            },
+            json=payload,
+            timeout=30
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
