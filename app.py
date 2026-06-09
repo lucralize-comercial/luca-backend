@@ -178,6 +178,13 @@ def refresh():
     scheduler.add_job(fetch_deals_safe, "date", id="fetch_manual", replace_existing=True)
     return jsonify({"status": "started", "message": "Atualização iniciada"}), 200
 
+@app.route("/reset-fetch", methods=["POST"])
+def reset_fetch():
+    global fetch_running, fetch_started_at
+    fetch_running = False
+    fetch_started_at = None
+    return jsonify({"status": "ok", "message": "fetch_running resetado com sucesso"})
+
 @app.route("/deals")
 def deals():
     return jsonify({"data": cache["deals"], "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]}})
