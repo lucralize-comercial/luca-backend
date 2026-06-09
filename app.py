@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import requests
 import os
 import time
+import threading
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
@@ -14,12 +15,15 @@ AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# Funis para buscar histórico (ajuste conforme necessário)
 FUNIS_HISTORICO = ["Funil Comercial"]
-HISTORICO_MESES = 6
+HISTORICO_DIAS = 30  # apenas últimos 30 dias
 
 cache = {"deals": [], "total": 0, "updated_at": None}
-history_cache = {"data": [], "updated_at": None}  # histórico processado por deal
+history_cache = {"data": [], "updated_at": None, "total_processed": 0, "total_target": 0}
+
+fetch_running = False
+fetch_started_at = None
+history_running = False
 
 def fetch_page(page):
     for attempt in range(3):
@@ -53,6 +57,66 @@ def fetch_deal_history(deal_id):
             if attempt < 1:
                 time.sleep(2)
     return []
+
+def fetch_history_job():
+    """Job independente — roda após o fetch de deals terminar."""
+    global history_running
+    if history_running:
+        print("Histórico já em andamento, ignorando.", flush=True)
+        return
+    history_running = True
+    try:
+        all_deals = cache["deals"]
+        if not all_deals:
+            print("Sem deals no cache para buscar histórico.", flush=True)
+            return
+
+        cutoff = datetime.utcnow() - timedelta(days=HISTORICO_DIAS)
+        deals_para_historico = [
+            d for d in all_deals
+            if d.get("dealStage", {}).get("funnel", {}).get("name") in FUNIS_HISTORICO
+            and d.get("startTime")
+            and datetime.strptime(d["startTime"][:10], "%Y-%m-%d") > cutoff
+        ]
+
+        total = len(deals_para_historico)
+        history_cache["total_target"] = total
+        history_cache["total_processed"] = 0
+        print(f"Buscando histórico de {total} deals dos últimos {HISTORICO_DIAS} dias...", flush=True)
+
+        hist_data = []
+        for i, deal in enumerate(deals_para_historico):
+            events = fetch_deal_history(deal["id"])
+            hist_data.append({
+                "deal_id": deal["id"],
+                "title": deal.get("title", ""),
+                "startTime": deal.get("startTime"),
+                "wonAt": deal.get("wonAt"),
+                "lostAt": deal.get("lostAt"),
+                "dealStatus": deal.get("dealStatus", {}),
+                "currentStage": deal.get("dealStage", {}),
+                "owner": deal.get("owner", {}),
+                "value": deal.get("value", 0),
+                "events": events
+            })
+            history_cache["total_processed"] = i + 1
+
+            # Salva parcialmente a cada 10 deals
+            if (i + 1) % 10 == 0:
+                history_cache["data"] = list(hist_data)
+                history_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                print(f"Histórico: {i+1}/{total}", flush=True)
+
+            time.sleep(0.15)
+
+        history_cache["data"] = hist_data
+        history_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"Histórico completo: {len(hist_data)} deals processados.", flush=True)
+
+    except Exception as e:
+        print(f"Erro no job de histórico: {e}", flush=True)
+    finally:
+        history_running = False
 
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
@@ -117,35 +181,11 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache final: {len(all_deals)} negocios", flush=True)
 
-    # Busca histórico de movimentação dos deals dos funis relevantes
-    cutoff_hist = datetime.utcnow() - timedelta(days=HISTORICO_MESES * 30)
-    deals_para_historico = [
-        d for d in all_deals
-        if d.get("dealStage", {}).get("funnel", {}).get("name") in FUNIS_HISTORICO
-        and d.get("startTime") and datetime.strptime(d["startTime"][:10], "%Y-%m-%d") > cutoff_hist
-    ]
-    print(f"Buscando historico de {len(deals_para_historico)} deals do Funil Comercial...", flush=True)
-    hist_data = []
-    for deal in deals_para_historico:
-        events = fetch_deal_history(deal["id"])
-        hist_data.append({
-            "deal_id": deal["id"],
-            "title": deal.get("title", ""),
-            "startTime": deal.get("startTime"),
-            "wonAt": deal.get("wonAt"),
-            "lostAt": deal.get("lostAt"),
-            "dealStatus": deal.get("dealStatus", {}),
-            "currentStage": deal.get("dealStage", {}),
-            "events": events
-        })
-        time.sleep(0.15)
-
-    history_cache["data"] = hist_data
-    history_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"Historico processado: {len(hist_data)} deals", flush=True)
-
-fetch_running = False
-fetch_started_at = None
+    # Dispara histórico em thread separada, 5 segundos após deals terminar
+    print("Agendando fetch de histórico em thread separada...", flush=True)
+    t = threading.Timer(5.0, fetch_history_job)
+    t.daemon = True
+    t.start()
 
 def fetch_deals_safe():
     global fetch_running, fetch_started_at
@@ -159,6 +199,8 @@ def fetch_deals_safe():
     finally:
         fetch_running = False
 
+# ── Rotas ──────────────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
     return jsonify({
@@ -166,7 +208,10 @@ def index():
         "cached_deals": len(cache["deals"]),
         "updated_at": cache["updated_at"],
         "fetch_running": fetch_running,
+        "history_running": history_running,
         "history_cached": len(history_cache["data"]),
+        "history_processed": history_cache["total_processed"],
+        "history_target": history_cache["total_target"],
         "history_updated_at": history_cache["updated_at"]
     })
 
@@ -180,10 +225,11 @@ def refresh():
 
 @app.route("/reset-fetch", methods=["POST"])
 def reset_fetch():
-    global fetch_running, fetch_started_at
+    global fetch_running, fetch_started_at, history_running
     fetch_running = False
     fetch_started_at = None
-    return jsonify({"status": "ok", "message": "fetch_running resetado com sucesso"})
+    history_running = False
+    return jsonify({"status": "ok", "message": "fetch_running e history_running resetados"})
 
 @app.route("/deals")
 def deals():
@@ -196,16 +242,14 @@ def funnels():
 
 @app.route("/history-cache")
 def history_cache_route():
-    """Retorna histórico de movimentação dos deals do Funil Comercial (últimos 6 meses)."""
     return jsonify({
         "data": history_cache["data"],
         "total": len(history_cache["data"]),
-        "updated_at": history_cache["updated_at"]
+        "updated_at": history_cache["updated_at"],
+        "processing": history_running,
+        "processed": history_cache["total_processed"],
+        "target": history_cache["total_target"]
     })
-
-@app.route("/test-history")
-def test_history():
-    return jsonify({"ok": True, "msg": "rota simples funcionando"})
 
 @app.route("/chat", methods=["POST"])
 def chat():
