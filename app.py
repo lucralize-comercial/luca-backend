@@ -18,6 +18,30 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FUNIS_HISTORICO = ["Funil Comercial"]
 HISTORICO_DIAS = 30
 
+# Normalização de tipos de atividade para português
+TIPO_MAP = {
+    "whatsapp": "WhatsApp",
+    "call": "Ligação",
+    "phone": "Ligação",
+    "ligacao": "Ligação",
+    "ligação": "Ligação",
+    "meeting": "Reunião",
+    "reuniao": "Reunião",
+    "reunião": "Reunião",
+    "email": "E-mail",
+    "e-mail": "E-mail",
+    "task": "Tarefa",
+    "tarefa": "Tarefa",
+    "note": "Nota",
+    "nota": "Nota",
+}
+
+def normalize_tipo(tipo):
+    if not tipo:
+        return "Outro"
+    key = tipo.lower().strip()
+    return TIPO_MAP.get(key, tipo)  # mantém original se não reconhecer
+
 cache = {"deals": [], "total": 0, "updated_at": None}
 history_cache = {"data": [], "updated_at": None, "total_processed": 0, "total_target": 0}
 tasks_cache = {"data": [], "updated_at": None}
@@ -59,10 +83,10 @@ def fetch_tasks_job():
     try:
         print("Buscando tasks do Agendor...", flush=True)
         all_tasks = []
-        # Busca últimos 31 dias (limite da API)
-        date_gt = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        # Ampliado para 90 dias para cobrir o período do filtro global
+        date_gt = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
         page = 1
-        while page <= 50:
+        while page <= 100:
             r = requests.get(
                 f"{AGENDOR_BASE}/tasks", headers=HEADERS,
                 params={"per_page": 100, "page": page, "createdDateGt": date_gt},
@@ -75,12 +99,18 @@ def fetch_tasks_job():
             page_data = data.get("data", [])
             if not page_data:
                 break
+
+            # Normaliza o campo type para português
+            for t in page_data:
+                t["type"] = normalize_tipo(t.get("type", ""))
+
             all_tasks.extend(page_data)
             print(f"Tasks pagina {page}: {len(page_data)} ({len(all_tasks)} total)", flush=True)
             if not data.get("links", {}).get("next") or len(page_data) < 100:
                 break
             page += 1
             time.sleep(0.2)
+
         tasks_cache["data"] = all_tasks
         tasks_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(f"Tasks: {len(all_tasks)} carregadas", flush=True)
@@ -224,6 +254,14 @@ def refresh():
     scheduler.add_job(fetch_deals_safe, "date", id="fetch_manual", replace_existing=True)
     return jsonify({"status": "started", "message": "Atualização iniciada"}), 200
 
+@app.route("/refresh-tasks", methods=["POST"])
+def refresh_tasks():
+    """Atualiza apenas o cache de tasks sem refazer todos os deals"""
+    t = threading.Thread(target=fetch_tasks_job)
+    t.daemon = True
+    t.start()
+    return jsonify({"status": "started", "message": "Atualização de tasks iniciada"}), 200
+
 @app.route("/reset-fetch", methods=["POST"])
 def reset_fetch():
     global fetch_running, fetch_started_at, history_running
@@ -277,6 +315,8 @@ def chat():
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
+# Tasks atualizam a cada 2h independentemente dos deals
+scheduler.add_job(fetch_tasks_job, "interval", hours=2, id="tasks_recorrente")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.start()
 
