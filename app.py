@@ -20,7 +20,7 @@ HISTORICO_DIAS = 30
 
 cache = {"deals": [], "total": 0, "updated_at": None}
 history_cache = {"data": [], "updated_at": None, "total_processed": 0, "total_target": 0}
-activities_cache = {"data": [], "updated_at": None}
+tasks_cache = {"data": [], "updated_at": None}
 
 fetch_running = False
 fetch_started_at = None
@@ -55,10 +55,41 @@ def fetch_deal_history(deal_id):
                 time.sleep(2)
     return []
 
+def fetch_tasks_job():
+    try:
+        print("Buscando tasks do Agendor...", flush=True)
+        all_tasks = []
+        # Busca últimos 31 dias (limite da API)
+        date_gt = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        page = 1
+        while page <= 50:
+            r = requests.get(
+                f"{AGENDOR_BASE}/tasks", headers=HEADERS,
+                params={"per_page": 100, "page": page, "createdDateGt": date_gt},
+                timeout=60
+            )
+            if r.status_code != 200:
+                print(f"Erro tasks pagina {page}: {r.status_code} {r.text[:100]}", flush=True)
+                break
+            data = r.json()
+            page_data = data.get("data", [])
+            if not page_data:
+                break
+            all_tasks.extend(page_data)
+            print(f"Tasks pagina {page}: {len(page_data)} ({len(all_tasks)} total)", flush=True)
+            if not data.get("links", {}).get("next") or len(page_data) < 100:
+                break
+            page += 1
+            time.sleep(0.2)
+        tasks_cache["data"] = all_tasks
+        tasks_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"Tasks: {len(all_tasks)} carregadas", flush=True)
+    except Exception as e:
+        print(f"Erro fetch tasks: {e}", flush=True)
+
 def fetch_history_job():
     global history_running
     if history_running:
-        print("Histórico já em andamento, ignorando.", flush=True)
         return
     history_running = True
     try:
@@ -75,65 +106,29 @@ def fetch_history_job():
         total = len(deals_para_historico)
         history_cache["total_target"] = total
         history_cache["total_processed"] = 0
-        print(f"Buscando histórico de {total} deals dos últimos {HISTORICO_DIAS} dias...", flush=True)
+        print(f"Buscando histórico de {total} deals...", flush=True)
         hist_data = []
         for i, deal in enumerate(deals_para_historico):
             events = fetch_deal_history(deal["id"])
             hist_data.append({
-                "deal_id": deal["id"],
-                "title": deal.get("title", ""),
-                "startTime": deal.get("startTime"),
-                "wonAt": deal.get("wonAt"),
-                "lostAt": deal.get("lostAt"),
-                "dealStatus": deal.get("dealStatus", {}),
-                "currentStage": deal.get("dealStage", {}),
-                "owner": deal.get("owner", {}),
-                "value": deal.get("value", 0),
-                "events": events
+                "deal_id": deal["id"], "title": deal.get("title", ""),
+                "startTime": deal.get("startTime"), "wonAt": deal.get("wonAt"),
+                "lostAt": deal.get("lostAt"), "dealStatus": deal.get("dealStatus", {}),
+                "currentStage": deal.get("dealStage", {}), "owner": deal.get("owner", {}),
+                "value": deal.get("value", 0), "events": events
             })
             history_cache["total_processed"] = i + 1
             if (i + 1) % 10 == 0:
                 history_cache["data"] = list(hist_data)
                 history_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                print(f"Histórico: {i+1}/{total}", flush=True)
             time.sleep(0.15)
         history_cache["data"] = hist_data
         history_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        print(f"Histórico completo: {len(hist_data)} deals processados.", flush=True)
+        print(f"Histórico completo: {len(hist_data)} deals.", flush=True)
     except Exception as e:
-        print(f"Erro no job de histórico: {e}", flush=True)
+        print(f"Erro histórico: {e}", flush=True)
     finally:
         history_running = False
-
-def fetch_activities_job():
-    try:
-        print("Buscando atividades do Agendor...", flush=True)
-        all_activities = []
-        page = 1
-        while page <= 30:
-            r = requests.get(
-                f"{AGENDOR_BASE}/activities", headers=HEADERS,
-                params={"per_page": 100, "page": page, "order_by": "date", "order_dir": "desc"},
-                timeout=60
-            )
-            if r.status_code != 200:
-                print(f"Erro atividades pagina {page}: {r.status_code} {r.text[:100]}", flush=True)
-                break
-            data = r.json()
-            page_data = data.get("data", [])
-            if not page_data:
-                break
-            all_activities.extend(page_data)
-            print(f"Atividades pagina {page}: {len(page_data)} ({len(all_activities)} total)", flush=True)
-            if not data.get("links", {}).get("next") or len(page_data) < 100:
-                break
-            page += 1
-            time.sleep(0.2)
-        activities_cache["data"] = all_activities
-        activities_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        print(f"Atividades: {len(all_activities)} carregadas", flush=True)
-    except Exception as e:
-        print(f"Erro fetch atividades: {e}", flush=True)
 
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
@@ -141,7 +136,6 @@ def fetch_deals():
     page = 1
     total_count = None
     while True:
-        print(f"Buscando pagina {page}...", flush=True)
         data = fetch_page(page)
         if data is None:
             break
@@ -155,8 +149,7 @@ def fetch_deals():
             cache["deals"] = list(all_deals)
             cache["total"] = total_count or len(all_deals)
             cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        next_link = data.get("links", {}).get("next")
-        if not next_link or len(page_deals) == 0:
+        if not data.get("links", {}).get("next") or len(page_deals) == 0:
             break
         page += 1
         time.sleep(0.2)
@@ -164,7 +157,7 @@ def fetch_deals():
     cache["deals"] = all_deals
     cache["total"] = total_count or len(all_deals)
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"Cache atualizado: {len(all_deals)} negocios as {cache['updated_at']}", flush=True)
+    print(f"Cache atualizado: {len(all_deals)} negocios", flush=True)
 
     cutoff = datetime.utcnow() - timedelta(days=180)
     won_recent = [
@@ -172,7 +165,7 @@ def fetch_deals():
         if d.get("dealStatus", {}).get("id") == 2
         and d.get("wonAt") and datetime.strptime(d["wonAt"][:10], "%Y-%m-%d") > cutoff
     ]
-    print(f"Buscando produtos de {len(won_recent)} negocios ganhos recentes...", flush=True)
+    print(f"Buscando produtos de {len(won_recent)} ganhos recentes...", flush=True)
     for deal in won_recent:
         try:
             r = requests.get(f"{AGENDOR_BASE}/deals/{deal['id']}/products", headers=HEADERS, timeout=15)
@@ -188,19 +181,17 @@ def fetch_deals():
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"Cache final: {len(all_deals)} negocios", flush=True)
 
-    # Dispara histórico e atividades em threads separadas
-    print("Agendando fetch de histórico e atividades...", flush=True)
+    # Dispara histórico e tasks em threads separadas
     t1 = threading.Timer(5.0, fetch_history_job)
     t1.daemon = True
     t1.start()
-    t2 = threading.Timer(10.0, fetch_activities_job)
+    t2 = threading.Timer(10.0, fetch_tasks_job)
     t2.daemon = True
     t2.start()
 
 def fetch_deals_safe():
     global fetch_running, fetch_started_at
     if fetch_running:
-        print("Fetch ja em andamento, ignorando.", flush=True)
         return
     fetch_running = True
     fetch_started_at = time.time()
@@ -221,8 +212,8 @@ def index():
         "history_processed": history_cache["total_processed"],
         "history_target": history_cache["total_target"],
         "history_updated_at": history_cache["updated_at"],
-        "activities_cached": len(activities_cache["data"]),
-        "activities_updated_at": activities_cache["updated_at"]
+        "tasks_cached": len(tasks_cache["data"]),
+        "tasks_updated_at": tasks_cache["updated_at"]
     })
 
 @app.route("/refresh", methods=["POST"])
@@ -239,18 +230,18 @@ def reset_fetch():
     fetch_running = False
     fetch_started_at = None
     history_running = False
-    return jsonify({"status": "ok", "message": "fetch_running e history_running resetados"})
+    return jsonify({"status": "ok", "message": "resetado"})
 
 @app.route("/deals")
 def deals():
     return jsonify({"data": cache["deals"], "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]}})
 
-@app.route("/activities")
-def activities():
+@app.route("/tasks")
+def tasks():
     return jsonify({
-        "data": activities_cache["data"],
-        "total": len(activities_cache["data"]),
-        "updated_at": activities_cache["updated_at"]
+        "data": tasks_cache["data"],
+        "total": len(tasks_cache["data"]),
+        "updated_at": tasks_cache["updated_at"]
     })
 
 @app.route("/funnels")
@@ -272,7 +263,7 @@ def history_cache_route():
 @app.route("/chat", methods=["POST"])
 def chat():
     if not ANTHROPIC_API_KEY:
-        return jsonify({"error": "ANTHROPIC_API_KEY não configurada"}), 500
+        return jsonify({"error": "ANTHROPIC_API_KEY nao configurada"}), 500
     try:
         payload = request.get_json()
         r = requests.post(
