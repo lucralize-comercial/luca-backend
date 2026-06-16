@@ -84,7 +84,7 @@ def fetch_tasks_job():
         print("Buscando tasks do Agendor...", flush=True)
         all_tasks = []
         # Ampliado para 90 dias para cobrir o período do filtro global
-        date_gt = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+        date_gt = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
         page = 1
         while page <= 100:
             r = requests.get(
