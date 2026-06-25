@@ -397,7 +397,7 @@ def chat():
 # POST https://chat.agendor.com.br/api/v1/accounts/825/conversations/{id}/messages
 
 AGENDORCHAT_TOKEN      = os.environ.get("AGENDORCHAT_TOKEN", "3t9nxq9fmZLyd9SfH7JEsqK8")
-AGENDORCHAT_ACCOUNT_ID = os.environ.get("AGENDORCHAT_ACCOUNT_ID", "825")
+AGENDORCHAT_ACCOUNT_ID = os.environ.get("AGENDORCHAT_ACCOUNT_ID", "1035")
 AGENDORCHAT_BASE       = "https://chat.agendor.com.br/api/v1"
 
 
