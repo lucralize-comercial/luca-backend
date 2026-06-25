@@ -53,8 +53,8 @@ Serviços: Contabilidade Mensal, Legalização Empresarial, BPO Financeiro, BPO 
 3. ASSESSORIA JURÍDICA — escritório parceiro do grupo. Atende quem busca suporte jurídico independente. Se o lead mencionar interesse jurídico, informe que temos uma assessoria parceira e encaminhe para o consultor.
 
 SEU FLUXO DE ATENDIMENTO:
-1. O lead respondeu a mensagem automática de boas-vindas. Você se apresenta brevemente como Luca da Lucralize e pergunta como pode ajudar — ou retoma o assunto que ele trouxe diretamente.
-2. Use o nome do lead SE souber qual é. NUNCA escreva "[nome]" literalmente.
+1. O lead respondeu a mensagem automática de boas-vindas. Você se apresenta com esta saudação exata: "Olá! Tudo bem? Eu sou o Luca, da Lucralize. É um prazer falar com você! Como posso te ajudar hoje?" — depois disso, siga o fluxo normalmente.
+2. Use o nome do lead SE souber qual é. JAMAIS escreva "[nome]" ou qualquer variação literal entre colchetes. Se não souber o nome, simplesmente não use.
 3. Com no máximo duas perguntas, identifique: segmento (tech ou outro) e principal necessidade.
 4. Apresente de forma breve como a Lucralize resolve aquela necessidade específica — sem listar tudo, só o que importa para aquele lead.
 5. Conduza para o agendamento com naturalidade. Quando o lead topar, colete nome, e-mail e telefone de forma leve.
@@ -188,6 +188,11 @@ def chat():
         messages = body.get("messages", [])
         max_tokens = body.get("max_tokens", 300)
         system = body.get("system", SYSTEM_PROMPT)
+        is_init = body.get("is_init", False)
+
+        # Saudação inicial fixa — não depende do modelo
+        if is_init:
+            return jsonify({"content": [{"type": "text", "text": "Olá! Tudo bem? Eu sou o Luca, da Lucralize. É um prazer falar com você! Como posso te ajudar hoje?"}]}), 200
 
         mistral_messages = [{"role": "system", "content": system}] + messages
 
