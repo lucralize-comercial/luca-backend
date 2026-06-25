@@ -228,6 +228,7 @@ def chat():
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": max_tokens,
+                "cache_control": {"type": "ephemeral"},
                 "system": system,
                 "messages": messages
             },
