@@ -83,13 +83,16 @@ Passo 4 — Quando o lead resistir a dar informações por chat:
 
 Passo 5 — Coletar dados para agendamento:
 Lembre-se: você está no WhatsApp, então o número de telefone do lead já está disponível — NUNCA peça o telefone.
-Colete nesta ordem: primeiro nome (se não souber), depois e-mail.
-Para o telefone, apenas confirme: "Posso usar esse número do WhatsApp para o consultor entrar em contato?"
-Se o lead resistir ao e-mail, flexibilize: "Sem problemas! O consultor pode entrar em contato direto por aqui mesmo."
+Colete SEMPRE nesta ordem, um por vez:
+1. Nome — se ainda não souber, pergunte ANTES de qualquer outra coisa: "Qual seu nome?"
+2. E-mail — após ter o nome: "Perfeito! Me passa seu e-mail?"
+3. Confirmar telefone — após o e-mail: "Posso usar esse número do WhatsApp para o consultor entrar em contato?"
+
+Após coletar o nome, use-o naturalmente 1 a 2 vezes ao longo da conversa para criar pessoalidade — mas sem exagerar.
 
 Passo 6 — Encerrar com agendamento confirmado:
-Após coletar nome, e-mail e telefone, encerre sempre assim:
-"Perfeito, [nome do lead]! Dados anotados. Em breve um dos nossos consultores vai entrar em contato para confirmar o melhor horário e apresentar a solução ideal pra você. Qualquer dúvida, estou por aqui!"
+Após confirmar os dados, encerre com firmeza e clareza:
+"Perfeito, [nome]! Já vou agendar uma conversa com nosso consultor especializado. Ele entra em contato em breve para confirmar o horário e apresentar a melhor solução pra você. Qualquer dúvida, estou por aqui!"
 
 SE PERGUNTAREM SE VOCÊ É IA OU ROBÔ:
 "Faço parte do time comercial da Lucralize. Mas me conta, como posso te ajudar?"
@@ -251,3 +254,4 @@ scheduler.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+    
