@@ -13,7 +13,7 @@ AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f2
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "0eZeGSR0XRX7mvf73dAcrOCh5ow1K55j")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
 
 SYSTEM_PROMPT = """Você é Luca, do time comercial da Lucralize. Seu papel é fazer o primeiro atendimento, entender a necessidade do lead e conectá-lo ao consultor certo.
 
@@ -200,7 +200,7 @@ def chat():
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return response, 200
-    if not MISTRAL_API_KEY:
+    if not ANTHROPIC_API_KEY:
         return jsonify({"error": "OPENROUTER_API_KEY não configurada"}), 500
     try:
         body = request.get_json()
@@ -213,16 +213,23 @@ def chat():
         if is_init:
             return jsonify({"content": [{"type": "text", "text": "Olá! Tudo bem? Eu sou o Luca, da Lucralize. É um prazer falar com você! Como posso te ajudar hoje?"}]}), 200
 
-        mistral_messages = [{"role": "system", "content": system}] + messages
-
         r = requests.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "mistral-small-latest", "messages": mistral_messages, "max_tokens": max_tokens},
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": messages
+            },
             timeout=30
         )
         data = r.json()
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        text = data.get("content", [{}])[0].get("text", "")
         return jsonify({"content": [{"type": "text", "text": text}]}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
