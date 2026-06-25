@@ -225,7 +225,7 @@ def chat():
                 "Content-Type": "application/json"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": max_tokens,
                 "system": system,
                 "messages": messages
