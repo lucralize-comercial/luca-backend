@@ -13,7 +13,7 @@ AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f2
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "0eZeGSR0XRX7mvf73dAcrOCh5ow1K55j")
 
 SYSTEM_PROMPT = """Você é Luca, membro do time comercial da Lucralize. Sua função é fazer o primeiro atendimento e conectar o lead a um consultor especializado.
 
@@ -192,7 +192,7 @@ def chat():
         response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return response, 200
-    if not OPENROUTER_API_KEY:
+    if not MISTRAL_API_KEY:
         return jsonify({"error": "OPENROUTER_API_KEY não configurada"}), 500
     try:
         body = request.get_json()
@@ -200,12 +200,12 @@ def chat():
         max_tokens = body.get("max_tokens", 300)
         system = body.get("system", SYSTEM_PROMPT)
 
-        or_messages = [{"role": "system", "content": system}] + messages
+        mistral_messages = [{"role": "system", "content": system}] + messages
 
         r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "google/gemma-4-31b-it:free", "messages": or_messages, "max_tokens": max_tokens},
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "mistral-small-latest", "messages": mistral_messages, "max_tokens": max_tokens},
             timeout=30
         )
         data = r.json()
