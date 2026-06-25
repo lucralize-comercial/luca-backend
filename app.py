@@ -13,7 +13,7 @@ AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f2
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAb8RN6KIUKrwvECjuMww3qyVm2skXYgDlmG5UmscUWky0ffr1Q")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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")
 
 cache = {"deals": [], "total": 0, "updated_at": None}
 
@@ -77,7 +77,6 @@ def fetch_deals():
         if d.get("dealStatus", {}).get("id") == 2
         and d.get("wonAt") and datetime.strptime(d["wonAt"][:10], "%Y-%m-%d") > cutoff
     ]
-    print(f"Buscando produtos de {len(won_recent)} negocios ganhos recentes...", flush=True)
     for deal in won_recent:
         try:
             r = requests.get(
@@ -139,36 +138,34 @@ def funnels():
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    if not GEMINI_API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY não configurada"}), 500
+    if not OPENROUTER_API_KEY:
+        return jsonify({"error": "OPENROUTER_API_KEY não configurada"}), 500
     try:
         body = request.get_json()
         system_prompt = body.get("system", "")
         messages = body.get("messages", [])
+        max_tokens = body.get("max_tokens", 300)
 
-        # Converter formato Anthropic → Gemini
-        contents = []
-        for msg in messages:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-
-        gemini_payload = {
-            "system_instruction": {"parts": [{"text": system_prompt}]} if system_prompt else None,
-            "contents": contents,
-            "generationConfig": {"maxOutputTokens": body.get("max_tokens", 300), "temperature": 0.7}
-        }
-        if not system_prompt:
-            del gemini_payload["system_instruction"]
+        or_messages = []
+        if system_prompt:
+            or_messages.append({"role": "system", "content": system_prompt})
+        or_messages.extend(messages)
 
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-            json=gemini_payload,
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "meta-llama/llama-3.1-8b-instruct:free",
+                "messages": or_messages,
+                "max_tokens": max_tokens
+            },
             timeout=30
         )
         data = r.json()
-
-        # Converter resposta Gemini → formato Anthropic
-        text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         return jsonify({"content": [{"type": "text", "text": text}]}), 200
 
     except Exception as e:
