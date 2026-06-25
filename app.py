@@ -376,15 +376,46 @@ def chat():
 # NOVA ROTA — /agendorchat/webhook  (AgendorChat → Luca → AgendorChat)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-# Payload esperado do AgendorChat:
+# Payload real do AgendorChat (event: message_created):
 # {
-#   "conversation": { "id": "abc123" },
-#   "contact":      { "phone": "5531999990000", "name": "João" },
-#   "message":      { "text": "Olá, quero saber sobre contabilidade" }
+#   "event": "message_created",
+#   "message_type": "incoming",        ← só processar incoming (do lead)
+#   "content": "Olá, quero saber...",
+#   "conversation": {
+#     "id": 77,
+#     "meta": {
+#       "sender": {
+#         "name": "Lead Teste",
+#         "phone_number": "+5548999999999"
+#       }
+#     }
+#   },
+#   "sender": { "type": "contact" }    ← "contact"=lead | "user"=agente
 # }
 #
-# Resposta esperada (texto puro — AgendorChat envia ao lead):
-# { "text": "Olá! Tudo bem? ..." }
+# Resposta: envia mensagem de volta via API do AgendorChat
+# POST https://chat.agendor.com.br/api/v1/accounts/825/conversations/{id}/messages
+
+AGENDORCHAT_TOKEN      = os.environ.get("AGENDORCHAT_TOKEN", "3t9nxq9fmZLyd9SfH7JEsqK8")
+AGENDORCHAT_ACCOUNT_ID = os.environ.get("AGENDORCHAT_ACCOUNT_ID", "825")
+AGENDORCHAT_BASE       = "https://chat.agendor.com.br/api/v1"
+
+
+def send_agendorchat_message(conversation_id: int, text: str):
+    """Envia resposta do Luca de volta ao lead via API do AgendorChat."""
+    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+    resp = requests.post(
+        url,
+        headers={
+            "api_access_token": AGENDORCHAT_TOKEN,
+            "Content-Type":     "application/json",
+        },
+        json={"content": text, "message_type": "outgoing", "private": False},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
 
 @app.route("/agendorchat/webhook", methods=["POST", "OPTIONS"])
 def agendorchat_webhook():
@@ -395,67 +426,77 @@ def agendorchat_webhook():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp, 200
 
-    if not ANTHROPIC_API_KEY:
-        return jsonify({"text": "Olá! Nosso atendimento está temporariamente indisponível. Em breve retornaremos!"}), 200
-
     try:
         body = request.get_json(force=True) or {}
 
-        # ── Extrai campos do payload ──────────────────────────────────────────
-        conversation_id   = (body.get("conversation") or {}).get("id", "default")
-        contact_name      = (body.get("contact")      or {}).get("name", "")
-        contact_phone     = (body.get("contact")      or {}).get("phone", "")
-        message_text      = (body.get("message")      or {}).get("text", "").strip()
+        # ── Filtra apenas mensagens recebidas do lead ─────────────────────────
+        event        = body.get("event", "")
+        message_type = body.get("message_type", "")
+        sender_type  = (body.get("sender") or {}).get("type", "")
 
-        # Ignora mensagens vazias (p.ex. eventos de status)
-        if not message_text:
+        # Ignora tudo que não seja mensagem nova do lead
+        # message_type "incoming" + sender type "contact" = lead escreveu
+        if event != "message_created":
+            return jsonify({}), 200
+        if message_type != "incoming" or sender_type != "contact":
+            return jsonify({}), 200
+
+        # ── Extrai campos do payload ──────────────────────────────────────────
+        message_text    = (body.get("content") or "").strip()
+        conversation    = body.get("conversation") or {}
+        conversation_id = conversation.get("id")
+        meta_sender     = (conversation.get("meta") or {}).get("sender") or {}
+        contact_name    = meta_sender.get("name", "")
+        contact_phone   = meta_sender.get("phone_number", "")
+
+        if not message_text or not conversation_id:
             return jsonify({}), 200
 
         print(f"[webhook] conv={conversation_id} | {contact_phone} | msg={message_text[:60]}", flush=True)
 
         # ── Recupera ou inicializa histórico ──────────────────────────────────
-        if conversation_id not in conversation_histories:
-            # Primeira mensagem: injeta contexto do contato no system prompt
+        conv_key = str(conversation_id)
+        if conv_key not in conversation_histories:
             extra = ""
             if contact_name:
                 extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
             if contact_phone:
-                extra += f" Telefone/WhatsApp já disponível: {contact_phone}."
-            conversation_histories[conversation_id] = {
-                "system": SYSTEM_PROMPT + extra,
+                extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
+            conversation_histories[conv_key] = {
+                "system":   SYSTEM_PROMPT + extra,
                 "messages": [],
             }
 
-        conv = conversation_histories[conversation_id]
+        conv = conversation_histories[conv_key]
 
-        # ── Primeira mensagem da conversa = saudação do Luca ─────────────────
+        # ── Se é primeira mensagem, injeta saudação do Luca no histórico ─────
+        # (para o Claude saber que já se apresentou)
         if not conv["messages"]:
-            greeting = (
-                "Olá! Tudo bem? Eu sou o Luca, da Lucralize. "
-                "É um prazer falar com você! Como posso te ajudar hoje?"
-            )
-            conv["messages"].append({"role": "assistant", "content": greeting})
-            # Ainda processa a primeira mensagem do lead logo abaixo
+            conv["messages"].append({
+                "role":    "assistant",
+                "content": (
+                    "Olá! Tudo bem? Eu sou o Luca, da Lucralize. "
+                    "É um prazer falar com você! Como posso te ajudar hoje?"
+                ),
+            })
 
-        # ── Adiciona mensagem do lead ao histórico ────────────────────────────
+        # ── Adiciona mensagem do lead e chama o Claude ────────────────────────
         conv["messages"].append({"role": "user", "content": message_text})
-
-        # ── Chama o Claude ────────────────────────────────────────────────────
         reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
-
-        # ── Salva resposta no histórico ───────────────────────────────────────
         conv["messages"].append({"role": "assistant", "content": reply})
 
-        # Limita histórico a 40 turnos (20 pares) para não explodir tokens
+        # Limita histórico a 40 turnos para não explodir tokens
         if len(conv["messages"]) > 40:
             conv["messages"] = conv["messages"][-40:]
 
-        return jsonify({"text": reply}), 200
+        # ── Envia resposta de volta ao AgendorChat ────────────────────────────
+        send_agendorchat_message(conversation_id, reply)
+
+        return jsonify({"status": "ok"}), 200
 
     except Exception as e:
         print(f"[webhook] Erro: {e}", flush=True)
-        # Nunca deixa o AgendorChat sem resposta
-        return jsonify({"text": "Tive um problema aqui, mas já estou resolvendo! Pode mandar sua dúvida de novo?"}), 200
+        return jsonify({"status": "error", "detail": str(e)}), 200
 
 
 # ═════════════════════════════════════════════════════════════════════════════
