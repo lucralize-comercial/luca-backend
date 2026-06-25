@@ -5,16 +5,26 @@ from datetime import datetime, timedelta
 import requests
 import os
 import time
+import json
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
 
+# ── Agendor ──────────────────────────────────────────────────────────────────
 AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f20159a")
-AGENDOR_BASE = "https://api.agendor.com.br/v3"
-HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
+AGENDOR_BASE  = "https://api.agendor.com.br/v3"
+HEADERS       = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
+# ── Anthropic ─────────────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# ── Azure AD / Microsoft Graph (agendamento Teams) ────────────────────────────
+AZURE_CLIENT_ID     = os.environ.get("AZURE_CLIENT_ID",     "c0868f3b-764c-4c5b-a9fc-4af4b6eb0baf")
+AZURE_CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET", "PBL8Q~pfG-XmBkvvmv5K~NgY-pLxpWlbayUE5aOb")
+AZURE_TENANT_ID     = os.environ.get("AZURE_TENANT_ID",     "5173aa83-66e1-49f3-9128-f2251b43294d")
+CALENDAR_USER       = os.environ.get("CALENDAR_USER",       "ronaldojunior@lucralize.com.br")
+
+# ── System prompt do Luca ─────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Você é Luca, do time comercial da Lucralize. Seu papel é fazer o primeiro atendimento, entender a necessidade do lead e conectá-lo ao consultor certo.
 
 PERSONALIDADE E TOM:
@@ -115,7 +125,17 @@ REGRAS INEGOCIÁVEIS:
 - Texto puro, sem asteriscos, sem markdown
 - Responda apenas em português brasileiro"""
 
+# ── Cache de negócios Agendor ─────────────────────────────────────────────────
 cache = {"deals": [], "total": 0, "updated_at": None}
+
+# ── Histórico de conversas por conversa_id (em memória) ──────────────────────
+# Estrutura: { conversation_id: [{"role": "user"|"assistant", "content": "..."}] }
+conversation_histories = {}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AGENDOR — busca de negócios
+# ═════════════════════════════════════════════════════════════════════════════
 
 def fetch_page(page):
     for attempt in range(3):
@@ -123,7 +143,8 @@ def fetch_page(page):
             r = requests.get(
                 f"{AGENDOR_BASE}/deals",
                 headers=HEADERS,
-                params={"per_page": 100, "page": page, "withCustomFields": "true", "order_by": "updatedAt", "order_dir": "desc"},
+                params={"per_page": 100, "page": page, "withCustomFields": "true",
+                        "order_by": "updatedAt", "order_dir": "desc"},
                 timeout=60
             )
             r.raise_for_status()
@@ -134,11 +155,10 @@ def fetch_page(page):
                 time.sleep(5)
     return None
 
+
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
-    all_deals = []
-    page = 1
-    total_count = None
+    all_deals, page, total_count = [], 1, None
     while True:
         data = fetch_page(page)
         if data is None:
@@ -148,38 +168,39 @@ def fetch_deals():
             total_count = data.get("meta", {}).get("totalCount", 0)
         all_deals.extend(page_deals)
         if page % 10 == 0:
-            cache["deals"] = list(all_deals)
-            cache["total"] = total_count or len(all_deals)
-            cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            cache.update({"deals": list(all_deals), "total": total_count or len(all_deals),
+                          "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         next_link = data.get("links", {}).get("next")
-        if not next_link or len(page_deals) == 0:
+        if not next_link or not page_deals:
             break
         page += 1
         time.sleep(0.2)
-    cache["deals"] = all_deals
-    cache["total"] = total_count or len(all_deals)
-    cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    cache.update({"deals": all_deals, "total": total_count or len(all_deals),
+                  "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
     cutoff = datetime.utcnow() - timedelta(days=180)
-    won_recent = [
-        d for d in all_deals
-        if d.get("dealStatus", {}).get("id") == 2
-        and d.get("wonAt") and datetime.strptime(d["wonAt"][:10], "%Y-%m-%d") > cutoff
-    ]
-    for deal in won_recent:
-        try:
-            r = requests.get(f"{AGENDOR_BASE}/deals/{deal['id']}/products", headers=HEADERS, timeout=15)
-            if r.status_code == 200:
-                products = r.json().get("data", [])
-                if products:
-                    deal["products_entities"] = products
-        except Exception as e:
-            print(f"Erro produtos {deal['id']}: {e}", flush=True)
-        time.sleep(0.1)
-    cache["deals"] = all_deals
+    for deal in all_deals:
+        if (deal.get("dealStatus", {}).get("id") == 2
+                and deal.get("wonAt")
+                and datetime.strptime(deal["wonAt"][:10], "%Y-%m-%d") > cutoff):
+            try:
+                r = requests.get(f"{AGENDOR_BASE}/deals/{deal['id']}/products",
+                                 headers=HEADERS, timeout=15)
+                if r.status_code == 200:
+                    products = r.json().get("data", [])
+                    if products:
+                        deal["products_entities"] = products
+            except Exception as e:
+                print(f"Erro produtos {deal['id']}: {e}", flush=True)
+            time.sleep(0.1)
+
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
 
 fetch_running = False
 fetch_started_at = None
+
 
 def fetch_deals_safe():
     global fetch_running, fetch_started_at
@@ -192,73 +213,314 @@ def fetch_deals_safe():
     finally:
         fetch_running = False
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MICROSOFT GRAPH — agendamento de reunião Teams
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_graph_token():
+    """Obtém access token via client credentials (app-only)."""
+    url = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/oauth2/v2.0/token"
+    resp = requests.post(url, data={
+        "grant_type":    "client_credentials",
+        "client_id":     AZURE_CLIENT_ID,
+        "client_secret": AZURE_CLIENT_SECRET,
+        "scope":         "https://graph.microsoft.com/.default",
+    }, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def create_teams_meeting(lead_name: str, lead_email: str, start_iso: str, duration_minutes: int = 30):
+    """
+    Cria uma reunião Teams no calendário do consultor e retorna o joinUrl.
+    start_iso: "2025-07-10T14:00:00" (horário de Brasília — será tratado como -03:00)
+    """
+    token = get_graph_token()
+    start_dt = datetime.fromisoformat(start_iso)
+    end_dt   = start_dt + timedelta(minutes=duration_minutes)
+
+    body = {
+        "subject": f"Consultoria Lucralize — {lead_name}",
+        "body": {
+            "contentType": "HTML",
+            "content": (
+                f"<p>Reunião agendada via Luca (agente comercial Lucralize).</p>"
+                f"<p>Lead: <b>{lead_name}</b> | {lead_email}</p>"
+            )
+        },
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Sao_Paulo"},
+        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "America/Sao_Paulo"},
+        "attendees": [
+            {
+                "emailAddress": {"address": lead_email, "name": lead_name},
+                "type": "required"
+            }
+        ],
+        "isOnlineMeeting": True,
+        "onlineMeetingProvider": "teamsForBusiness",
+        "allowNewTimeProposals": False,
+    }
+
+    url = f"https://graph.microsoft.com/v1.0/users/{CALENDAR_USER}/events"
+    resp = requests.post(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }, json=body, timeout=20)
+    resp.raise_for_status()
+    event = resp.json()
+    return {
+        "event_id":  event["id"],
+        "join_url":  event.get("onlineMeeting", {}).get("joinUrl", ""),
+        "start":     event["start"]["dateTime"],
+        "end":       event["end"]["dateTime"],
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ANTHROPIC — chamada ao Claude
+# ═════════════════════════════════════════════════════════════════════════════
+
+def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROMPT) -> str:
+    """Chama a API Anthropic e retorna o texto da resposta."""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key":         ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type":      "application/json",
+        },
+        json={
+            "model":      "claude-sonnet-4-5",
+            "max_tokens": max_tokens,
+            "system":     system,
+            "messages":   messages,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("content", [{}])[0].get("text", "").strip()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ROTAS EXISTENTES
+# ═════════════════════════════════════════════════════════════════════════════
+
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "cached_deals": len(cache["deals"]), "updated_at": cache["updated_at"], "fetch_running": fetch_running})
+    return jsonify({
+        "status": "ok",
+        "cached_deals": len(cache["deals"]),
+        "updated_at": cache["updated_at"],
+        "fetch_running": fetch_running,
+    })
+
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
-    global fetch_running
     if fetch_running:
         return jsonify({"status": "running"}), 202
     scheduler.add_job(fetch_deals_safe, "date", id="fetch_manual", replace_existing=True)
     return jsonify({"status": "started"}), 200
 
+
 @app.route("/deals")
 def deals():
-    return jsonify({"data": cache["deals"], "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]}})
+    return jsonify({
+        "data": cache["deals"],
+        "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]},
+    })
+
 
 @app.route("/funnels")
 def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
 
+
+# ── /chat — simulador web (mantido igual) ────────────────────────────────────
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
     if request.method == "OPTIONS":
-        response = jsonify({})
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        return response, 200
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 200
+
     if not ANTHROPIC_API_KEY:
-        return jsonify({"error": "OPENROUTER_API_KEY não configurada"}), 500
+        return jsonify({"error": "ANTHROPIC_API_KEY não configurada"}), 500
+
     try:
-        body = request.get_json()
+        body     = request.get_json()
         messages = body.get("messages", [])
-        max_tokens = body.get("max_tokens", 300)
-        system = body.get("system", SYSTEM_PROMPT)
-        is_init = body.get("is_init", False)
+        max_tok  = body.get("max_tokens", 300)
+        system   = body.get("system", SYSTEM_PROMPT)
+        is_init  = body.get("is_init", False)
 
-        # Saudação inicial fixa — não depende do modelo
         if is_init:
-            return jsonify({"content": [{"type": "text", "text": "Olá! Tudo bem? Eu sou o Luca, da Lucralize. É um prazer falar com você! Como posso te ajudar hoje?"}]}), 200
+            return jsonify({"content": [{"type": "text", "text": (
+                "Olá! Tudo bem? Eu sou o Luca, da Lucralize. "
+                "É um prazer falar com você! Como posso te ajudar hoje?"
+            )}]}), 200
 
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "claude-sonnet-4-5",
-                "max_tokens": max_tokens,
-                "cache_control": {"type": "ephemeral"},
-                "system": system,
-                "messages": messages
-            },
-            timeout=30
-        )
-        data = r.json()
-        text = data.get("content", [{}])[0].get("text", "")
+        text = call_claude(messages, max_tokens=max_tok, system=system)
         return jsonify({"content": [{"type": "text", "text": text}]}), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# NOVA ROTA — /agendorchat/webhook  (AgendorChat → Luca → AgendorChat)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Payload esperado do AgendorChat:
+# {
+#   "conversation": { "id": "abc123" },
+#   "contact":      { "phone": "5531999990000", "name": "João" },
+#   "message":      { "text": "Olá, quero saber sobre contabilidade" }
+# }
+#
+# Resposta esperada (texto puro — AgendorChat envia ao lead):
+# { "text": "Olá! Tudo bem? ..." }
+
+@app.route("/agendorchat/webhook", methods=["POST", "OPTIONS"])
+def agendorchat_webhook():
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 200
+
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"text": "Olá! Nosso atendimento está temporariamente indisponível. Em breve retornaremos!"}), 200
+
+    try:
+        body = request.get_json(force=True) or {}
+
+        # ── Extrai campos do payload ──────────────────────────────────────────
+        conversation_id   = (body.get("conversation") or {}).get("id", "default")
+        contact_name      = (body.get("contact")      or {}).get("name", "")
+        contact_phone     = (body.get("contact")      or {}).get("phone", "")
+        message_text      = (body.get("message")      or {}).get("text", "").strip()
+
+        # Ignora mensagens vazias (p.ex. eventos de status)
+        if not message_text:
+            return jsonify({}), 200
+
+        print(f"[webhook] conv={conversation_id} | {contact_phone} | msg={message_text[:60]}", flush=True)
+
+        # ── Recupera ou inicializa histórico ──────────────────────────────────
+        if conversation_id not in conversation_histories:
+            # Primeira mensagem: injeta contexto do contato no system prompt
+            extra = ""
+            if contact_name:
+                extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
+            if contact_phone:
+                extra += f" Telefone/WhatsApp já disponível: {contact_phone}."
+            conversation_histories[conversation_id] = {
+                "system": SYSTEM_PROMPT + extra,
+                "messages": [],
+            }
+
+        conv = conversation_histories[conversation_id]
+
+        # ── Primeira mensagem da conversa = saudação do Luca ─────────────────
+        if not conv["messages"]:
+            greeting = (
+                "Olá! Tudo bem? Eu sou o Luca, da Lucralize. "
+                "É um prazer falar com você! Como posso te ajudar hoje?"
+            )
+            conv["messages"].append({"role": "assistant", "content": greeting})
+            # Ainda processa a primeira mensagem do lead logo abaixo
+
+        # ── Adiciona mensagem do lead ao histórico ────────────────────────────
+        conv["messages"].append({"role": "user", "content": message_text})
+
+        # ── Chama o Claude ────────────────────────────────────────────────────
+        reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
+
+        # ── Salva resposta no histórico ───────────────────────────────────────
+        conv["messages"].append({"role": "assistant", "content": reply})
+
+        # Limita histórico a 40 turnos (20 pares) para não explodir tokens
+        if len(conv["messages"]) > 40:
+            conv["messages"] = conv["messages"][-40:]
+
+        return jsonify({"text": reply}), 200
+
+    except Exception as e:
+        print(f"[webhook] Erro: {e}", flush=True)
+        # Nunca deixa o AgendorChat sem resposta
+        return jsonify({"text": "Tive um problema aqui, mas já estou resolvendo! Pode mandar sua dúvida de novo?"}), 200
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# NOVA ROTA — /agendar  (criar reunião Teams via Graph API)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Payload:
+# {
+#   "lead_name":  "João Silva",
+#   "lead_email": "joao@email.com",
+#   "start":      "2025-07-10T14:00:00"   ← horário de Brasília
+# }
+#
+# ATENÇÃO: requer permissão Calendars.ReadWrite no Azure AD (app-only).
+# Enquanto a permissão não for concedida pelo administrador, esta rota
+# retornará 503. Não há impacto nas demais rotas.
+
+@app.route("/agendar", methods=["POST", "OPTIONS"])
+def agendar():
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 200
+
+    try:
+        body       = request.get_json(force=True) or {}
+        lead_name  = body.get("lead_name", "Lead")
+        lead_email = body.get("lead_email", "")
+        start      = body.get("start", "")
+
+        if not lead_email or not start:
+            return jsonify({"error": "lead_email e start são obrigatórios"}), 400
+
+        result = create_teams_meeting(lead_name, lead_email, start)
+        return jsonify(result), 200
+
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        detail = ""
+        try:
+            detail = e.response.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if status == 403:
+            return jsonify({
+                "error": "Permissão Calendars.ReadWrite ainda não concedida no Azure AD.",
+                "detail": detail,
+                "action": "Solicite ao administrador do tenant que conceda a permissão e faça grant de admin consent."
+            }), 503
+        return jsonify({"error": str(e), "detail": detail}), 500
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SCHEDULER + MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
-scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
+scheduler.add_job(fetch_deals_safe, "date",
+                  run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.start()
 
 if __name__ == "__main__":
