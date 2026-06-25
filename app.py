@@ -429,16 +429,19 @@ def agendorchat_webhook():
     try:
         body = request.get_json(force=True) or {}
 
-        # ── Filtra apenas mensagens recebidas do lead ─────────────────────────
+        # ── Log completo para debug ───────────────────────────────────────────
         event        = body.get("event", "")
         message_type = body.get("message_type", "")
         sender_type  = (body.get("sender") or {}).get("type", "")
+        print(f"[webhook] RAW event={event} | message_type={message_type} | sender_type={sender_type}", flush=True)
+        print(f"[webhook] RAW payload={json.dumps(body)[:600]}", flush=True)
 
         # Ignora tudo que não seja mensagem nova do lead
-        # message_type "incoming" + sender type "contact" = lead escreveu
         if event != "message_created":
+            print(f"[webhook] IGNORADO event={event}", flush=True)
             return jsonify({}), 200
         if message_type != "incoming" or sender_type != "contact":
+            print(f"[webhook] IGNORADO message_type={message_type} sender_type={sender_type}", flush=True)
             return jsonify({}), 200
 
         # ── Extrai campos do payload ──────────────────────────────────────────
