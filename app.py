@@ -440,8 +440,8 @@ def agendorchat_webhook():
         if event != "message_created":
             print(f"[webhook] IGNORADO event={event}", flush=True)
             return jsonify({}), 200
-        if message_type != "incoming" or sender_type != "contact":
-            print(f"[webhook] IGNORADO message_type={message_type} sender_type={sender_type}", flush=True)
+        if message_type != "incoming":
+            print(f"[webhook] IGNORADO message_type={message_type}", flush=True)
             return jsonify({}), 200
 
         # ── Extrai campos do payload ──────────────────────────────────────────
