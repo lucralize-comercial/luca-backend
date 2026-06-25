@@ -13,7 +13,7 @@ AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f2
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAb8RN6KIUKrwvECjuMww3qyVm2skXYgDlmG5UmscUWky0ffr1Q")
 
 cache = {"deals": [], "total": 0, "updated_at": None}
 
