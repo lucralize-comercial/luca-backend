@@ -377,6 +377,130 @@ def send_agendorchat_message(conversation_id: int, text: str):
     return resp.json()
 
 
+def send_private_note(conversation_id: int, text: str):
+    """Cria ou atualiza nota interna visível apenas para agentes."""
+    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+    resp = requests.post(
+        url,
+        headers={
+            "api_access_token": AGENDORCHAT_TOKEN,
+            "Content-Type":     "application/json",
+        },
+        json={"content": text, "message_type": "outgoing", "private": True},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_conversation_history(conversation_id: int) -> list:
+    """Busca histórico de mensagens da conversa no AgendorChat e retorna no formato Claude."""
+    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+    try:
+        resp = requests.get(
+            url,
+            headers={"api_access_token": AGENDORCHAT_TOKEN},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        messages = data.get("payload", [])
+
+        history = []
+        for msg in messages:
+            # Ignora mensagens privadas (notas internas) e vazias
+            if msg.get("private"):
+                continue
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            msg_type = msg.get("message_type")
+            # 0 = incoming (lead), 1 = outgoing (agente/Luca)
+            if msg_type == 0:
+                history.append({"role": "user", "content": content})
+            elif msg_type == 1:
+                history.append({"role": "assistant", "content": content})
+
+        return history
+    except Exception as e:
+        print(f"[history] Erro ao buscar histórico conv={conversation_id}: {e}", flush=True)
+        return []
+
+
+def build_lead_note(conv_data: dict) -> str:
+    """Monta o texto da nota interna com o resumo do lead."""
+    nome       = conv_data.get("nome", "Não informado")
+    segmento   = conv_data.get("segmento", "Não identificado")
+    necessidade = conv_data.get("necessidade", "Não informada")
+    email      = conv_data.get("email", "Não informado")
+    preferencia = conv_data.get("preferencia", "")
+    status     = conv_data.get("status", "Em atendimento")
+
+    note = (
+        f"📋 Resumo do Lead
+"
+        f"Nome: {nome}
+"
+        f"Segmento: {segmento}
+"
+        f"Necessidade: {necessidade}
+"
+        f"E-mail: {email}
+"
+    )
+    if preferencia:
+        note += f"Preferência: {preferencia}
+"
+    note += f"Status: {status}"
+    return note
+
+
+def extract_lead_data(messages: list, contact_name: str) -> dict:
+    """Usa o Claude para extrair dados do lead a partir do histórico."""
+    if not messages:
+        return {}
+    
+    history_text = "
+".join([
+        f"{'Lead' if m['role'] == 'user' else 'Luca'}: {m['content']}"
+        for m in messages[-20:]  # últimas 20 mensagens
+    ])
+    
+    prompt = f"""Com base nessa conversa, extraia as informações do lead em JSON.
+Retorne APENAS o JSON, sem texto adicional.
+
+Conversa:
+{history_text}
+
+Retorne este JSON (deixe em branco se não informado):
+{{
+  "nome": "",
+  "segmento": "",
+  "necessidade": "",
+  "email": "",
+  "preferencia": "",
+  "status": ""
+}}
+
+Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-mail" | "Preferência informada: [dia] às [horário]" | "Agendamento confirmado"
+"""
+    try:
+        reply = call_claude(
+            [{"role": "user", "content": prompt}],
+            max_tokens=300,
+            system="Você extrai dados estruturados de conversas. Retorne apenas JSON válido."
+        )
+        # Remove possíveis backticks
+        reply = reply.replace("```json", "").replace("```", "").strip()
+        data = json.loads(reply)
+        if contact_name and not data.get("nome"):
+            data["nome"] = contact_name
+        return data
+    except Exception as e:
+        print(f"[note] Erro ao extrair dados: {e}", flush=True)
+        return {"nome": contact_name}
+
+
 @app.route("/agendorchat/webhook", methods=["POST", "OPTIONS"])
 def agendorchat_webhook():
     if request.method == "OPTIONS":
@@ -433,22 +557,29 @@ def agendorchat_webhook():
             if contact_phone:
                 extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
             conversation_histories[conv_key] = {
-                "system":   SYSTEM_PROMPT + extra,
-                "messages": [],
+                "system":    SYSTEM_PROMPT + extra,
+                "messages":  [],
+                "note_id":   None,   # ID da última nota interna criada
+                "lead_data": {"nome": contact_name},
             }
 
         conv = conversation_histories[conv_key]
 
-        # ── Se é primeira mensagem, injeta saudação do Luca no histórico ─────
-        # (para o Claude saber que já se apresentou)
+        # ── Se memória está vazia, busca histórico real do AgendorChat ────────
         if not conv["messages"]:
-            conv["messages"].append({
-                "role":    "assistant",
-                "content": (
-                    "Olá! Tudo bem? Eu sou o Luca, da Lucralize. "
-                    "É um prazer falar com você! Como posso te ajudar hoje?"
-                ),
-            })
+            remote_history = fetch_conversation_history(conversation_id)
+            if remote_history:
+                print(f"[history] Recuperados {len(remote_history)} msgs da conv={conversation_id}", flush=True)
+                conv["messages"] = remote_history
+            else:
+                # Sem histórico remoto: injeta saudação inicial
+                conv["messages"].append({
+                    "role":    "assistant",
+                    "content": (
+                        "Olá! Tudo bem? Eu sou o Luca, da Lucralize. "
+                        "É um prazer falar com você! Como posso te ajudar hoje?"
+                    ),
+                })
 
         # ── Adiciona mensagem do lead e chama o Claude ────────────────────────
         conv["messages"].append({"role": "user", "content": message_text})
@@ -461,6 +592,17 @@ def agendorchat_webhook():
 
         # ── Envia resposta de volta ao AgendorChat ────────────────────────────
         send_agendorchat_message(conversation_id, reply)
+
+        # ── Atualiza nota interna com resumo do lead ──────────────────────────
+        try:
+            lead_data = extract_lead_data(conv["messages"], contact_name)
+            if lead_data:
+                conv["lead_data"].update({k: v for k, v in lead_data.items() if v})
+                note_text = build_lead_note(conv["lead_data"])
+                send_private_note(conversation_id, note_text)
+                print(f"[note] Nota atualizada conv={conversation_id}", flush=True)
+        except Exception as e:
+            print(f"[note] Erro ao atualizar nota: {e}", flush=True)
 
         return jsonify({"status": "ok"}), 200
 
