@@ -63,9 +63,13 @@ Se o lead perguntar sobre tributação ou quanto pagaria de imposto, sugira a ca
 - WhatsApp: "Posso usar esse número aqui para o contato?" (NUNCA peça telefone — ele já está disponível)
 
 8. HORÁRIO: "Qual o melhor dia e horário? Atendemos seg a qui das 9h às 17h e sex das 9h às 16h30. São só 20 minutinhos!"
-Se sugerir horário fora desses, redirecione gentilmente.
+Horários válidos: seg a qui 09h-17h, sex 09h-16h30. Sem almoço 12h-13h. Sem fins de semana.
+NUNCA sugira sábado ou domingo. Se o lead sugerir fim de semana, oriente: "Nosso atendimento é de segunda a sexta. Qual dia funciona melhor?"
+Se o lead pedir hoje e estiver dentro do horário, aceite. Se for fora do horário ou fim de semana, sugira o próximo dia útil — nunca "amanhã" se amanhã for sábado ou domingo.
+NUNCA prometa verificar agenda, que o consultor liga agora ou que vai encaixar o lead — apenas anote a preferência.
 
-9. ENCERRAMENTO: "Perfeito! Anotei sua preferência para [dia] às [horário]. Nosso consultor confirma pelo WhatsApp em breve. Qualquer dúvida, estou por aqui!"
+9. ENCERRAMENTO: "Perfeito! Anotei sua preferência para [dia] às [horário]. Nosso consultor confirma o agendamento pelo WhatsApp em breve. Qualquer dúvida, estou por aqui!"
+NUNCA diga que vai verificar a agenda ou que o consultor liga agora — apenas confirme que anotou.
 
 RESISTÊNCIAS COMUNS:
 - "Quero falar com um atendente": "Claro! O consultor especializado é exatamente quem vai te atender — vamos marcar essa conversa?"
@@ -78,8 +82,10 @@ SE PERGUNTAREM SE VOCÊ É IA OU ROBÔ:
 
 REGRAS INEGOCIÁVEIS:
 - NUNCA escreva "[nome]" ou texto entre colchetes — use o nome real ou não use
+- NUNCA use e-mail como nome — se não souber o nome, pergunte
 - NUNCA informe preços ou valores
-- NUNCA invente informações
+- NUNCA invente informações ou prometa coisas que não pode cumprir (verificar agenda, ligar agora, encaixar hoje)
+- NUNCA sugira fins de semana — apenas dias úteis seg a sex
 - NUNCA deixe a conversa morrer — sempre termine com pergunta ou próximo passo
 - Máximo 4 linhas por mensagem
 - Texto puro, sem asteriscos, sem markdown
@@ -453,21 +459,16 @@ def build_lead_note(conv_data: dict) -> str:
     preferencia = conv_data.get("preferencia", "")
     status     = conv_data.get("status", "Em atendimento")
 
-    note = (
-        f"📋 Resumo do Lead
-"
-        f"Nome: {nome}
-"
-        f"Segmento: {segmento}
-"
-        f"Necessidade: {necessidade}
-"
-        f"E-mail: {email}
-"
-    )
+    lines = [
+        "📋 Resumo do Lead",
+        f"Nome: {nome}",
+        f"Segmento: {segmento}",
+        f"Necessidade: {necessidade}",
+        f"E-mail: {email}",
+    ]
     if preferencia:
-        note += f"Preferência: {preferencia}
-"
+        lines.append(f"Preferência: {preferencia}")
+    note = "\n".join(lines)
     note += f"Status: {status}"
     return note
 
@@ -477,10 +478,9 @@ def extract_lead_data(messages: list, contact_name: str) -> dict:
     if not messages:
         return {}
     
-    history_text = "
-".join([
-        f"{'Lead' if m['role'] == 'user' else 'Luca'}: {m['content']}"
-        for m in messages[-20:]  # últimas 20 mensagens
+    history_text = "\n".join([
+        ("Lead: " if m["role"] == "user" else "Luca: ") + m["content"]
+        for m in messages[-20:]
     ])
     
     prompt = f"""Com base nessa conversa, extraia as informações do lead em JSON.
