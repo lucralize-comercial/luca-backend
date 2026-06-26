@@ -404,6 +404,13 @@ def agendorchat_webhook():
             print(f"[webhook] IGNORADO message_type={message_type}", flush=True)
             return jsonify({}), 200
 
+        # ── Ignora se há agente humano atribuído à conversa ───────────────────
+        conversation_meta = (body.get("conversation") or {}).get("meta") or {}
+        assignee = conversation_meta.get("assignee")
+        if assignee and assignee.get("type") == "user":
+            print(f"[webhook] IGNORADO agente humano atribuído: {assignee.get('name')}", flush=True)
+            return jsonify({}), 200
+
         # ── Extrai campos do payload ──────────────────────────────────────────
         message_text    = (body.get("content") or "").strip()
         conversation    = body.get("conversation") or {}
