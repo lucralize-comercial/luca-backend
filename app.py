@@ -377,6 +377,23 @@ def send_agendorchat_message(conversation_id: int, text: str):
     return resp.json()
 
 
+def toggle_typing(inbox_identifier: str, contact_identifier: str, conversation_id: int, status: str = "on"):
+    """Ativa ou desativa o indicador 'digitando...' no AgendorChat."""
+    url = (
+        f"https://chat.agendor.com.br/public/api/v1/inboxes/{inbox_identifier}"
+        f"/contacts/{contact_identifier}/conversations/{conversation_id}/toggle_typing"
+    )
+    try:
+        requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={"typing_status": status},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[typing] Erro: {e}", flush=True)
+
+
 def send_private_note(conversation_id: int, text: str):
     """Cria ou atualiza nota interna visível apenas para agentes."""
     url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
@@ -543,6 +560,11 @@ def agendorchat_webhook():
         contact_name    = meta_sender.get("name", "")
         contact_phone   = meta_sender.get("phone_number", "")
 
+        # Identificadores para Toggle Typing (API pública)
+        contact_inbox     = conversation.get("contact_inbox") or {}
+        inbox_identifier  = contact_inbox.get("source_id", "")
+        contact_identifier = contact_inbox.get("pubsub_token", "")
+
         if not message_text or not conversation_id:
             return jsonify({}), 200
 
@@ -583,7 +605,15 @@ def agendorchat_webhook():
 
         # ── Adiciona mensagem do lead e chama o Claude ────────────────────────
         conv["messages"].append({"role": "user", "content": message_text})
+
+        # Ativa "digitando..." enquanto o Claude processa
+        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
+
         reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
+
+        # Desativa "digitando..."
+        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
+
         conv["messages"].append({"role": "assistant", "content": reply})
 
         # Limita histórico a 40 turnos para não explodir tokens
