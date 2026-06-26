@@ -76,6 +76,7 @@ RESISTÊNCIAS COMUNS:
 - "Quanto custa?": "O valor depende do seu perfil — o especialista te mostra isso na conversa, junto com o que faz mais sentido pra você. Qual o melhor dia?"
 - "Me manda mais informações": "Posso te contar o básico aqui, mas o que vai realmente fazer diferença é a conversa com o especialista — ele adapta tudo pro seu caso. Tem 20 minutos essa semana?"
 - "Vou pensar": "Claro, sem pressa! Só deixa eu já reservar um horário pra você — se não der, é só avisar. Qual dia costuma ser melhor?"
+- Lead em momento incerto (aguardando contrato, decisão, etc.): não force o agendamento. Use: "O que eu sugiro: vamos te deixar aqui em nosso acompanhamento. Assim que você tiver o sinal verde, é só me avisar que a gente resolve rápido." NUNCA diga "lista de espera". Após esse encerramento, NÃO faça mais nenhuma pergunta — deixe a conversa terminar naturalmente.
 
 SE PERGUNTAREM SE VOCÊ É IA OU ROBÔ:
 "Faço parte do time comercial da Lucralize. Mas me conta, como posso te ajudar?"
@@ -561,9 +562,10 @@ def agendorchat_webhook():
         contact_phone   = meta_sender.get("phone_number", "")
 
         # Identificadores para Toggle Typing (API pública)
-        contact_inbox     = conversation.get("contact_inbox") or {}
-        inbox_identifier  = contact_inbox.get("source_id", "")
+        contact_inbox      = conversation.get("contact_inbox") or {}
+        inbox_identifier   = contact_inbox.get("source_id", "")
         contact_identifier = contact_inbox.get("pubsub_token", "")
+        print(f"[typing] inbox_identifier={inbox_identifier} | contact_identifier={contact_identifier}", flush=True)
 
         if not message_text or not conversation_id:
             return jsonify({}), 200
@@ -581,8 +583,9 @@ def agendorchat_webhook():
             conversation_histories[conv_key] = {
                 "system":    SYSTEM_PROMPT + extra,
                 "messages":  [],
-                "note_id":   None,   # ID da última nota interna criada
+                "note_id":   None,
                 "lead_data": {"nome": contact_name},
+                "last_msg_at": time.time(),
             }
 
         conv = conversation_histories[conv_key]
@@ -603,8 +606,24 @@ def agendorchat_webhook():
                     ),
                 })
 
+        # ── Detecta retomada após longa ausência (>2h) ───────────────────────
+        now = time.time()
+        last_msg_at = conv.get("last_msg_at", now)
+        elapsed_minutes = (now - last_msg_at) / 60
+        conv["last_msg_at"] = now
+
+        # ── Monta mensagem do lead com contexto de retomada se necessário ────
+        user_content = message_text
+        if elapsed_minutes > 120 and len(conv["messages"]) > 1:
+            retomada = (
+                "[O lead ficou ausente por " + str(int(elapsed_minutes // 60)) + "h e voltou. "
+                "Inicie sua resposta com uma retomada leve e natural, como 'Retomando por aqui!' "
+                "e continue de onde a conversa parou.]\n\n" + message_text
+            )
+            user_content = retomada
+
         # ── Adiciona mensagem do lead e chama o Claude ────────────────────────
-        conv["messages"].append({"role": "user", "content": message_text})
+        conv["messages"].append({"role": "user", "content": user_content})
 
         # Ativa "digitando..." enquanto o Claude processa
         toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
@@ -613,6 +632,10 @@ def agendorchat_webhook():
 
         # Desativa "digitando..."
         toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
+
+        # Salva no histórico sem o contexto de retomada (para não poluir)
+        if elapsed_minutes > 120 and len(conv["messages"]) > 1:
+            conv["messages"][-1] = {"role": "user", "content": message_text}
 
         conv["messages"].append({"role": "assistant", "content": reply})
 
@@ -623,16 +646,31 @@ def agendorchat_webhook():
         # ── Envia resposta de volta ao AgendorChat ────────────────────────────
         send_agendorchat_message(conversation_id, reply)
 
-        # ── Atualiza nota interna com resumo do lead ──────────────────────────
+        # ── Nota interna — dados completos ou conversa encerrada ─────────────
         try:
             lead_data = extract_lead_data(conv["messages"], contact_name)
             if lead_data:
                 conv["lead_data"].update({k: v for k, v in lead_data.items() if v})
-                note_text = build_lead_note(conv["lead_data"])
-                send_private_note(conversation_id, note_text)
-                print(f"[note] Nota atualizada conv={conversation_id}", flush=True)
+                d = conv["lead_data"]
+
+                dados_completos = (
+                    d.get("nome") and d.get("nome") != "Não informado"
+                    and d.get("segmento") and d.get("segmento") != "Não identificado"
+                    and d.get("necessidade") and d.get("necessidade") != "Não informada"
+                    and d.get("email") and d.get("email") != "Não informado"
+                )
+
+                # Detecta encerramento por acompanhamento
+                termos_encerramento = ["acompanhamento", "sinal verde", "é só me avisar", "estou por aqui"]
+                conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
+
+                if (dados_completos or conversa_encerrada) and not conv.get("note_sent"):
+                    note_text = build_lead_note(d)
+                    send_private_note(conversation_id, note_text)
+                    conv["note_sent"] = True
+                    print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
         except Exception as e:
-            print(f"[note] Erro ao atualizar nota: {e}", flush=True)
+            print(f"[note] Erro ao processar nota: {e}", flush=True)
 
         return jsonify({"status": "ok"}), 200
 
