@@ -432,7 +432,7 @@ def autentique_debug():
     query = "{ documents(page: 1) { total data { id name created_at } } }"
     try:
         r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
-        return jsonify({"status": r.status_code, "body": r.json()})
+        return jsonify({"status": r.status_code, "headers": dict(r.headers), "body_raw": r.text[:2000]})
     except Exception as e:
         return jsonify({"error": str(e)})
 def autentique_refresh():
