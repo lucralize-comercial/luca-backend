@@ -105,12 +105,25 @@ REGRAS INEGOCIÁVEIS:
 - Texto puro, sem asteriscos, sem markdown
 - NUNCA use travessão (—) em suas respostas. Use vírgula, ponto ou reformule a frase em duas frases curtas
 - Escreva em português brasileiro correto e natural, com atenção especial à concordância verbal e de número/gênero. Revise mentalmente a frase antes de enviar
+- Se o lead fizer uma pergunta ambígua, revise o histórico ANTES de pedir contexto. Se a pergunta dele claramente se referir a algo já mencionado no histórico (ex: uma mensagem anterior, mesmo que não escrita por você, falando de "condições especiais" ou uma oferta), entregue essa informação primeiro, no que ela realmente quer saber, antes de qualquer pergunta de qualificação. Só peça contexto ("Ah, me conta mais! O que você quer saber especificamente?") se a pergunta não tiver nenhuma referência clara no histórico.
+- Quando o lead responder afirmativamente a um convite ou gancho que está no histórico (ex: "tem um momento pra eu te contar?" seguido de "Claro"), primeiro entregue o que foi prometido (as condições, diferenciais, etc.), e só depois conecte com a próxima pergunta natural do funil (ex: se já tem empresa aberta).
 - Responda apenas em português brasileiro"""
 
 
 AGENDORCHAT_TOKEN      = os.environ.get("AGENDORCHAT_TOKEN", "3t9nxq9fmZLyd9SfH7JEsqK8")
 AGENDORCHAT_ACCOUNT_ID = os.environ.get("AGENDORCHAT_ACCOUNT_ID", "1035")
 AGENDORCHAT_BASE       = "https://chat.agendor.com.br/api/v1"
+
+
+def saudacao_atual() -> str:
+    """Retorna a saudação adequada com base no horário de Brasília."""
+    hora_brasilia = (datetime.utcnow() - timedelta(hours=3)).hour
+    if 5 <= hora_brasilia < 12:
+        return "Bom dia"
+    elif 12 <= hora_brasilia < 18:
+        return "Boa tarde"
+    else:
+        return "Boa noite"
 
 
 def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROMPT) -> str:
@@ -670,10 +683,14 @@ def agendorchat_webhook():
         # ── Monta mensagem do lead com contexto de retomada se necessário ────
         user_content = message_text
         if elapsed_minutes > 120 and len(conv["messages"]) > 1:
+            saudacao = saudacao_atual()
             retomada = (
-                "[O lead ficou ausente por " + str(int(elapsed_minutes // 60)) + "h e voltou. "
-                "Inicie sua resposta com uma retomada leve e natural, como 'Retomando por aqui!' "
-                "e continue de onde a conversa parou.]\n\n" + message_text
+                "[O lead ficou ausente por " + str(int(elapsed_minutes // 60)) + "h e voltou, mandando apenas uma saudação curta. "
+                "Comece respondendo a saudação dele normalmente, usando \"" + saudacao + "\" (horário atual de Brasília), de forma calorosa. "
+                "Depois disso, NÃO trate o resto como uma conversa nova e NÃO pergunte genericamente 'o que você precisa' ou similar. "
+                "Volte exatamente ao ponto em que a conversa parou: revise as últimas mensagens acima e continue "
+                "a partir da última pergunta ou pendência que ficou em aberto (ex: se você tinha perguntado o faturamento "
+                "ou sugerido um dia para a reunião, repita ou retome esse mesmo ponto).]\n\n" + message_text
             )
             user_content = retomada
 
@@ -847,10 +864,13 @@ def agendorchat_conversation_updated():
                 messages_for_call = list(conv["messages"])
                 if messages_for_call and messages_for_call[-1]["role"] == "user":
                     last_content = messages_for_call[-1]["content"]
+                    saudacao = saudacao_atual()
                     messages_for_call[-1] = {
                         "role": "user",
                         "content": (
                             "[Esta é a mensagem mais recente do lead, ainda sem resposta. "
+                            "Se for apenas uma saudação curta (oi, olá, etc.), responda com \"" + saudacao + "\" "
+                            "de forma calorosa antes de continuar. "
                             "Responda diretamente a ela, considerando todo o histórico acima, "
                             "sem repetir despedidas ou frases de encerramento anteriores.]\n\n"
                             + last_content
