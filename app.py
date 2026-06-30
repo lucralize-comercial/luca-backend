@@ -433,9 +433,21 @@ Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-ma
     except Exception as e:
         print(f"[note] Erro ao extrair dados: {e}", flush=True)
         return {"nome": contact_name}
-
-
-@app.route("/agendorchat/webhook", methods=["POST", "OPTIONS"])
+    try:
+        reply = call_claude(
+            [{"role": "user", "content": prompt}],
+            max_tokens=300,
+            system="Você extrai dados estruturados de conversas. Retorne apenas JSON válido."
+        )
+        # Remove possíveis backticks
+        reply = reply.replace("```json", "").replace("```", "").strip()
+        data = json.loads(reply)
+        if contact_name and not data.get("nome"):
+            data["nome"] = contact_name
+        return data
+    except Exception as e:
+        print(f"[note] Erro ao extrair dados: {e}", flush=True)
+        return {"nome": contact_name}
 def agendorchat_webhook():
     if request.method == "OPTIONS":
         resp = jsonify({})
@@ -593,24 +605,6 @@ def agendorchat_webhook():
     except Exception as e:
         print(f"[webhook] Erro: {e}", flush=True)
         return jsonify({"status": "error", "detail": str(e)}), 200
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# NOVA ROTA — /agendar  (criar reunião Teams via Graph API)
-# ═════════════════════════════════════════════════════════════════════════════
-#
-# Payload:
-# {
-#   "lead_name":  "João Silva",
-#   "lead_email": "joao@email.com",
-#   "start":      "2025-07-10T14:00:00"   ← horário de Brasília
-# }
-#
-# ATENÇÃO: requer permissão Calendars.ReadWrite no Azure AD (app-only).
-# Enquanto a permissão não for concedida pelo administrador, esta rota
-# retornará 503. Não há impacto nas demais rotas.
-
-@app.route("/agendar", methods=["POST", "OPTIONS"])
 def agendar():
     if request.method == "OPTIONS":
         resp = jsonify({})
