@@ -434,17 +434,15 @@ def autentique():
 @app.route("/autentique/debug")
 def autentique_debug():
     headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
-    introspect = """
+    query = """
     {
-      __type(name: "Signature") { fields { name type { name kind ofType { name kind } } } }
-      __type2: __type(name: "Event") { fields { name type { name kind ofType { name kind } } } }
+      sig: __type(name: "Signature") { fields { name type { name kind ofType { name kind } } } }
+      doc: __type(name: "Document") { fields { name type { name kind ofType { name kind } } } }
     }
     """
-    sample = """{ documents(page: 1) { total data { id name created_at signatures { name signed { created_at } } } } }"""
     try:
-        r1 = requests.post(AUTENTIQUE_BASE, json={"query": introspect}, headers=headers, timeout=30)
-        r2 = requests.post(AUTENTIQUE_BASE, json={"query": sample}, headers=headers, timeout=30)
-        return jsonify({"introspection": r1.json(), "sample": r2.text[:2000]})
+        r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
+        return jsonify(r.json())
     except Exception as e:
         return jsonify({"error": str(e)})
 def autentique_refresh():
