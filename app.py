@@ -16,7 +16,7 @@ AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AUTENTIQUE_TOKEN = os.environ.get("AUTENTIQUE_TOKEN", "49cde424806e0f64f13bbee6c782e6f8693762078a3f58a0ae34b5bce4268686")
-AUTENTIQUE_BASE = "https://api.autentique.com.br/2/graphql"
+AUTENTIQUE_BASE = "https://api.autentique.com.br/v2/graphql"
 
 FUNIS_HISTORICO = ["Funil Comercial"]
 HISTORICO_DIAS = 30
@@ -429,20 +429,12 @@ def autentique():
 @app.route("/autentique/debug")
 def autentique_debug():
     headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
-    query = "{ documents(page: 1) { total data { id name created_at } } }"
-    resultados = {}
-    endpoints = [
-        "https://api.autentique.com.br/2/graphql",
-        "https://api.autentique.com.br/graphql",
-        "https://api.autentique.com.br/v2/graphql",
-    ]
-    for url in endpoints:
-        try:
-            r = requests.post(url, json={"query": query}, headers=headers, timeout=15)
-            resultados[url] = {"status": r.status_code, "body": r.text[:500]}
-        except Exception as e:
-            resultados[url] = {"error": str(e)}
-    return jsonify(resultados)
+    query = """{ documents(page: 1) { total data { id name created_at signatures { name signed signed_at } } } }"""
+    try:
+        r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
+        return jsonify({"status": r.status_code, "body": r.text[:3000]})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 def autentique_refresh():
     threading.Thread(target=fetch_autentique_all, daemon=True).start()
     return jsonify({"status": "ok"})
