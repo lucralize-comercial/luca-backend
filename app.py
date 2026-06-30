@@ -394,11 +394,9 @@ def fetch_autentique_all():
               id
               name
               created_at
-              created_by { name email }
               signatures {
                 name
                 email
-                action
                 signed { created_at }
                 rejected { created_at }
               }
@@ -408,7 +406,11 @@ def fetch_autentique_all():
         """
         try:
             r = requests.post(AUTENTIQUE_BASE, json={"query": query, "variables": {"page": page}}, headers=headers, timeout=30)
+            print(f"Autentique p{page} status={r.status_code} body={r.text[:300]}", flush=True)
             data = r.json()
+            if data.get("errors"):
+                print(f"Autentique erros: {data['errors']}", flush=True)
+                break
             docs = data.get("data", {}).get("documents", {}).get("data", [])
             total = data.get("data", {}).get("documents", {}).get("total", 0)
             all_docs.extend(docs)
