@@ -396,8 +396,9 @@ def fetch_autentique_all():
               created_at
               signatures {
                 name
-                signed
-                signed_at
+                email
+                signed { created_at }
+                rejected { created_at }
               }
             }
           }
@@ -429,10 +430,17 @@ def autentique():
 @app.route("/autentique/debug")
 def autentique_debug():
     headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
-    query = """{ documents(page: 1) { total data { id name created_at signatures { name signed { created_at } } } } }"""
+    introspect = """
+    {
+      __type(name: "Signature") { fields { name type { name kind ofType { name kind } } } }
+      __type2: __type(name: "Event") { fields { name type { name kind ofType { name kind } } } }
+    }
+    """
+    sample = """{ documents(page: 1) { total data { id name created_at signatures { name signed { created_at } } } } }"""
     try:
-        r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
-        return jsonify({"status": r.status_code, "body": r.text[:3000]})
+        r1 = requests.post(AUTENTIQUE_BASE, json={"query": introspect}, headers=headers, timeout=30)
+        r2 = requests.post(AUTENTIQUE_BASE, json={"query": sample}, headers=headers, timeout=30)
+        return jsonify({"introspection": r1.json(), "sample": r2.text[:2000]})
     except Exception as e:
         return jsonify({"error": str(e)})
 def autentique_refresh():
