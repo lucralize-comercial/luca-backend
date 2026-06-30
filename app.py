@@ -690,13 +690,6 @@ def refresh_tasks():
     t.start()
     return jsonify({"status": "started"}), 200
 
-@app.route("/refresh-tasks", methods=["POST"])
-def refresh_tasks():
-    t = threading.Thread(target=fetch_tasks_job)
-    t.daemon = True
-    t.start()
-    return jsonify({"status": "started"}), 200
-
 @app.route("/reset-fetch", methods=["POST"])
 def reset_fetch():
     global fetch_running, fetch_started_at, history_running
