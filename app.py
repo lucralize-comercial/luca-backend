@@ -309,9 +309,12 @@ def fetch_deals():
         time.sleep(0.1)
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    t1 = threading.Timer(5.0, fetch_history_job)
-    t1.daemon = True
-    t1.start()
+    # Desativado: endpoint /deals/{id}/history retorna 404 na API v3 do Agendor
+    # (não existe mais), e o dashboard nunca consome /history-cache. Mantido o
+    # código de fetch_history_job intacto abaixo, caso a Agendor reative o endpoint.
+    # t1 = threading.Timer(5.0, fetch_history_job)
+    # t1.daemon = True
+    # t1.start()
     t2 = threading.Timer(10.0, fetch_tasks_job)
     t2.daemon = True
     t2.start()
