@@ -426,7 +426,15 @@ def autentique():
         fetch_autentique_all()
     return jsonify({"data": autentique_cache["data"], "total": len(autentique_cache["data"]), "updated_at": autentique_cache["updated_at"]})
 
-@app.route("/autentique/refresh", methods=["POST"])
+@app.route("/autentique/debug")
+def autentique_debug():
+    headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
+    query = "{ documents(page: 1) { total data { id name created_at } } }"
+    try:
+        r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
+        return jsonify({"status": r.status_code, "body": r.json()})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 def autentique_refresh():
     threading.Thread(target=fetch_autentique_all, daemon=True).start()
     return jsonify({"status": "ok"})
