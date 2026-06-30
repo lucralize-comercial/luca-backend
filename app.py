@@ -85,6 +85,12 @@ RESISTÊNCIAS COMUNS:
 - "Vou pensar": "Claro, sem pressa! Só deixa eu já reservar um horário pra você, se não der, é só avisar. Qual dia costuma ser melhor?"
 - Lead em momento incerto (aguardando contrato, decisão, etc.): não force o agendamento. Use: "O que eu sugiro: vamos te deixar aqui em nosso acompanhamento. Assim que você tiver o sinal verde, é só me avisar que a gente resolve rápido." NUNCA diga "lista de espera". Após esse encerramento, NÃO faça mais nenhuma pergunta. Deixe a conversa terminar naturalmente.
 
+RECUSA EXPLÍCITA ("não tenho interesse", "não quero", "não preciso"):
+Trate como objeção, não como encerramento automático. Primeiro, tente entender o motivo ou ofereça algo mais leve, sem pressão de agendamento: "Tudo bem! Posso te ajudar com alguma dúvida específica, sem compromisso de marcar nada?"
+Se a resposta do lead deixar QUALQUER abertura (ele responde, faz uma pergunta, demonstra curiosidade), continue ajudando normalmente, sem forçar volta ao roteiro de qualificação.
+Só recue de verdade quando a recusa for clara e repetida, sem nenhuma abertura. Nesse caso: "Sem problemas, Thiago! Qualquer coisa, estou por aqui." E pare. Não insista, não pergunte de novo sobre segmento ou agendamento.
+Avalie pelo contexto, não por uma contagem fixa de recusas. O sinal é se a porta ficou aberta ou fechada na resposta do lead.
+
 SE PERGUNTAREM SE VOCÊ É IA OU ROBÔ:
 "Faço parte do time comercial da Lucralize. Mas me conta, como posso te ajudar?"
 
@@ -98,6 +104,7 @@ REGRAS INEGOCIÁVEIS:
 - Máximo 4 linhas por mensagem
 - Texto puro, sem asteriscos, sem markdown
 - NUNCA use travessão (—) em suas respostas. Use vírgula, ponto ou reformule a frase em duas frases curtas
+- Escreva em português brasileiro correto e natural, com atenção especial à concordância verbal e de número/gênero. Revise mentalmente a frase antes de enviar
 - Responda apenas em português brasileiro"""
 
 
@@ -673,6 +680,19 @@ def agendorchat_webhook():
         # ── Adiciona mensagem do lead e chama o Claude ────────────────────────
         conv["messages"].append({"role": "user", "content": user_content})
 
+        # ── Agrupamento de mensagens em sequência rápida ──────────────────────
+        # Marca esta como a versão mais recente da conversa e espera um pouco
+        # para ver se o lead manda mais mensagens antes de responder.
+        msg_token = time.time()
+        conv["latest_msg_token"] = msg_token
+        time.sleep(2.5)
+
+        # Se durante a espera chegou mensagem mais nova, esta requisição desiste
+        # silenciosamente — a requisição da mensagem mais nova vai responder por todas.
+        if conv.get("latest_msg_token") != msg_token:
+            print(f"[webhook] Mensagem agrupada — outra mais recente chegou, conv={conversation_id}", flush=True)
+            return jsonify({"status": "grouped"}), 200
+
         # Ativa "digitando..." enquanto o Claude processa
         toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
 
@@ -822,7 +842,22 @@ def agendorchat_conversation_updated():
                 conv["messages"] = remote_history
 
             if conv["messages"]:
-                reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
+                # Marca a última mensagem do lead como pendente de resposta direta,
+                # evitando que o Claude apenas continue um padrão anterior (ex: despedida)
+                messages_for_call = list(conv["messages"])
+                if messages_for_call and messages_for_call[-1]["role"] == "user":
+                    last_content = messages_for_call[-1]["content"]
+                    messages_for_call[-1] = {
+                        "role": "user",
+                        "content": (
+                            "[Esta é a mensagem mais recente do lead, ainda sem resposta. "
+                            "Responda diretamente a ela, considerando todo o histórico acima, "
+                            "sem repetir despedidas ou frases de encerramento anteriores.]\n\n"
+                            + last_content
+                        ),
+                    }
+
+                reply = call_claude(messages_for_call, max_tokens=300, system=conv["system"])
                 conv["messages"].append({"role": "assistant", "content": reply})
                 send_agendorchat_message(conversation_id, reply)
                 print(f"[conv_updated] Luca respondeu conv={conversation_id}", flush=True)
