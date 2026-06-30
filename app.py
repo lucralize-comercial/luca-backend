@@ -105,20 +105,26 @@ AGENDORCHAT_ACCOUNT_ID = os.environ.get("AGENDORCHAT_ACCOUNT_ID", "1035")
 AGENDORCHAT_BASE       = "https://chat.agendor.com.br/api/v1"
 
 
-def send_agendorchat_message(conversation_id: int, text: str):
-    """Envia resposta do Luca de volta ao lead via API do AgendorChat."""
-    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROMPT) -> str:
+    """Chama a API Anthropic e retorna o texto da resposta."""
     resp = requests.post(
-        url,
+        "https://api.anthropic.com/v1/messages",
         headers={
-            "api_access_token": AGENDORCHAT_TOKEN,
-            "Content-Type":     "application/json",
+            "x-api-key":         ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type":      "application/json",
         },
-        json={"content": text, "message_type": "outgoing", "private": False},
-        timeout=15,
+        json={
+            "model":      "claude-sonnet-4-5",
+            "max_tokens": max_tokens,
+            "system":     system,
+            "messages":   messages,
+        },
+        timeout=30,
     )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    return data.get("content", [{}])[0].get("text", "").strip()
 
 
 # Histórico de conversas por conversa_id (em memória)
@@ -299,365 +305,6 @@ def fetch_deals_safe():
         fetch_deals()
     finally:
         fetch_running = False
-
-def toggle_typing(inbox_identifier: str, contact_identifier: str, conversation_id: int, status: str = "on"):
-    """Ativa ou desativa o indicador 'digitando...' no AgendorChat."""
-    url = (
-        f"https://chat.agendor.com.br/public/api/v1/inboxes/{inbox_identifier}"
-        f"/contacts/{contact_identifier}/conversations/{conversation_id}/toggle_typing"
-    )
-    try:
-        requests.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json={"typing_status": status},
-            timeout=5,
-        )
-    except Exception as e:
-        print(f"[typing] Erro: {e}", flush=True)
-
-
-def send_private_note(conversation_id: int, text: str):
-    """Cria ou atualiza nota interna visível apenas para agentes."""
-    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
-    resp = requests.post(
-        url,
-        headers={
-            "api_access_token": AGENDORCHAT_TOKEN,
-            "Content-Type":     "application/json",
-        },
-        json={"content": text, "message_type": "outgoing", "private": True},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_conversation_history(conversation_id: int) -> list:
-    """Busca histórico de mensagens da conversa no AgendorChat e retorna no formato Claude."""
-    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
-    try:
-        resp = requests.get(
-            url,
-            headers={"api_access_token": AGENDORCHAT_TOKEN},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        messages = data.get("payload", [])
-
-        history = []
-        for msg in messages:
-            # Ignora mensagens privadas (notas internas) e vazias
-            if msg.get("private"):
-                continue
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            msg_type = msg.get("message_type")
-            # 0 = incoming (lead), 1 = outgoing (agente/Luca)
-            if msg_type == 0:
-                history.append({"role": "user", "content": content})
-            elif msg_type == 1:
-                history.append({"role": "assistant", "content": content})
-
-        return history
-    except Exception as e:
-        print(f"[history] Erro ao buscar histórico conv={conversation_id}: {e}", flush=True)
-        return []
-
-
-def build_lead_note(conv_data: dict) -> str:
-    """Monta o texto da nota interna com o resumo do lead."""
-    nome       = conv_data.get("nome", "Não informado")
-    segmento   = conv_data.get("segmento", "Não identificado")
-    necessidade = conv_data.get("necessidade", "Não informada")
-    email      = conv_data.get("email", "Não informado")
-    preferencia = conv_data.get("preferencia", "")
-    status     = conv_data.get("status", "Em atendimento")
-
-    lines = [
-        "📋 Resumo do Lead",
-        f"Nome: {nome}",
-        f"Segmento: {segmento}",
-        f"Necessidade: {necessidade}",
-        f"E-mail: {email}",
-    ]
-    if preferencia:
-        lines.append(f"Preferência: {preferencia}")
-    note = "\n".join(lines)
-    note += f"Status: {status}"
-    return note
-
-
-def extract_lead_data(messages: list, contact_name: str) -> dict:
-    """Usa o Claude para extrair dados do lead a partir do histórico."""
-    if not messages:
-        return {}
-    
-    history_text = "\n".join([
-        ("Lead: " if m["role"] == "user" else "Luca: ") + m["content"]
-        for m in messages[-20:]
-    ])
-    
-    prompt = f"""Com base nessa conversa, extraia as informações do lead em JSON.
-Retorne APENAS o JSON, sem texto adicional.
-
-Conversa:
-{history_text}
-
-Retorne este JSON (deixe em branco se não informado):
-{{
-  "nome": "",
-  "segmento": "",
-  "necessidade": "",
-  "email": "",
-  "preferencia": "",
-  "status": ""
-}}
-
-Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-mail" | "Preferência informada: [dia] às [horário]" | "Agendamento confirmado"
-"""
-    try:
-        reply = call_claude(
-            [{"role": "user", "content": prompt}],
-            max_tokens=300,
-            system="Você extrai dados estruturados de conversas. Retorne apenas JSON válido."
-        )
-        # Remove possíveis backticks
-        reply = reply.replace("```json", "").replace("```", "").strip()
-        data = json.loads(reply)
-        if contact_name and not data.get("nome"):
-            data["nome"] = contact_name
-        return data
-    except Exception as e:
-        print(f"[note] Erro ao extrair dados: {e}", flush=True)
-        return {"nome": contact_name}
-    try:
-        reply = call_claude(
-            [{"role": "user", "content": prompt}],
-            max_tokens=300,
-            system="Você extrai dados estruturados de conversas. Retorne apenas JSON válido."
-        )
-        # Remove possíveis backticks
-        reply = reply.replace("```json", "").replace("```", "").strip()
-        data = json.loads(reply)
-        if contact_name and not data.get("nome"):
-            data["nome"] = contact_name
-        return data
-    except Exception as e:
-        print(f"[note] Erro ao extrair dados: {e}", flush=True)
-        return {"nome": contact_name}
-def agendorchat_webhook():
-    if request.method == "OPTIONS":
-        resp = jsonify({})
-        resp.headers["Access-Control-Allow-Origin"]  = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        return resp, 200
-
-    try:
-        body = request.get_json(force=True) or {}
-
-        # ── Log completo para debug ───────────────────────────────────────────
-        event        = body.get("event", "")
-        message_type = body.get("message_type", "")
-        sender_type  = (body.get("sender") or {}).get("type", "")
-        print(f"[webhook] RAW event={event} | message_type={message_type} | sender_type={sender_type}", flush=True)
-        print(f"[webhook] RAW payload={json.dumps(body)[:600]}", flush=True)
-
-        # Ignora tudo que não seja mensagem nova do lead
-        if event != "message_created":
-            print(f"[webhook] IGNORADO event={event}", flush=True)
-            return jsonify({}), 200
-        if message_type != "incoming":
-            print(f"[webhook] IGNORADO message_type={message_type}", flush=True)
-            return jsonify({}), 200
-
-        # ── Ignora se há agente humano atribuído à conversa ───────────────────
-        conversation_meta = (body.get("conversation") or {}).get("meta") or {}
-        assignee = conversation_meta.get("assignee")
-        if assignee and assignee.get("type") == "user":
-            print(f"[webhook] IGNORADO agente humano atribuído: {assignee.get('name')}", flush=True)
-            return jsonify({}), 200
-
-        # ── Extrai campos do payload ──────────────────────────────────────────
-        message_text    = (body.get("content") or "").strip()
-        conversation    = body.get("conversation") or {}
-        conversation_id = conversation.get("id")
-        meta_sender     = (conversation.get("meta") or {}).get("sender") or {}
-        contact_name    = meta_sender.get("name", "")
-        contact_phone   = meta_sender.get("phone_number", "")
-
-        # Identificadores para Toggle Typing (API pública)
-        contact_inbox      = conversation.get("contact_inbox") or {}
-        inbox_identifier   = contact_inbox.get("source_id", "")
-        contact_identifier = contact_inbox.get("pubsub_token", "")
-        print(f"[typing] inbox_identifier={inbox_identifier} | contact_identifier={contact_identifier}", flush=True)
-
-        if not message_text or not conversation_id:
-            return jsonify({}), 200
-
-        print(f"[webhook] conv={conversation_id} | {contact_phone} | msg={message_text[:60]}", flush=True)
-
-        # ── Recupera ou inicializa histórico ──────────────────────────────────
-        conv_key = str(conversation_id)
-        if conv_key not in conversation_histories:
-            extra = ""
-            if contact_name:
-                extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
-            if contact_phone:
-                extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
-            conversation_histories[conv_key] = {
-                "system":    SYSTEM_PROMPT + extra,
-                "messages":  [],
-                "note_id":   None,
-                "lead_data": {"nome": contact_name},
-                "last_msg_at": time.time(),
-            }
-
-        conv = conversation_histories[conv_key]
-
-        # ── Se memória está vazia, busca histórico real do AgendorChat ────────
-        if not conv["messages"]:
-            remote_history = fetch_conversation_history(conversation_id)
-            if remote_history:
-                print(f"[history] Recuperados {len(remote_history)} msgs da conv={conversation_id}", flush=True)
-                conv["messages"] = remote_history
-            else:
-                # Sem histórico remoto: injeta saudação inicial
-                conv["messages"].append({
-                    "role":    "assistant",
-                    "content": (
-                        "Olá! Tudo bem? Eu sou o Luca, da Lucralize. "
-                        "É um prazer falar com você! Como posso te ajudar hoje?"
-                    ),
-                })
-
-        # ── Detecta retomada após longa ausência (>2h) ───────────────────────
-        now = time.time()
-        last_msg_at = conv.get("last_msg_at", now)
-        elapsed_minutes = (now - last_msg_at) / 60
-        conv["last_msg_at"] = now
-
-        # ── Monta mensagem do lead com contexto de retomada se necessário ────
-        user_content = message_text
-        if elapsed_minutes > 120 and len(conv["messages"]) > 1:
-            retomada = (
-                "[O lead ficou ausente por " + str(int(elapsed_minutes // 60)) + "h e voltou. "
-                "Inicie sua resposta com uma retomada leve e natural, como 'Retomando por aqui!' "
-                "e continue de onde a conversa parou.]\n\n" + message_text
-            )
-            user_content = retomada
-
-        # ── Adiciona mensagem do lead e chama o Claude ────────────────────────
-        conv["messages"].append({"role": "user", "content": user_content})
-
-        # Ativa "digitando..." enquanto o Claude processa
-        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
-
-        reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
-
-        # Desativa "digitando..."
-        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
-
-        # Salva no histórico sem o contexto de retomada (para não poluir)
-        if elapsed_minutes > 120 and len(conv["messages"]) > 1:
-            conv["messages"][-1] = {"role": "user", "content": message_text}
-
-        conv["messages"].append({"role": "assistant", "content": reply})
-
-        # Limita histórico a 40 turnos para não explodir tokens
-        if len(conv["messages"]) > 40:
-            conv["messages"] = conv["messages"][-40:]
-
-        # ── Envia resposta de volta ao AgendorChat ────────────────────────────
-        send_agendorchat_message(conversation_id, reply)
-
-        # ── Nota interna — dados completos ou conversa encerrada ─────────────
-        try:
-            lead_data = extract_lead_data(conv["messages"], contact_name)
-            if lead_data:
-                conv["lead_data"].update({k: v for k, v in lead_data.items() if v})
-                d = conv["lead_data"]
-
-                dados_completos = (
-                    d.get("nome") and d.get("nome") != "Não informado"
-                    and d.get("segmento") and d.get("segmento") != "Não identificado"
-                    and d.get("necessidade") and d.get("necessidade") != "Não informada"
-                    and d.get("email") and d.get("email") != "Não informado"
-                )
-
-                # Detecta encerramento por acompanhamento
-                termos_encerramento = ["acompanhamento", "sinal verde", "é só me avisar", "estou por aqui"]
-                conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
-
-                if (dados_completos or conversa_encerrada) and not conv.get("note_sent"):
-                    note_text = build_lead_note(d)
-                    send_private_note(conversation_id, note_text)
-                    conv["note_sent"] = True
-                    print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
-        except Exception as e:
-            print(f"[note] Erro ao processar nota: {e}", flush=True)
-
-        return jsonify({"status": "ok"}), 200
-
-    except Exception as e:
-        print(f"[webhook] Erro: {e}", flush=True)
-        return jsonify({"status": "error", "detail": str(e)}), 200
-def agendar():
-    if request.method == "OPTIONS":
-        resp = jsonify({})
-        resp.headers["Access-Control-Allow-Origin"]  = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        return resp, 200
-
-    try:
-        body       = request.get_json(force=True) or {}
-        lead_name  = body.get("lead_name", "Lead")
-        lead_email = body.get("lead_email", "")
-        start      = body.get("start", "")
-
-        if not lead_email or not start:
-            return jsonify({"error": "lead_email e start são obrigatórios"}), 400
-
-        result = create_teams_meeting(lead_name, lead_email, start)
-        return jsonify(result), 200
-
-    except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else 0
-        detail = ""
-        try:
-            detail = e.response.json().get("error", {}).get("message", "")
-        except Exception:
-            pass
-        if status == 403:
-            return jsonify({
-                "error": "Permissão Calendars.ReadWrite ainda não concedida no Azure AD.",
-                "detail": detail,
-                "action": "Solicite ao administrador do tenant que conceda a permissão e faça grant de admin consent."
-            }), 503
-        return jsonify({"error": str(e), "detail": detail}), 500
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SCHEDULER + MAIN
-# ═════════════════════════════════════════════════════════════════════════════
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
-scheduler.add_job(fetch_deals_safe, "date",
-                  run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
-scheduler.start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
-
 @app.route("/")
 def index():
     return jsonify({
@@ -727,37 +374,6 @@ def chat():
         return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-# ══ ROTAS LUCA ══
-# NOVA ROTA — /agendorchat/webhook  (AgendorChat → Luca → AgendorChat)
-# ═════════════════════════════════════════════════════════════════════════════
-#
-# Payload real do AgendorChat (event: message_created):
-# {
-#   "event": "message_created",
-#   "message_type": "incoming",        ← só processar incoming (do lead)
-#   "content": "Olá, quero saber...",
-#   "conversation": {
-#     "id": 77,
-#     "meta": {
-#       "sender": {
-#         "name": "Lead Teste",
-#         "phone_number": "+5548999999999"
-#       }
-#     }
-#   },
-#   "sender": { "type": "contact" }    ← "contact"=lead | "user"=agente
-# }
-#
-# Resposta: envia mensagem de volta via API do AgendorChat
-# POST https://chat.agendor.com.br/api/v1/accounts/825/conversations/{id}/messages
-
-AGENDORCHAT_TOKEN      = os.environ.get("AGENDORCHAT_TOKEN", "3t9nxq9fmZLyd9SfH7JEsqK8")
-AGENDORCHAT_ACCOUNT_ID = os.environ.get("AGENDORCHAT_ACCOUNT_ID", "1035")
-AGENDORCHAT_BASE       = "https://chat.agendor.com.br/api/v1"
-
-
 def send_agendorchat_message(conversation_id: int, text: str):
     """Envia resposta do Luca de volta ao lead via API do AgendorChat."""
     url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
@@ -1128,15 +744,6 @@ def agendar():
 # SCHEDULER + MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
-scheduler.add_job(fetch_deals_safe, "date",
-                  run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
-scheduler.start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
 scheduler.add_job(fetch_tasks_job, "interval", hours=2, id="tasks_recorrente")
