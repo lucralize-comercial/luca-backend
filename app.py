@@ -429,7 +429,7 @@ def autentique():
 @app.route("/autentique/debug")
 def autentique_debug():
     headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
-    query = """{ documents(page: 1) { total data { id name created_at signatures { name signed signed_at } } } }"""
+    query = """{ documents(page: 1) { total data { id name created_at signatures { name signed { created_at } } } } }"""
     try:
         r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
         return jsonify({"status": r.status_code, "body": r.text[:3000]})
