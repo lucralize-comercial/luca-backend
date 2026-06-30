@@ -436,12 +436,19 @@ def autentique():
 @app.route("/autentique/debug")
 def autentique_debug():
     headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
-    query = "{ documents(page: 1) { total } }"
-    try:
-        r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
-        return jsonify({"api_response": r.json(), "cache_total": len(autentique_cache["data"])})
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    queries = {
+        "default": "{ documents(page: 1) { total } }",
+        "org": "{ documents(page: 1, scope: ORGANIZATION) { total } }",
+        "group": "{ documents(page: 1, scope: GROUP) { total } }",
+    }
+    results = {}
+    for key, query in queries.items():
+        try:
+            r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=15)
+            results[key] = r.json()
+        except Exception as e:
+            results[key] = {"error": str(e)}
+    return jsonify(results)
 
 @app.route("/autentique/refresh", methods=["POST"])
 def autentique_refresh():
