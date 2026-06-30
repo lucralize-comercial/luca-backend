@@ -423,6 +423,47 @@ def send_private_note(conversation_id: int, text: str):
     return resp.json()
 
 
+def get_conversation_details(conversation_id: int) -> dict:
+    """Busca status e assignee atuais de uma conversa no AgendorChat."""
+    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}"
+    try:
+        resp = requests.get(
+            url,
+            headers={"api_access_token": AGENDORCHAT_TOKEN},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[conv_details] Erro ao buscar conv={conversation_id}: {e}", flush=True)
+        return {}
+
+
+def get_last_message_info(conversation_id: int) -> dict:
+    """Retorna informações da última mensagem da conversa (quem enviou, se é do lead)."""
+    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+    try:
+        resp = requests.get(
+            url,
+            headers={"api_access_token": AGENDORCHAT_TOKEN},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        messages = data.get("payload", [])
+        if not messages:
+            return {}
+        last = messages[-1]
+        return {
+            "content": last.get("content", ""),
+            "message_type": last.get("message_type"),  # 0=incoming(lead), 1=outgoing(agente)
+            "private": last.get("private", False),
+        }
+    except Exception as e:
+        print(f"[last_msg] Erro ao buscar conv={conversation_id}: {e}", flush=True)
+        return {}
+
+
 def fetch_conversation_history(conversation_id: int) -> list:
     """Busca histórico de mensagens da conversa no AgendorChat e retorna no formato Claude."""
     url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
@@ -699,6 +740,98 @@ def agendorchat_webhook():
 # ATENÇÃO: requer permissão Calendars.ReadWrite no Azure AD (app-only).
 # Enquanto a permissão não for concedida pelo administrador, esta rota
 # retornará 503. Não há impacto nas demais rotas.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ROTA — /agendorchat/conversation-updated
+# Detecta quando uma conversa é desatribuída SEM ser resolvida, e verifica
+# se há mensagem do lead pendente de resposta. Se sim, o Luca assume e responde.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route("/agendorchat/conversation-updated", methods=["POST", "OPTIONS"])
+def agendorchat_conversation_updated():
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 200
+
+    try:
+        body = request.get_json(force=True) or {}
+        event = body.get("event", "")
+
+        if event != "conversation_updated":
+            return jsonify({}), 200
+
+        conversation = body.get("conversation") or body  # alguns payloads vêm no nível raiz
+        conversation_id = conversation.get("id")
+        status = conversation.get("status", "")
+        assignee = (conversation.get("meta") or {}).get("assignee")
+
+        if not conversation_id:
+            return jsonify({}), 200
+
+        print(f"[conv_updated] conv={conversation_id} | status={status} | assignee={assignee}", flush=True)
+
+        # Se foi resolvida, não faz nada — é um encerramento intencional
+        if status == "resolved":
+            print(f"[conv_updated] IGNORADO — conversa resolvida", flush=True)
+            return jsonify({}), 200
+
+        # Se ainda está atribuída a alguém, não faz nada
+        if assignee:
+            print(f"[conv_updated] IGNORADO — ainda atribuída a {assignee.get('name')}", flush=True)
+            return jsonify({}), 200
+
+        # Conversa ficou sem atribuição e não foi resolvida — verifica se há mensagem pendente
+        last_msg = get_last_message_info(conversation_id)
+        if not last_msg:
+            return jsonify({}), 200
+
+        # message_type 0 = incoming (lead) — se a última mensagem é do lead e não é privada,
+        # significa que ela ficou sem resposta
+        if last_msg.get("message_type") == 0 and not last_msg.get("private"):
+            print(f"[conv_updated] Mensagem pendente detectada — Luca vai responder conv={conversation_id}", flush=True)
+
+            conv_details = get_conversation_details(conversation_id)
+            meta_sender = ((conv_details.get("meta") or {}).get("sender")) or {}
+            contact_name = meta_sender.get("name", "")
+            contact_phone = meta_sender.get("phone_number", "")
+
+            conv_key = str(conversation_id)
+            if conv_key not in conversation_histories:
+                extra = ""
+                if contact_name:
+                    extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
+                if contact_phone:
+                    extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
+                conversation_histories[conv_key] = {
+                    "system":    SYSTEM_PROMPT + extra,
+                    "messages":  [],
+                    "note_id":   None,
+                    "lead_data": {"nome": contact_name},
+                    "last_msg_at": time.time(),
+                }
+
+            conv = conversation_histories[conv_key]
+
+            # Busca histórico remoto para responder com contexto completo
+            remote_history = fetch_conversation_history(conversation_id)
+            if remote_history:
+                conv["messages"] = remote_history
+
+            if conv["messages"]:
+                reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
+                conv["messages"].append({"role": "assistant", "content": reply})
+                send_agendorchat_message(conversation_id, reply)
+                print(f"[conv_updated] Luca respondeu conv={conversation_id}", flush=True)
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        print(f"[conv_updated] Erro: {e}", flush=True)
+        return jsonify({"status": "error", "detail": str(e)}), 200
+
 
 @app.route("/agendar", methods=["POST", "OPTIONS"])
 def agendar():
