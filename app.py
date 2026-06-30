@@ -829,6 +829,16 @@ def agendorchat_conversation_updated():
         # message_type 0 = incoming (lead) — se a última mensagem é do lead e não é privada,
         # significa que ela ficou sem resposta
         if last_msg.get("message_type") == 0 and not last_msg.get("private"):
+            conv_key = str(conversation_id)
+            last_msg_content = last_msg.get("content", "")
+
+            # Evita responder múltiplas vezes à mesma mensagem — o AgendorChat pode
+            # disparar conversation_updated várias vezes para a mesma situação
+            existing_conv = conversation_histories.get(conv_key, {})
+            if existing_conv.get("last_responded_pending") == last_msg_content:
+                print(f"[conv_updated] IGNORADO — já respondeu a esta mensagem pendente, conv={conversation_id}", flush=True)
+                return jsonify({}), 200
+
             print(f"[conv_updated] Mensagem pendente detectada — Luca vai responder conv={conversation_id}", flush=True)
 
             conv_details = get_conversation_details(conversation_id)
@@ -880,6 +890,7 @@ def agendorchat_conversation_updated():
                 reply = call_claude(messages_for_call, max_tokens=300, system=conv["system"])
                 conv["messages"].append({"role": "assistant", "content": reply})
                 send_agendorchat_message(conversation_id, reply)
+                conv["last_responded_pending"] = last_msg_content
                 print(f"[conv_updated] Luca respondeu conv={conversation_id}", flush=True)
 
         return jsonify({"status": "ok"}), 200
