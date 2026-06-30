@@ -430,11 +430,19 @@ def autentique():
 def autentique_debug():
     headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
     query = "{ documents(page: 1) { total data { id name created_at } } }"
-    try:
-        r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
-        return jsonify({"status": r.status_code, "headers": dict(r.headers), "body_raw": r.text[:2000]})
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    resultados = {}
+    endpoints = [
+        "https://api.autentique.com.br/2/graphql",
+        "https://api.autentique.com.br/graphql",
+        "https://api.autentique.com.br/v2/graphql",
+    ]
+    for url in endpoints:
+        try:
+            r = requests.post(url, json={"query": query}, headers=headers, timeout=15)
+            resultados[url] = {"status": r.status_code, "body": r.text[:500]}
+        except Exception as e:
+            resultados[url] = {"error": str(e)}
+    return jsonify(resultados)
 def autentique_refresh():
     threading.Thread(target=fetch_autentique_all, daemon=True).start()
     return jsonify({"status": "ok"})
