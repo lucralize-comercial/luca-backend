@@ -15,6 +15,8 @@ AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "a89b0def-fd5e-45ed-981f-efe89f2
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AUTENTIQUE_TOKEN = os.environ.get("AUTENTIQUE_TOKEN", "49cde424806e0f64f13bbee6c782e6f8693762078a3f58a0ae34b5bce4268686")
+AUTENTIQUE_BASE = "https://api.autentique.com.br/2/graphql"
 
 FUNIS_HISTORICO = ["Funil Comercial"]
 HISTORICO_DIAS = 30
@@ -375,6 +377,59 @@ def tasks():
 def funnels():
     r = requests.get(f"{AGENDOR_BASE}/funnels", headers=HEADERS, timeout=30)
     return jsonify(r.json())
+
+autentique_cache = {"data": [], "updated_at": None}
+
+def fetch_autentique_all():
+    print("Buscando documentos do Autentique...", flush=True)
+    all_docs = []
+    page = 1
+    headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
+    while True:
+        query = """
+        query ($page: Int!) {
+          documents(page: $page) {
+            total
+            data {
+              id
+              name
+              created_at
+              signatures {
+                name
+                signed
+                signed_at
+              }
+            }
+          }
+        }
+        """
+        try:
+            r = requests.post(AUTENTIQUE_BASE, json={"query": query, "variables": {"page": page}}, headers=headers, timeout=30)
+            data = r.json()
+            docs = data.get("data", {}).get("documents", {}).get("data", [])
+            total = data.get("data", {}).get("documents", {}).get("total", 0)
+            all_docs.extend(docs)
+            if len(all_docs) >= total or not docs:
+                break
+            page += 1
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"Erro Autentique p{page}: {e}", flush=True)
+            break
+    autentique_cache["data"] = all_docs
+    autentique_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"Autentique: {len(all_docs)} documentos carregados.", flush=True)
+
+@app.route("/autentique")
+def autentique():
+    if not autentique_cache["data"]:
+        fetch_autentique_all()
+    return jsonify({"data": autentique_cache["data"], "total": len(autentique_cache["data"]), "updated_at": autentique_cache["updated_at"]})
+
+@app.route("/autentique/refresh", methods=["POST"])
+def autentique_refresh():
+    threading.Thread(target=fetch_autentique_all, daemon=True).start()
+    return jsonify({"status": "ok"})
 
 @app.route("/history-cache")
 def history_cache_route():
