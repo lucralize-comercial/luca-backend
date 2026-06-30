@@ -394,9 +394,11 @@ def fetch_autentique_all():
               id
               name
               created_at
+              created_by { name email }
               signatures {
                 name
                 email
+                action
                 signed { created_at }
                 rejected { created_at }
               }
