@@ -838,7 +838,32 @@ def agendorchat_webhook():
         # para ver se o lead manda mais mensagens antes de responder.
         msg_token = time.time()
         conv["latest_msg_token"] = msg_token
-        time.sleep(2.5)
+
+        # Na primeira mensagem de uma conversa nova, aguarda 90s para que a
+        # automação do Agendor (boas_vindas_primeiro_contato) dispare primeiro.
+        # Assim o Luca entra depois do template, com contexto completo e sem repetir
+        # a saudação. Nas mensagens seguintes, responde normalmente após 2.5s.
+        is_first_message = conv.get("message_count", 0) == 0
+        if is_first_message:
+            print(f"[webhook] Primeira mensagem — aguardando 90s para automação conv={conversation_id}", flush=True)
+            time.sleep(90)
+            # Após o delay, busca histórico atualizado para incluir o template
+            remote_history = fetch_conversation_history(conversation_id)
+            if remote_history:
+                conv["messages"] = remote_history
+                print(f"[history] Histórico atualizado após delay: {len(remote_history)} msgs conv={conversation_id}", flush=True)
+            # Injeta instrução para não repetir o que o template já disse
+            if conv["messages"] and conv["messages"][-1]["role"] == "user":
+                conv["messages"][-1]["content"] = (
+                    "[ATENÇÃO: Um template de boas-vindas já foi enviado automaticamente pelo sistema antes desta resposta. "
+                    "NÃO repita a saudação nem se apresente novamente. "
+                    "Responda diretamente à mensagem do lead, continuando de onde o template parou.]\n\n"
+                    + conv["messages"][-1]["content"]
+                )
+        else:
+            time.sleep(2.5)
+
+        conv["message_count"] = conv.get("message_count", 0) + 1
 
         # Se durante a espera chegou mensagem mais nova, esta requisição desiste
         # silenciosamente — a requisição da mensagem mais nova vai responder por todas.
