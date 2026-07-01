@@ -968,7 +968,20 @@ def agendorchat_conversation_updated():
                 print(f"[conv_updated] IGNORADO — já respondeu a esta mensagem pendente, conv={conversation_id}", flush=True)
                 return jsonify({}), 200
 
-            print(f"[conv_updated] Mensagem pendente detectada — Luca vai responder conv={conversation_id}", flush=True)
+            print(f"[conv_updated] Mensagem pendente detectada — aguardando message_created conv={conversation_id}", flush=True)
+
+            # Aguarda 5s para dar tempo ao message_created de chegar e processar primeiro.
+            # Se message_created responder nesse intervalo, last_responded_msg_id será setado
+            # e o conv_updated vai ignorar corretamente.
+            time.sleep(5)
+
+            # Verifica novamente após o sleep — se message_created já respondeu, cancela
+            existing_conv = conversation_histories.get(conv_key, {})
+            if existing_conv.get("last_responded_msg_id") == last_msg_id:
+                print(f"[conv_updated] IGNORADO — message_created respondeu durante o sleep, conv={conversation_id}", flush=True)
+                return jsonify({}), 200
+
+            print(f"[conv_updated] Luca vai responder via conv_updated conv={conversation_id}", flush=True)
 
             conv_details = get_conversation_details(conversation_id)
             meta_sender = ((conv_details.get("meta") or {}).get("sender")) or {}
