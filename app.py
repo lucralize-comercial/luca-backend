@@ -451,19 +451,30 @@ def autentique():
 @app.route("/autentique/debug")
 def autentique_debug():
     headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
-    queries = {
-        "default": "{ documents(page: 1) { total } }",
-        "org": "{ documents(page: 1, scope: ORGANIZATION) { total } }",
-        "group": "{ documents(page: 1, scope: GROUP) { total } }",
+    query = """
+    {
+      documents(page: 1, limit: 60) {
+        data {
+          id
+          name
+          created_at
+          deleted_at
+          lifecycle_in
+          signatures { email signed { created_at } rejected { created_at } }
+        }
+      }
     }
-    results = {}
-    for key, query in queries.items():
-        try:
-            r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=15)
-            results[key] = r.json()
-        except Exception as e:
-            results[key] = {"error": str(e)}
-    return jsonify(results)
+    """
+    try:
+        r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
+        data = r.json()
+        docs = (data.get("data") or {}).get("documents", {}).get("data", [])
+        especiais = [d for d in docs if d.get("deleted_at") or d.get("lifecycle_in")]
+        # Também retorna o LITIO de maio para ver campos
+        litio = next((d for d in docs if "LITIO" in d.get("name","") and "2026-05" in d.get("created_at","")), None)
+        return jsonify({"total": len(docs), "especiais": especiais[:3], "litio_maio": litio, "errors": data.get("errors")})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 @app.route("/autentique/refresh", methods=["POST"])
 def autentique_refresh():
