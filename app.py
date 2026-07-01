@@ -18,6 +18,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AUTENTIQUE_TOKEN = os.environ.get("AUTENTIQUE_TOKEN", "49cde424806e0f64f13bbee6c782e6f8693762078a3f58a0ae34b5bce4268686")
 AUTENTIQUE_TOKEN_EVERTON = os.environ.get("AUTENTIQUE_TOKEN_EVERTON", "ec582dbc7c93dbd538ee1bd734d6a1c3bb0cb3e52f7ed67bfdd1ff1605e9af82")
 AUTENTIQUE_TOKEN_GIOVANNA = os.environ.get("AUTENTIQUE_TOKEN_GIOVANNA", "6420de60a459b4fa74bf01a4a4b779cb89025e2ffdb4002ce89171d1627652dd")
+AUTENTIQUE_TOKEN_LUIZ = os.environ.get("AUTENTIQUE_TOKEN_LUIZ", "dc637baedb399a3d54ebdc932e1b93d0ea204c0db3fb8ffd6fbe3a4a00f094e7")
 AUTENTIQUE_BASE = "https://api.autentique.com.br/v2/graphql"
 
 FUNIS_HISTORICO = ["Funil Comercial"]
@@ -428,7 +429,7 @@ def fetch_autentique_account(token):
 
 def fetch_autentique_all():
     print("Buscando documentos do Autentique (3 contas)...", flush=True)
-    tokens = [AUTENTIQUE_TOKEN, AUTENTIQUE_TOKEN_EVERTON, AUTENTIQUE_TOKEN_GIOVANNA]
+    tokens = [AUTENTIQUE_TOKEN, AUTENTIQUE_TOKEN_EVERTON, AUTENTIQUE_TOKEN_GIOVANNA, AUTENTIQUE_TOKEN_LUIZ]
     seen_ids = set()
     all_docs = []
     for token in tokens:
