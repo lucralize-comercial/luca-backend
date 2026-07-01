@@ -458,9 +458,12 @@ def autentique_debug():
           id
           name
           created_at
-          processed_at
-          expiration_at
-          signatures { email signed { created_at } rejected { created_at } }
+          signatures {
+            email
+            archived_at
+            signed { created_at }
+            rejected { created_at }
+          }
         }
       }
     }
@@ -472,8 +475,8 @@ def autentique_debug():
             return jsonify({"errors": data["errors"]})
         docs = (data.get("data") or {}).get("documents", {}).get("data", [])
         litio = next((d for d in docs if "LITIO" in d.get("name","") and "2026-05" in d.get("created_at","")), None)
-        com_processed = [d for d in docs if d.get("processed_at")]
-        return jsonify({"total": len(docs), "com_processed_at": len(com_processed), "litio_maio": litio, "exemplo_processed": com_processed[:2]})
+        com_archived = [d for d in docs if any(s.get("archived_at") for s in d.get("signatures",[]))]
+        return jsonify({"total": len(docs), "com_archived": len(com_archived), "litio_maio": litio, "exemplos_archived": com_archived[:2]})
     except Exception as e:
         return jsonify({"error": str(e)})
 
