@@ -756,6 +756,29 @@ def agendorchat_webhook():
 
         conv = conversation_histories[conv_key]
 
+        # ── Detecta reabertura após encerramento — reseta para novo atendimento ─
+        if conv.get("was_resolved"):
+            print(f"[webhook] Conversa reaberta após encerramento — resetando histórico conv={conversation_id}", flush=True)
+            extra = ""
+            if contact_name:
+                extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
+            if contact_phone:
+                extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
+            conversation_histories[conv_key] = {
+                "system":    SYSTEM_PROMPT + extra,
+                "messages":  [],
+                "note_id":   None,
+                "lead_data": {"nome": contact_name},
+                "last_msg_at": time.time(),
+                "was_resolved": False,
+            }
+            conv = conversation_histories[conv_key]
+            # Injeta contexto de reabertura para o Luca tratar como retorno
+            conv["messages"].append({
+                "role": "assistant",
+                "content": f"Oi, {contact_name.split()[0] if contact_name else 'tudo bem'}! Que bom ter você de volta. Como posso te ajudar hoje?"
+            })
+
         # ── Se memória está vazia, busca histórico real do AgendorChat ────────
         if not conv["messages"]:
             remote_history = fetch_conversation_history(conversation_id)
@@ -913,8 +936,11 @@ def agendorchat_conversation_updated():
 
         print(f"[conv_updated] conv={conversation_id} | status={status} | assignee={assignee}", flush=True)
 
-        # Se foi resolvida, não faz nada — é um encerramento intencional
+        # Se foi resolvida, marca no histórico para detectar reabertura depois
         if status == "resolved":
+            conv_key = str(conversation_id)
+            if conv_key in conversation_histories:
+                conversation_histories[conv_key]["was_resolved"] = True
             print(f"[conv_updated] IGNORADO — conversa resolvida", flush=True)
             return jsonify({}), 200
 
