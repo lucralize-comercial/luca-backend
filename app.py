@@ -964,93 +964,10 @@ def agendorchat_conversation_updated():
             print(f"[conv_updated] IGNORADO — ainda atribuída a {assignee.get('name')}", flush=True)
             return jsonify({}), 200
 
-        # Conversa ficou sem atribuição e não foi resolvida — verifica se há mensagem pendente
-        last_msg = get_last_message_info(conversation_id)
-        if not last_msg:
-            return jsonify({}), 200
-
-        # message_type 0 = incoming (lead) — se a última mensagem é do lead e não é privada,
-        # significa que ela ficou sem resposta
-        if last_msg.get("message_type") == 0 and not last_msg.get("private"):
-            conv_key = str(conversation_id)
-            last_msg_id = last_msg.get("id")
-            last_msg_content = last_msg.get("content", "")
-
-            # Evita responder múltiplas vezes à mesma mensagem — usa message_id como chave
-            # mais confiável que o conteúdo (que pode se repetir ou ser zerado por restart)
-            existing_conv = conversation_histories.get(conv_key, {})
-            if existing_conv.get("last_responded_msg_id") == last_msg_id:
-                print(f"[conv_updated] IGNORADO — já respondeu a esta mensagem pendente, conv={conversation_id}", flush=True)
-                return jsonify({}), 200
-
-            print(f"[conv_updated] Mensagem pendente detectada — aguardando message_created conv={conversation_id}", flush=True)
-
-            # Aguarda 5s para dar tempo ao message_created de chegar e processar primeiro.
-            # Se message_created responder nesse intervalo, last_responded_msg_id será setado
-            # e o conv_updated vai ignorar corretamente.
-            time.sleep(5)
-
-            # Verifica novamente após o sleep — se message_created já respondeu, cancela
-            existing_conv = conversation_histories.get(conv_key, {})
-            if existing_conv.get("last_responded_msg_id") == last_msg_id:
-                print(f"[conv_updated] IGNORADO — message_created respondeu durante o sleep, conv={conversation_id}", flush=True)
-                return jsonify({}), 200
-
-            print(f"[conv_updated] Luca vai responder via conv_updated conv={conversation_id}", flush=True)
-
-            conv_details = get_conversation_details(conversation_id)
-            meta_sender = ((conv_details.get("meta") or {}).get("sender")) or {}
-            contact_name = meta_sender.get("name", "")
-            contact_phone = meta_sender.get("phone_number", "")
-
-            conv_key = str(conversation_id)
-            if conv_key not in conversation_histories:
-                extra = ""
-                if contact_name:
-                    extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
-                if contact_phone:
-                    extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
-                conversation_histories[conv_key] = {
-                    "system":    SYSTEM_PROMPT + extra,
-                    "messages":  [],
-                    "note_id":   None,
-                    "lead_data": {"nome": contact_name},
-                    "last_msg_at": time.time(),
-                }
-
-            conv = conversation_histories[conv_key]
-
-            # Busca histórico remoto para responder com contexto completo
-            remote_history = fetch_conversation_history(conversation_id)
-            if remote_history:
-                conv["messages"] = remote_history
-
-            if conv["messages"]:
-                # Marca a última mensagem do lead como pendente de resposta direta,
-                # evitando que o Claude apenas continue um padrão anterior (ex: despedida)
-                messages_for_call = list(conv["messages"])
-                if messages_for_call and messages_for_call[-1]["role"] == "user":
-                    last_content = messages_for_call[-1]["content"]
-                    saudacao = saudacao_atual()
-                    messages_for_call[-1] = {
-                        "role": "user",
-                        "content": (
-                            "[Esta é a mensagem mais recente do lead, ainda sem resposta. "
-                            "Se for apenas uma saudação curta (oi, olá, etc.), responda com \"" + saudacao + "\" "
-                            "de forma calorosa antes de continuar. "
-                            "Responda diretamente a ela, considerando todo o histórico acima, "
-                            "sem repetir despedidas ou frases de encerramento anteriores.]\n\n"
-                            + last_content
-                        ),
-                    }
-
-                reply = call_claude(messages_for_call, max_tokens=300, system=conv["system"])
-                conv["messages"].append({"role": "assistant", "content": reply})
-                send_agendorchat_message(conversation_id, reply)
-                conv["last_responded_msg_id"] = last_msg_id
-                print(f"[conv_updated] Luca respondeu conv={conversation_id}", flush=True)
-
-        return jsonify({"status": "ok"}), 200
+        # O Luca responde somente via message_created para evitar duplicação.
+        # O conv_updated serve apenas para marcar conversas resolvidas (detectar reabertura).
+        print(f"[conv_updated] IGNORADO — resposta somente via message_created", flush=True)
+        return jsonify({}), 200
 
     except Exception as e:
         print(f"[conv_updated] Erro: {e}", flush=True)
