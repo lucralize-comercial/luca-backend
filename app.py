@@ -458,8 +458,8 @@ def autentique_debug():
           id
           name
           created_at
-          deleted_at
-          lifecycle_in
+          processed_at
+          expiration_at
           signatures { email signed { created_at } rejected { created_at } }
         }
       }
@@ -468,11 +468,12 @@ def autentique_debug():
     try:
         r = requests.post(AUTENTIQUE_BASE, json={"query": query}, headers=headers, timeout=30)
         data = r.json()
+        if data.get("errors"):
+            return jsonify({"errors": data["errors"]})
         docs = (data.get("data") or {}).get("documents", {}).get("data", [])
-        especiais = [d for d in docs if d.get("deleted_at") or d.get("lifecycle_in")]
-        # Também retorna o LITIO de maio para ver campos
         litio = next((d for d in docs if "LITIO" in d.get("name","") and "2026-05" in d.get("created_at","")), None)
-        return jsonify({"total": len(docs), "especiais": especiais[:3], "litio_maio": litio, "errors": data.get("errors")})
+        com_processed = [d for d in docs if d.get("processed_at")]
+        return jsonify({"total": len(docs), "com_processed_at": len(com_processed), "litio_maio": litio, "exemplo_processed": com_processed[:2]})
     except Exception as e:
         return jsonify({"error": str(e)})
 
