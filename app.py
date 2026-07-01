@@ -16,6 +16,8 @@ AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AUTENTIQUE_TOKEN = os.environ.get("AUTENTIQUE_TOKEN", "49cde424806e0f64f13bbee6c782e6f8693762078a3f58a0ae34b5bce4268686")
+AUTENTIQUE_TOKEN_EVERTON = os.environ.get("AUTENTIQUE_TOKEN_EVERTON", "ec582dbc7c93dbd538ee1bd734d6a1c3bb0cb3e52f7ed67bfdd1ff1605e9af82")
+AUTENTIQUE_TOKEN_GIOVANNA = os.environ.get("AUTENTIQUE_TOKEN_GIOVANNA", "6420de60a459b4fa74bf01a4a4b779cb89025e2ffdb4002ce89171d1627652dd")
 AUTENTIQUE_BASE = "https://api.autentique.com.br/v2/graphql"
 
 FUNIS_HISTORICO = ["Funil Comercial"]
@@ -380,15 +382,14 @@ def funnels():
 
 autentique_cache = {"data": [], "updated_at": None}
 
-def fetch_autentique_all():
-    print("Buscando documentos do Autentique...", flush=True)
-    all_docs = []
+def fetch_autentique_account(token):
+    docs = []
     page = 1
-    headers = {"Authorization": f"Bearer {AUTENTIQUE_TOKEN}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     while True:
         query = """
         query ($page: Int!) {
-          documents(page: $page) {
+          documents(page: $page, limit: 60) {
             total
             data {
               id
@@ -408,24 +409,36 @@ def fetch_autentique_all():
         """
         try:
             r = requests.post(AUTENTIQUE_BASE, json={"query": query, "variables": {"page": page}}, headers=headers, timeout=30)
-            print(f"Autentique p{page} status={r.status_code} body={r.text[:300]}", flush=True)
             data = r.json()
             if data.get("errors"):
-                print(f"Autentique erros: {data['errors']}", flush=True)
+                print(f"Autentique erros token ...{token[-6:]}: {data['errors']}", flush=True)
                 break
-            docs = data.get("data", {}).get("documents", {}).get("data", [])
+            page_docs = data.get("data", {}).get("documents", {}).get("data", [])
             total = data.get("data", {}).get("documents", {}).get("total", 0)
-            all_docs.extend(docs)
-            if len(all_docs) >= total or not docs:
+            docs.extend(page_docs)
+            if len(docs) >= total or not page_docs:
                 break
             page += 1
             time.sleep(0.3)
         except Exception as e:
-            print(f"Erro Autentique p{page}: {e}", flush=True)
+            print(f"Erro Autentique token ...{token[-6:]} p{page}: {e}", flush=True)
             break
+    print(f"Autentique token ...{token[-6:]}: {len(docs)} docs", flush=True)
+    return docs
+
+def fetch_autentique_all():
+    print("Buscando documentos do Autentique (3 contas)...", flush=True)
+    tokens = [AUTENTIQUE_TOKEN, AUTENTIQUE_TOKEN_EVERTON, AUTENTIQUE_TOKEN_GIOVANNA]
+    seen_ids = set()
+    all_docs = []
+    for token in tokens:
+        for doc in fetch_autentique_account(token):
+            if doc["id"] not in seen_ids:
+                seen_ids.add(doc["id"])
+                all_docs.append(doc)
     autentique_cache["data"] = all_docs
     autentique_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"Autentique: {len(all_docs)} documentos carregados.", flush=True)
+    print(f"Autentique total mesclado: {len(all_docs)} documentos.", flush=True)
 
 @app.route("/autentique")
 def autentique():
