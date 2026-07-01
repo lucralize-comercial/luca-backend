@@ -720,6 +720,7 @@ def agendorchat_webhook():
 
         # ── Extrai campos do payload ──────────────────────────────────────────
         message_text    = (body.get("content") or "").strip()
+        message_id      = body.get("id")
         conversation    = body.get("conversation") or {}
         conversation_id = conversation.get("id")
         meta_sender     = (conversation.get("meta") or {}).get("sender") or {}
@@ -825,6 +826,10 @@ def agendorchat_webhook():
         if len(conv["messages"]) > 40:
             conv["messages"] = conv["messages"][-40:]
 
+        # Marca o message_id respondido — impede o conv_updated de responder de novo
+        if message_id:
+            conv["last_responded_msg_id"] = message_id
+
         # ── Envia resposta de volta ao AgendorChat ────────────────────────────
         send_agendorchat_message(conversation_id, reply)
 
@@ -927,12 +932,13 @@ def agendorchat_conversation_updated():
         # significa que ela ficou sem resposta
         if last_msg.get("message_type") == 0 and not last_msg.get("private"):
             conv_key = str(conversation_id)
+            last_msg_id = last_msg.get("id")
             last_msg_content = last_msg.get("content", "")
 
-            # Evita responder múltiplas vezes à mesma mensagem — o AgendorChat pode
-            # disparar conversation_updated várias vezes para a mesma situação
+            # Evita responder múltiplas vezes à mesma mensagem — usa message_id como chave
+            # mais confiável que o conteúdo (que pode se repetir ou ser zerado por restart)
             existing_conv = conversation_histories.get(conv_key, {})
-            if existing_conv.get("last_responded_pending") == last_msg_content:
+            if existing_conv.get("last_responded_msg_id") == last_msg_id:
                 print(f"[conv_updated] IGNORADO — já respondeu a esta mensagem pendente, conv={conversation_id}", flush=True)
                 return jsonify({}), 200
 
@@ -987,7 +993,7 @@ def agendorchat_conversation_updated():
                 reply = call_claude(messages_for_call, max_tokens=300, system=conv["system"])
                 conv["messages"].append({"role": "assistant", "content": reply})
                 send_agendorchat_message(conversation_id, reply)
-                conv["last_responded_pending"] = last_msg_content
+                conv["last_responded_msg_id"] = last_msg_id
                 print(f"[conv_updated] Luca respondeu conv={conversation_id}", flush=True)
 
         return jsonify({"status": "ok"}), 200
