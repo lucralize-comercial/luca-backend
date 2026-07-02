@@ -369,6 +369,45 @@ def reset_fetch():
     history_running = False
     return jsonify({"status": "ok"})
 
+@app.route("/agendor/deal-created", methods=["POST"])
+def agendor_deal_created():
+    try:
+        body = request.get_json(force=True) or {}
+        deal = body.get("deal") or body.get("data") or {}
+        deal_id = deal.get("id")
+        description = (deal.get("description") or "").strip()
+
+        print(f"[deal-created] Negócio id={deal_id} | descrição: {description[:80]}", flush=True)
+
+        if not deal_id:
+            return jsonify({"status": "ignored", "reason": "no deal_id"}), 200
+
+        # Se veio do RD Station, não preenche origem
+        if "Criado automaticamente pela integração com RD Station" in description:
+            print(f"[deal-created] IGNORADO — origem RD Station, deal={deal_id}", flush=True)
+            return jsonify({"status": "ignored", "reason": "rd_station"}), 200
+
+        # Se já tem origem preenchida, não sobrescreve
+        custom = deal.get("customFields") or {}
+        if custom.get("origem_do_negocio"):
+            print(f"[deal-created] IGNORADO — origem já preenchida, deal={deal_id}", flush=True)
+            return jsonify({"status": "ignored", "reason": "already_filled"}), 200
+
+        # Preenche origem como whatsapp_pagina
+        payload = {"customFields": {"origem_do_negocio": 59538}}
+        r = requests.put(
+            f"{AGENDOR_BASE}/deals/{deal_id}",
+            headers={**HEADERS, "Content-Type": "application/json"},
+            json=payload,
+            timeout=15
+        )
+        print(f"[deal-created] Origem preenchida deal={deal_id} | status={r.status_code}", flush=True)
+        return jsonify({"status": "ok", "deal_id": deal_id}), 200
+
+    except Exception as e:
+        print(f"[deal-created] Erro: {e}", flush=True)
+        return jsonify({"status": "error"}), 200
+
 @app.route("/deals")
 def deals():
     return jsonify({"data": cache["deals"], "meta": {"totalCount": cache["total"], "updated_at": cache["updated_at"]}})
@@ -700,6 +739,52 @@ Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-ma
 
 
 @app.route("/agendorchat/webhook", methods=["POST", "OPTIONS"])
+def preencher_origem_whatsapp_pagina(phone):
+    """Busca o negócio mais recente pelo telefone e preenche origem=whatsapp_pagina se descrição vazia."""
+    try:
+        # Aguarda 10s para garantir que o negócio já foi criado no Agendor
+        time.sleep(10)
+        # Normaliza telefone — remove +, espaços
+        phone_clean = phone.replace("+", "").replace(" ", "").strip()
+        # Busca pessoa pelo telefone
+        r = requests.get(f"{AGENDOR_BASE}/people", headers=HEADERS,
+                         params={"phone": phone_clean}, timeout=15)
+        pessoas = r.json().get("data", [])
+        if not pessoas:
+            print(f"[origem] Pessoa não encontrada para telefone {phone_clean}", flush=True)
+            return
+        person_id = pessoas[0].get("id")
+        # Busca negócios da pessoa, ordenados por criação desc
+        r2 = requests.get(f"{AGENDOR_BASE}/deals", headers=HEADERS,
+                          params={"personId": person_id, "per_page": 5}, timeout=15)
+        deals = r2.json().get("data", [])
+        if not deals:
+            print(f"[origem] Nenhum negócio encontrado para person_id={person_id}", flush=True)
+            return
+        # Pega o negócio mais recente
+        deal = sorted(deals, key=lambda d: d.get("createdAt",""), reverse=True)[0]
+        deal_id = deal.get("id")
+        description = (deal.get("description") or "").strip()
+        # Só preenche se descrição vazia
+        if description:
+            print(f"[origem] IGNORADO — descrição não vazia deal={deal_id}: {description[:60]}", flush=True)
+            return
+        # Verifica se origem já preenchida
+        custom = deal.get("customFields") or {}
+        if custom.get("origem_do_negocio"):
+            print(f"[origem] IGNORADO — origem já preenchida deal={deal_id}", flush=True)
+            return
+        # Preenche origem
+        r3 = requests.put(
+            f"{AGENDOR_BASE}/deals/{deal_id}",
+            headers={**HEADERS, "Content-Type": "application/json"},
+            json={"customFields": {"origem_do_negocio": 59538}},
+            timeout=15
+        )
+        print(f"[origem] whatsapp_pagina preenchida deal={deal_id} | status={r3.status_code}", flush=True)
+    except Exception as e:
+        print(f"[origem] Erro: {e}", flush=True)
+
 def agendorchat_webhook():
     if request.method == "OPTIONS":
         resp = jsonify({})
@@ -770,6 +855,16 @@ def agendorchat_webhook():
             }
 
         conv = conversation_histories[conv_key]
+
+        # ── Detecta origem whatsapp_pagina na primeira mensagem ───────────────
+        TEXTO_BOTAO_WHATSAPP = "Olá! Gostaria de saber mais sobre os serviços da Lucralize Tech."
+        is_primeira_msg = conv.get("message_count", 0) == 0
+        if is_primeira_msg and message_text.strip() == TEXTO_BOTAO_WHATSAPP and contact_phone:
+            threading.Thread(
+                target=preencher_origem_whatsapp_pagina,
+                args=(contact_phone,),
+                daemon=True
+            ).start()
 
         # ── Detecta reabertura após encerramento — reseta para novo atendimento ─
         if conv.get("was_resolved"):
