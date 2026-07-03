@@ -627,6 +627,7 @@ def get_last_message_info(conversation_id: int) -> dict:
             return {}
         last = messages[-1]
         return {
+            "id":      last.get("id"),
             "content": last.get("content", ""),
             "message_type": last.get("message_type"),  # 0=incoming(lead), 1=outgoing(agente)
             "private": last.get("private", False),
@@ -1126,10 +1127,71 @@ def agendorchat_conversation_updated():
             print(f"[conv_updated] IGNORADO — ainda atribuída a {assignee.get('name')}", flush=True)
             return jsonify({}), 200
 
-        # O Luca responde somente via message_created para evitar duplicação.
-        # O conv_updated serve apenas para marcar conversas resolvidas (detectar reabertura).
-        print(f"[conv_updated] IGNORADO — resposta somente via message_created", flush=True)
-        return jsonify({}), 200
+        # ── Desatribuída e aberta: verifica se há mensagem do lead sem resposta ─
+        # Cenário: humano se atribui, conclui/abandona, conversa é desatribuída
+        # com o lead pendente. O Luca assume e responde.
+        conv_key = str(conversation_id)
+        last = get_last_message_info(conversation_id)
+        if not last:
+            print(f"[conv_updated] IGNORADO — sem mensagens na conversa", flush=True)
+            return jsonify({}), 200
+        if last.get("private") or last.get("message_type") != 0:
+            print(f"[conv_updated] IGNORADO — última mensagem não é do lead", flush=True)
+            return jsonify({}), 200
+
+        conv = conversation_histories.get(conv_key)
+        last_id = last.get("id")
+        if conv and last_id and conv.get("last_responded_msg_id") == last_id:
+            print(f"[conv_updated] IGNORADO — última mensagem já respondida pelo Luca", flush=True)
+            return jsonify({}), 200
+
+        # ── Lead pendente de resposta — Luca assume a conversa ────────────────
+        meta_sender   = (conversation.get("meta") or {}).get("sender") or {}
+        contact_name  = meta_sender.get("name", "")
+        contact_phone = meta_sender.get("phone_number", "")
+        contact_inbox = conversation.get("contact_inbox") or {}
+        inbox_identifier   = contact_inbox.get("source_id", "")
+        contact_identifier = contact_inbox.get("pubsub_token", "")
+
+        if conv_key not in conversation_histories:
+            extra = ""
+            if contact_name:
+                extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
+            if contact_phone:
+                extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
+            conversation_histories[conv_key] = {
+                "system":    SYSTEM_PROMPT + extra,
+                "messages":  [],
+                "note_id":   None,
+                "lead_data": {"nome": contact_name},
+                "last_msg_at": time.time(),
+            }
+        conv = conversation_histories[conv_key]
+
+        # Sincroniza o histórico real (inclui a mensagem pendente do lead e o
+        # trecho do atendimento humano, para o Luca ter o contexto completo)
+        remote_history = fetch_conversation_history(conversation_id)
+        if remote_history:
+            conv["messages"] = remote_history
+        if not conv["messages"] or conv["messages"][-1]["role"] != "user":
+            print(f"[conv_updated] IGNORADO — histórico sem mensagem pendente do lead", flush=True)
+            return jsonify({}), 200
+
+        conv["last_msg_at"] = time.time()
+        conv["message_count"] = max(conv.get("message_count", 0), 1)  # não é primeira mensagem
+        conv["was_resolved"] = False  # histórico já sincronizado; evita reset indevido depois
+        msg_token = time.time()
+        conv["latest_msg_token"] = msg_token
+
+        print(f"[conv_updated] RETOMADA — desatribuída com mensagem pendente, Luca assume conv={conversation_id}", flush=True)
+        threading.Thread(
+            target=_processar_resposta_luca,
+            args=(conv_key, conversation_id, msg_token, last_id, False,
+                  False, last.get("content", ""), contact_name,
+                  inbox_identifier, contact_identifier, 2.5),
+            daemon=True,
+        ).start()
+        return jsonify({"status": "retomada"}), 200
 
     except Exception as e:
         print(f"[conv_updated] Erro: {e}", flush=True)
