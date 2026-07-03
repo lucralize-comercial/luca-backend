@@ -149,9 +149,15 @@ def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROM
         },
         timeout=30,
     )
+    if resp.status_code != 200:
+        print(f"[claude] Erro API status={resp.status_code} body={resp.text[:300]}", flush=True)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("content", [{}])[0].get("text", "").strip()
+    content = data.get("content") or []
+    if not content or not content[0].get("text"):
+        print(f"[claude] Resposta sem conteúdo: {json.dumps(data)[:300]}", flush=True)
+        raise ValueError("Resposta da Anthropic sem conteúdo de texto")
+    return content[0]["text"].strip()
 
 
 # Histórico de conversas por conversa_id (em memória)
@@ -625,6 +631,8 @@ def get_last_message_info(conversation_id: int) -> dict:
         messages = data.get("payload", [])
         if not messages:
             return {}
+        # A API não garante ordem cronológica — ordena por id (crescente)
+        messages = sorted(messages, key=lambda m: m.get("id") or 0)
         last = messages[-1]
         return {
             "id":      last.get("id"),
@@ -649,6 +657,8 @@ def fetch_conversation_history(conversation_id: int) -> list:
         resp.raise_for_status()
         data = resp.json()
         messages = data.get("payload", [])
+        # A API não garante ordem cronológica — ordena por id (crescente)
+        messages = sorted(messages, key=lambda m: m.get("id") or 0)
 
         history = []
         for msg in messages:
@@ -661,9 +671,24 @@ def fetch_conversation_history(conversation_id: int) -> list:
             msg_type = msg.get("message_type")
             # 0 = incoming (lead), 1 = outgoing (agente/Luca)
             if msg_type == 0:
-                history.append({"role": "user", "content": content})
+                role = "user"
             elif msg_type == 1:
-                history.append({"role": "assistant", "content": content})
+                role = "assistant"
+            else:
+                continue
+            # Mescla turnos consecutivos do mesmo papel — a API da Anthropic
+            # exige alternância user/assistant (leads costumam mandar várias
+            # mensagens seguidas)
+            if history and history[-1]["role"] == role:
+                history[-1]["content"] += "\n\n" + content
+            else:
+                history.append({"role": role, "content": content})
+
+        # A API da Anthropic exige que a primeira mensagem seja do user —
+        # descarta turnos iniciais do assistant (ex: template disparado antes
+        # da primeira mensagem do lead)
+        while history and history[0]["role"] == "assistant":
+            history.pop(0)
 
         return history
     except Exception as e:
@@ -785,6 +810,32 @@ def preencher_origem_whatsapp_pagina(phone):
     except Exception as e:
         print(f"[origem] Erro: {e}", flush=True)
 
+def conta_respostas_apos(conversation_id: int, incoming_msg_id) -> int:
+    """Conta quantas respostas (outgoing não-privadas) existem depois da mensagem
+    do lead, consultando a própria API do AgendorChat. Proteção cross-worker/
+    cross-instância contra duplicatas — funciona mesmo com processos de memórias
+    isoladas (ex: janela de deploy com dois containers vivos)."""
+    try:
+        url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+        resp = requests.get(url, headers={"api_access_token": AGENDORCHAT_TOKEN}, timeout=15)
+        resp.raise_for_status()
+        messages = resp.json().get("payload", [])
+        # A API não garante ordem cronológica — ordena por id (crescente)
+        messages = sorted(messages, key=lambda m: m.get("id") or 0)
+        achou_incoming = False
+        count = 0
+        for m in messages:
+            if m.get("id") == incoming_msg_id:
+                achou_incoming = True
+                continue
+            if achou_incoming and m.get("message_type") == 1 and not m.get("private"):
+                count += 1
+        return count
+    except Exception as e:
+        print(f"[dedup-api] Erro ao verificar conv={conversation_id}: {e}", flush=True)
+        return 0
+
+
 def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                              is_first_message, retomada_ctx, message_text, contact_name,
                              inbox_identifier, contact_identifier, delay):
@@ -849,6 +900,24 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
         # Marca o message_id respondido — impede o conv_updated de responder de novo
         if message_id:
             conv["last_responded_msg_id"] = message_id
+
+        # Última checagem antes do envio: se durante o processamento chegou
+        # mensagem mais nova (ou outra thread assumiu), desiste sem enviar.
+        if conv.get("latest_msg_token") != msg_token:
+            print(f"[luca-bg] Abortado antes do envio — thread mais recente assumiu conv={conversation_id}", flush=True)
+            return
+
+        # Checagem cross-worker: consulta a API para ver se alguém (outro worker,
+        # outra instância ou um humano) já respondeu esta mensagem do lead.
+        # Em mensagens normais, 1 resposta existente já bloqueia o envio.
+        # Na primeira mensagem, tolera-se 1 outgoing (o template de boas-vindas
+        # é esperado antes do Luca); 2 ou mais indicam duplicata.
+        if message_id:
+            limite = 2 if is_first_message else 1
+            respostas = conta_respostas_apos(conversation_id, message_id)
+            if respostas >= limite:
+                print(f"[luca-bg] Abortado — {respostas} resposta(s) já existem após msg={message_id} conv={conversation_id}", flush=True)
+                return
 
         # ── Envia resposta de volta ao AgendorChat ────────────────────────────
         send_agendorchat_message(conversation_id, reply)
@@ -1144,6 +1213,11 @@ def agendorchat_conversation_updated():
         if conv and last_id and conv.get("last_responded_msg_id") == last_id:
             print(f"[conv_updated] IGNORADO — última mensagem já respondida pelo Luca", flush=True)
             return jsonify({}), 200
+        # Guard contra eventos conversation_updated duplicados: se já existe uma
+        # retomada agendada/em andamento para esta mesma mensagem, ignora.
+        if conv and last_id and conv.get("retomada_msg_id") == last_id:
+            print(f"[conv_updated] IGNORADO — retomada já em andamento para msg={last_id}", flush=True)
+            return jsonify({}), 200
 
         # ── Lead pendente de resposta — Luca assume a conversa ────────────────
         meta_sender   = (conversation.get("meta") or {}).get("sender") or {}
@@ -1180,6 +1254,7 @@ def agendorchat_conversation_updated():
         conv["last_msg_at"] = time.time()
         conv["message_count"] = max(conv.get("message_count", 0), 1)  # não é primeira mensagem
         conv["was_resolved"] = False  # histórico já sincronizado; evita reset indevido depois
+        conv["retomada_msg_id"] = last_id  # marca antes de disparar — bloqueia eventos duplicados
         msg_token = time.time()
         conv["latest_msg_token"] = msg_token
 
