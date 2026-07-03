@@ -738,7 +738,6 @@ Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-ma
         return {"nome": contact_name}
 
 
-@app.route("/agendorchat/webhook", methods=["POST", "OPTIONS"])
 def preencher_origem_whatsapp_pagina(phone):
     """Busca o negócio mais recente pelo telefone e preenche origem=whatsapp_pagina se descrição vazia."""
     try:
@@ -785,6 +784,105 @@ def preencher_origem_whatsapp_pagina(phone):
     except Exception as e:
         print(f"[origem] Erro: {e}", flush=True)
 
+def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
+                             is_first_message, retomada_ctx, message_text, contact_name,
+                             inbox_identifier, contact_identifier, delay):
+    """Processa a resposta do Luca em background, fora do ciclo da request.
+
+    O webhook responde 200 imediatamente e esta thread faz a espera (90s na
+    primeira mensagem / 2.5s de agrupamento), a chamada ao Claude e o envio.
+    Assim o worker único do Gunicorn nunca fica bloqueado nem estoura o
+    timeout de 120s. As threads compartilham o mesmo conversation_histories,
+    então o agrupamento por latest_msg_token continua funcionando."""
+    try:
+        time.sleep(delay)
+
+        conv = conversation_histories.get(conv_key)
+        if not conv:
+            print(f"[luca-bg] Histórico não encontrado conv={conversation_id}", flush=True)
+            return
+
+        # Se durante a espera chegou mensagem mais nova, esta thread desiste
+        # silenciosamente — a thread da mensagem mais nova responde por todas.
+        if conv.get("latest_msg_token") != msg_token:
+            print(f"[luca-bg] Mensagem agrupada — outra mais recente chegou, conv={conversation_id}", flush=True)
+            return
+
+        if is_first_message:
+            # Após o delay, busca histórico atualizado para incluir o template
+            remote_history = fetch_conversation_history(conversation_id)
+            if remote_history:
+                conv["messages"] = remote_history
+                print(f"[history] Histórico atualizado após delay: {len(remote_history)} msgs conv={conversation_id}", flush=True)
+            # Injeta instrução para não repetir o que o template já disse
+            if conv["messages"] and conv["messages"][-1]["role"] == "user":
+                conv["messages"][-1]["content"] = (
+                    "[ATENÇÃO: Um template de boas-vindas já foi enviado automaticamente pelo sistema antes desta resposta. "
+                    "NÃO repita a saudação nem se apresente novamente. "
+                    "Responda diretamente à mensagem do lead, continuando de onde o template parou.]\n\n"
+                    + conv["messages"][-1]["content"]
+                )
+            # Reconfere agrupamento após o fetch remoto
+            if conv.get("latest_msg_token") != msg_token:
+                print(f"[luca-bg] Mensagem agrupada após fetch conv={conversation_id}", flush=True)
+                return
+
+        # Ativa "digitando..." enquanto o Claude processa
+        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
+
+        reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
+
+        # Desativa "digitando..."
+        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
+
+        # Salva no histórico sem o contexto de retomada (para não poluir)
+        if retomada_ctx and conv["messages"] and conv["messages"][-1]["role"] == "user":
+            conv["messages"][-1] = {"role": "user", "content": message_text}
+
+        conv["messages"].append({"role": "assistant", "content": reply})
+
+        # Limita histórico a 40 turnos para não explodir tokens
+        if len(conv["messages"]) > 40:
+            conv["messages"] = conv["messages"][-40:]
+
+        # Marca o message_id respondido — impede o conv_updated de responder de novo
+        if message_id:
+            conv["last_responded_msg_id"] = message_id
+
+        # ── Envia resposta de volta ao AgendorChat ────────────────────────────
+        send_agendorchat_message(conversation_id, reply)
+
+        # ── Nota interna — dados completos ou conversa encerrada ─────────────
+        try:
+            lead_data = extract_lead_data(conv["messages"], contact_name)
+            if lead_data:
+                conv["lead_data"].update({k: v for k, v in lead_data.items() if v})
+                d = conv["lead_data"]
+
+                dados_completos = (
+                    d.get("nome") and d.get("nome") != "Não informado"
+                    and d.get("segmento") and d.get("segmento") != "Não identificado"
+                    and d.get("necessidade") and d.get("necessidade") != "Não informada"
+                    and d.get("email") and d.get("email") != "Não informado"
+                )
+
+                # Detecta encerramento por acompanhamento
+                termos_encerramento = ["acompanhamento", "sinal verde", "é só me avisar", "estou por aqui"]
+                conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
+
+                if (dados_completos or conversa_encerrada) and not conv.get("note_sent"):
+                    note_text = build_lead_note(d)
+                    send_private_note(conversation_id, note_text)
+                    conv["note_sent"] = True
+                    print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
+        except Exception as e:
+            print(f"[note] Erro ao processar nota: {e}", flush=True)
+
+    except Exception as e:
+        print(f"[luca-bg] Erro conv={conversation_id}: {e}", flush=True)
+
+
+@app.route("/agendorchat/webhook", methods=["POST", "OPTIONS"])
 def agendorchat_webhook():
     if request.method == "OPTIONS":
         resp = jsonify({})
@@ -881,6 +979,10 @@ def agendorchat_webhook():
                 "lead_data": {"nome": contact_name},
                 "last_msg_at": time.time(),
                 "was_resolved": False,
+                # Preserva a contagem para não tratar a reabertura como
+                # "primeira mensagem" (evita o delay de 90s e o refetch de
+                # histórico remoto, que desfariam o reset).
+                "message_count": conv.get("message_count", 1),
             }
             conv = conversation_histories[conv_key]
             # Injeta contexto de reabertura para o Luca tratar como retorno
@@ -911,9 +1013,11 @@ def agendorchat_webhook():
         elapsed_minutes = (now - last_msg_at) / 60
         conv["last_msg_at"] = now
 
+        retomada_ctx = elapsed_minutes > 120 and len(conv["messages"]) > 1
+
         # ── Monta mensagem do lead com contexto de retomada se necessário ────
         user_content = message_text
-        if elapsed_minutes > 120 and len(conv["messages"]) > 1:
+        if retomada_ctx:
             saudacao = saudacao_atual()
             retomada = (
                 "[O lead ficou ausente por " + str(int(elapsed_minutes // 60)) + "h e voltou, mandando apenas uma saudação curta. "
@@ -925,99 +1029,37 @@ def agendorchat_webhook():
             )
             user_content = retomada
 
-        # ── Adiciona mensagem do lead e chama o Claude ────────────────────────
+        # ── Adiciona mensagem do lead ao histórico ────────────────────────────
         conv["messages"].append({"role": "user", "content": user_content})
 
         # ── Agrupamento de mensagens em sequência rápida ──────────────────────
-        # Marca esta como a versão mais recente da conversa e espera um pouco
-        # para ver se o lead manda mais mensagens antes de responder.
+        # Marca esta como a versão mais recente da conversa; a thread em
+        # background só responde se nenhuma mensagem mais nova chegar durante
+        # a espera.
         msg_token = time.time()
         conv["latest_msg_token"] = msg_token
 
-        # Na primeira mensagem de uma conversa nova, aguarda 90s para que a
-        # automação do Agendor (boas_vindas_primeiro_contato) dispare primeiro.
-        # Assim o Luca entra depois do template, com contexto completo e sem repetir
-        # a saudação. Nas mensagens seguintes, responde normalmente após 2.5s.
+        # Na primeira mensagem de uma conversa nova, aguarda 90s (em background)
+        # para que a automação do Agendor (boas_vindas_primeiro_contato) dispare
+        # primeiro. Nas mensagens seguintes, responde após 2.5s (agrupamento).
+        # IMPORTANTE: a espera acontece numa thread separada — o webhook responde
+        # 200 imediatamente. Isso evita bloquear o worker único do Gunicorn e
+        # estourar o timeout de 120s (que matava o worker e zerava a memória).
         is_first_message = conv.get("message_count", 0) == 0
-        if is_first_message:
-            print(f"[webhook] Primeira mensagem — aguardando 90s para automação conv={conversation_id}", flush=True)
-            time.sleep(90)
-            # Após o delay, busca histórico atualizado para incluir o template
-            remote_history = fetch_conversation_history(conversation_id)
-            if remote_history:
-                conv["messages"] = remote_history
-                print(f"[history] Histórico atualizado após delay: {len(remote_history)} msgs conv={conversation_id}", flush=True)
-            # Injeta instrução para não repetir o que o template já disse
-            if conv["messages"] and conv["messages"][-1]["role"] == "user":
-                conv["messages"][-1]["content"] = (
-                    "[ATENÇÃO: Um template de boas-vindas já foi enviado automaticamente pelo sistema antes desta resposta. "
-                    "NÃO repita a saudação nem se apresente novamente. "
-                    "Responda diretamente à mensagem do lead, continuando de onde o template parou.]\n\n"
-                    + conv["messages"][-1]["content"]
-                )
-        else:
-            time.sleep(2.5)
-
         conv["message_count"] = conv.get("message_count", 0) + 1
+        delay = 90.0 if is_first_message else 2.5
+        if is_first_message:
+            print(f"[webhook] Primeira mensagem — 90s em background conv={conversation_id}", flush=True)
 
-        # Se durante a espera chegou mensagem mais nova, esta requisição desiste
-        # silenciosamente — a requisição da mensagem mais nova vai responder por todas.
-        if conv.get("latest_msg_token") != msg_token:
-            print(f"[webhook] Mensagem agrupada — outra mais recente chegou, conv={conversation_id}", flush=True)
-            return jsonify({"status": "grouped"}), 200
+        threading.Thread(
+            target=_processar_resposta_luca,
+            args=(conv_key, conversation_id, msg_token, message_id, is_first_message,
+                  retomada_ctx, message_text, contact_name,
+                  inbox_identifier, contact_identifier, delay),
+            daemon=True,
+        ).start()
 
-        # Ativa "digitando..." enquanto o Claude processa
-        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
-
-        reply = call_claude(conv["messages"], max_tokens=300, system=conv["system"])
-
-        # Desativa "digitando..."
-        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
-
-        # Salva no histórico sem o contexto de retomada (para não poluir)
-        if elapsed_minutes > 120 and len(conv["messages"]) > 1:
-            conv["messages"][-1] = {"role": "user", "content": message_text}
-
-        conv["messages"].append({"role": "assistant", "content": reply})
-
-        # Limita histórico a 40 turnos para não explodir tokens
-        if len(conv["messages"]) > 40:
-            conv["messages"] = conv["messages"][-40:]
-
-        # Marca o message_id respondido — impede o conv_updated de responder de novo
-        if message_id:
-            conv["last_responded_msg_id"] = message_id
-
-        # ── Envia resposta de volta ao AgendorChat ────────────────────────────
-        send_agendorchat_message(conversation_id, reply)
-
-        # ── Nota interna — dados completos ou conversa encerrada ─────────────
-        try:
-            lead_data = extract_lead_data(conv["messages"], contact_name)
-            if lead_data:
-                conv["lead_data"].update({k: v for k, v in lead_data.items() if v})
-                d = conv["lead_data"]
-
-                dados_completos = (
-                    d.get("nome") and d.get("nome") != "Não informado"
-                    and d.get("segmento") and d.get("segmento") != "Não identificado"
-                    and d.get("necessidade") and d.get("necessidade") != "Não informada"
-                    and d.get("email") and d.get("email") != "Não informado"
-                )
-
-                # Detecta encerramento por acompanhamento
-                termos_encerramento = ["acompanhamento", "sinal verde", "é só me avisar", "estou por aqui"]
-                conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
-
-                if (dados_completos or conversa_encerrada) and not conv.get("note_sent"):
-                    note_text = build_lead_note(d)
-                    send_private_note(conversation_id, note_text)
-                    conv["note_sent"] = True
-                    print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
-        except Exception as e:
-            print(f"[note] Erro ao processar nota: {e}", flush=True)
-
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "scheduled"}), 200
 
     except Exception as e:
         print(f"[webhook] Erro: {e}", flush=True)
