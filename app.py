@@ -121,6 +121,20 @@ AGENDORCHAT_ACCOUNT_ID = os.environ.get("AGENDORCHAT_ACCOUNT_ID", "1035")
 AGENDORCHAT_BASE       = "https://chat.agendor.com.br/api/v1"
 
 
+LUCA_BOT_ASSIGNEE = os.environ.get("LUCA_BOT_ASSIGNEE", "Bot")
+
+
+def eh_assignee_bot(assignee: dict) -> bool:
+    """Retorna True se o agente atribuído é o usuário do bot da automação —
+    conversas atribuídas a ele são território do Luca (ele responde normalmente).
+    Compara pelo nome exato para não confundir com humanos (o usuário do
+    Ronaldo tem available_name 'Luca', por exemplo). Configurável via env
+    LUCA_BOT_ASSIGNEE."""
+    if not assignee:
+        return False
+    return (assignee.get("name") or "").strip().lower() == LUCA_BOT_ASSIGNEE.strip().lower()
+
+
 def saudacao_atual() -> str:
     """Retorna a saudação adequada com base no horário de Brasília."""
     hora_brasilia = (datetime.utcnow() - timedelta(hours=3)).hour
@@ -132,8 +146,23 @@ def saudacao_atual() -> str:
         return "Boa noite"
 
 
+def contexto_data_atual() -> str:
+    """Retorna a data/hora atual de Brasília por extenso, para o Luca não
+    errar dia da semana ao propor reuniões."""
+    agora = datetime.utcnow() - timedelta(hours=3)
+    dias = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
+            "sexta-feira", "sábado", "domingo"]
+    meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
+             "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+    return (f"\n\nDATA E HORA ATUAIS (horário de Brasília): {dias[agora.weekday()]}, "
+            f"{agora.day} de {meses[agora.month - 1]} de {agora.year}, {agora.strftime('%H:%M')}. "
+            f"Use esta informação ao falar de dias da semana, 'amanhã', prazos e horários de reunião. "
+            f"Lembre-se: o atendimento é de segunda a quinta das 9h às 17h e sexta das 9h às 16h30, sem fins de semana.")
+
+
 def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROMPT) -> str:
     """Chama a API Anthropic e retorna o texto da resposta."""
+    system = system + contexto_data_atual()
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -980,9 +1009,11 @@ def agendorchat_webhook():
             return jsonify({}), 200
 
         # ── Ignora se há agente humano atribuído à conversa ───────────────────
+        # Exceção: o usuário do bot da automação (LUCA_BOT_ASSIGNEE) é território
+        # do Luca — conversas atribuídas a ele são respondidas normalmente.
         conversation_meta = (body.get("conversation") or {}).get("meta") or {}
         assignee = conversation_meta.get("assignee")
-        if assignee and assignee.get("type") == "user":
+        if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
             print(f"[webhook] IGNORADO agente humano atribuído: {assignee.get('name')}", flush=True)
             return jsonify({}), 200
 
@@ -1191,8 +1222,8 @@ def agendorchat_conversation_updated():
             print(f"[conv_updated] IGNORADO — conversa resolvida", flush=True)
             return jsonify({}), 200
 
-        # Se ainda está atribuída a alguém, não faz nada
-        if assignee:
+        # Se ainda está atribuída a alguém (que não seja o bot), não faz nada
+        if assignee and not eh_assignee_bot(assignee):
             print(f"[conv_updated] IGNORADO — ainda atribuída a {assignee.get('name')}", flush=True)
             return jsonify({}), 200
 
