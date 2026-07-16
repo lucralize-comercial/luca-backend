@@ -628,6 +628,172 @@ def toggle_typing(inbox_identifier: str, contact_identifier: str, conversation_i
         print(f"[typing] Erro: {e}", flush=True)
 
 
+def buscar_pessoa_e_negocio(phone):
+    """Localiza a pessoa pelo telefone e o negócio mais recente dela no Agendor.
+    Retorna (person, deal) ou (None, None)."""
+    phone_clean = phone.replace("+", "").replace(" ", "").strip()
+    r = requests.get(f"{AGENDOR_BASE}/people", headers=HEADERS,
+                     params={"phone": phone_clean}, timeout=15)
+    pessoas = r.json().get("data", [])
+    if not pessoas:
+        return None, None
+    person = pessoas[0]
+    r2 = requests.get(f"{AGENDOR_BASE}/deals", headers=HEADERS,
+                      params={"personId": person.get("id"), "per_page": 5}, timeout=15)
+    deals = r2.json().get("data", [])
+    if not deals:
+        return person, None
+    deal = sorted(deals, key=lambda d: d.get("createdAt", ""), reverse=True)[0]
+    return person, deal
+
+
+_campo_agendada_por_cache = None
+
+def resolver_campo_agendada_por():
+    """Descobre a chave do campo personalizado 'Reunião agendada por' e o ID
+    da opção 'Luca', consultando /custom_fields/deals. Cacheia em memória."""
+    global _campo_agendada_por_cache
+    if _campo_agendada_por_cache is not None:
+        return _campo_agendada_por_cache
+    try:
+        r = requests.get(f"{AGENDOR_BASE}/custom_fields/deals", headers=HEADERS, timeout=15)
+        campos = r.json().get("data", [])
+        for campo in campos:
+            nome = (campo.get("name") or "").lower()
+            if "agendada por" in nome:
+                chave = campo.get("key") or campo.get("slug")
+                opcao_luca = None
+                for opt in (campo.get("options") or campo.get("values") or []):
+                    if (opt.get("name") or opt.get("value") or "").strip().lower() == "luca":
+                        opcao_luca = opt.get("id")
+                        break
+                _campo_agendada_por_cache = {"key": chave, "luca_id": opcao_luca}
+                print(f"[crm] Campo 'agendada por' resolvido: key={chave} luca_id={opcao_luca}", flush=True)
+                return _campo_agendada_por_cache
+        print("[crm] Campo 'Reunião agendada por' não encontrado em /custom_fields/deals", flush=True)
+    except Exception as e:
+        print(f"[crm] Erro ao resolver campo agendada_por: {e}", flush=True)
+    _campo_agendada_por_cache = {}
+    return _campo_agendada_por_cache
+
+
+def parse_preferencia_datetime(preferencia: str):
+    """Converte a preferência do lead ('terça às 12h10') em ISO usando o Claude,
+    que já recebe a data atual de Brasília no system. Retorna ISO ou None."""
+    if not preferencia or not preferencia.strip():
+        return None
+    try:
+        prompt = (
+            "Converta a preferência de reunião abaixo para data e hora futuras no formato "
+            "ISO exato AAAA-MM-DDTHH:MM (ex: 2026-07-15T10:00), usando a data atual "
+            "informada no sistema como referência. Se a preferência não tiver informação "
+            "suficiente para determinar data e hora, responda apenas INDEFINIDA.\n"
+            "Responda APENAS o ISO ou INDEFINIDA, nada mais.\n\n"
+            f"Preferência: {preferencia}"
+        )
+        resp = call_claude([{"role": "user", "content": prompt}], max_tokens=30).strip()
+        if "INDEFINIDA" in resp.upper():
+            return None
+        datetime.strptime(resp[:16], "%Y-%m-%dT%H:%M")
+        return resp[:16]
+    except Exception as e:
+        print(f"[crm] Preferência não convertida ('{preferencia}'): {e}", flush=True)
+        return None
+
+
+def registrar_no_crm(conv, conversation_id, contact_name):
+    """Fecha o ciclo no Agendor quando a qualificação conclui:
+    1. Nota com o resumo do lead
+    2. Registro WhatsApp com a transcrição da conversa
+    3. Reunião [Luca] atribuída ao dono do negócio (se houver preferência)
+    4. Campo personalizado 'Reunião agendada por' = Luca"""
+    try:
+        if conv.get("crm_registrado"):
+            return
+        phone = conv.get("phone", "")
+        if not phone:
+            print(f"[crm] Sem telefone na conversa {conversation_id} — registro pulado", flush=True)
+            return
+        person, deal = buscar_pessoa_e_negocio(phone)
+        if not deal:
+            print(f"[crm] Negócio não encontrado para {phone} conv={conversation_id}", flush=True)
+            return
+        deal_id = deal.get("id")
+        d = conv.get("lead_data", {})
+
+        # ── 1. Nota: resumo do lead ──────────────────────────────────────────
+        nota = (
+            "📋 Atendimento via Luca (WhatsApp)\n"
+            f"Nome: {d.get('nome') or contact_name}\n"
+            f"Segmento: {d.get('segmento', '')}\n"
+            f"Necessidade: {d.get('necessidade', '')}\n"
+            f"E-mail: {d.get('email', '')}\n"
+            f"Preferência de reunião: {d.get('preferencia', '')}\n"
+            f"Status: {d.get('status', '')}"
+        )
+        r1 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                           headers={**HEADERS, "Content-Type": "application/json"},
+                           json={"text": nota}, timeout=15)
+        print(f"[crm] Nota resumo deal={deal_id} status={r1.status_code}", flush=True)
+
+        # ── 2. Registro WhatsApp: transcrição compacta ───────────────────────
+        linhas = []
+        for m in conv.get("messages", []):
+            papel = "Lead" if m["role"] == "user" else "Luca"
+            texto = m["content"]
+            # Remove instruções internas injetadas entre colchetes no início
+            if texto.startswith("["):
+                fim = texto.find("]\n\n")
+                if fim != -1:
+                    texto = texto[fim + 3:]
+            linhas.append(f"{papel}: {texto}")
+        transcricao = "💬 Conversa via Luca (WhatsApp):\n\n" + "\n\n".join(linhas)
+        blocos = [transcricao[i:i + 9000] for i in range(0, len(transcricao), 9000)]
+        for idx, bloco in enumerate(blocos):
+            sufixo = f" (parte {idx+1}/{len(blocos)})" if len(blocos) > 1 else ""
+            r2 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                               headers={**HEADERS, "Content-Type": "application/json"},
+                               json={"text": bloco + sufixo, "type": "whatsapp"}, timeout=15)
+            print(f"[crm] Transcrição{sufixo} deal={deal_id} status={r2.status_code}", flush=True)
+
+        # ── 3. Reunião [Luca] — somente se há preferência de horário ─────────
+        preferencia = (d.get("preferencia") or "").strip()
+        if preferencia:
+            owner_id = (deal.get("owner") or {}).get("id")
+            dt_iso = parse_preferencia_datetime(preferencia)
+            if dt_iso:
+                texto_reuniao = ("[Luca] Reunião com especialista — pré-agendada pelo Luca via WhatsApp, "
+                                 f"aguardando confirmação do consultor. Preferência do lead: {preferencia}")
+                due = dt_iso
+            else:
+                prox = datetime.utcnow() - timedelta(hours=3) + timedelta(days=1)
+                while prox.weekday() >= 5:
+                    prox += timedelta(days=1)
+                due = prox.strftime("%Y-%m-%dT09:00")
+                texto_reuniao = ("[Luca] Reunião com especialista — HORÁRIO A CONFIRMAR com o lead. "
+                                 f"Preferência informada: {preferencia}")
+            payload_reuniao = {"text": texto_reuniao, "type": "meeting", "dueDate": due}
+            if owner_id:
+                payload_reuniao["assignedUsers"] = [owner_id]
+            r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                               headers={**HEADERS, "Content-Type": "application/json"},
+                               json=payload_reuniao, timeout=15)
+            print(f"[crm] Reunião [Luca] deal={deal_id} due={due} status={r3.status_code} body={r3.text[:200]}", flush=True)
+
+            # ── 4. Campo personalizado 'Reunião agendada por' = Luca ─────────
+            campo = resolver_campo_agendada_por()
+            if campo.get("key") and campo.get("luca_id"):
+                r4 = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}",
+                                  headers={**HEADERS, "Content-Type": "application/json"},
+                                  json={"customFields": {campo["key"]: campo["luca_id"]}}, timeout=15)
+                print(f"[crm] Campo agendada_por=Luca deal={deal_id} status={r4.status_code}", flush=True)
+
+        conv["crm_registrado"] = True
+        print(f"[crm] ✅ Ciclo registrado no CRM deal={deal_id} conv={conversation_id}", flush=True)
+    except Exception as e:
+        print(f"[crm] Erro ao registrar conv={conversation_id}: {e}", flush=True)
+
+
 def send_private_note(conversation_id: int, text: str):
     """Cria ou atualiza nota interna visível apenas para agentes."""
     url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
@@ -988,6 +1154,8 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                     send_private_note(conversation_id, note_text)
                     conv["note_sent"] = True
                     print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
+                    # Fecha o ciclo no CRM: nota, transcrição, reunião [Luca] e campo
+                    registrar_no_crm(conv, conversation_id, contact_name)
         except Exception as e:
             print(f"[note] Erro ao processar nota: {e}", flush=True)
 
@@ -1068,6 +1236,8 @@ def agendorchat_webhook():
             }
 
         conv = conversation_histories[conv_key]
+        if contact_phone:
+            conv["phone"] = contact_phone
 
         # ── Detecta origem whatsapp_pagina na primeira mensagem ───────────────
         TEXTO_BOTAO_WHATSAPP = "Olá! Gostaria de saber mais sobre os serviços da Lucralize Tech."
@@ -1286,6 +1456,8 @@ def agendorchat_conversation_updated():
                 "last_msg_at": time.time(),
             }
         conv = conversation_histories[conv_key]
+        if contact_phone:
+            conv["phone"] = contact_phone
 
         # Sincroniza o histórico real (inclui a mensagem pendente do lead e o
         # trecho do atendimento humano, para o Luca ter o contexto completo)
