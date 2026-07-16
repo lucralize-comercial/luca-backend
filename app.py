@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import requests
 import os
 import time
@@ -1531,12 +1531,325 @@ def agendar():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# LEMBRETES AUTOMÁTICOS DE REUNIÃO
+# Varredura a cada 15 min das reuniões do Agendor; lembretes 24h e 1h antes.
+# Cascata: janela de 24h aberta -> mensagem livre | fechada -> template Meta.
+# Controles (variáveis no Railway):
+#   LEMBRETES_ATIVOS             liga/desliga tudo (padrão: false)
+#   LEMBRETES_MODO_OBSERVACAO    só simula com nota privada (padrão: true)
+#   LEMBRETE_ENVIA_COM_ATRIBUICAO envia mesmo com humano atribuído (padrão: true)
+#   MSG_LEMBRETE_24H / MSG_LEMBRETE_1H  textos da janela aberta ({nome},{hora},{hora_txt})
+# ═════════════════════════════════════════════════════════════════════════════
+
+AGENDORCHAT_INBOX_ID = os.environ.get("AGENDORCHAT_INBOX_ID", "2367")
+
+MSG_LEMBRETE_24H_PADRAO = (
+    "Olá, {nome}, tudo bem?\n\n"
+    "Sua reunião com o especialista está confirmada para amanhã{hora_txt}.\n\n"
+    "Ele já está se preparando para o seu caso. O convite com o link da videochamada está no seu e-mail.\n\n"
+    "Até amanhã!"
+)
+MSG_LEMBRETE_1H_PADRAO = (
+    "Olá, {nome}! Nossa conversa com o especialista é daqui a pouco, às {hora}.\n\n"
+    "O link da videochamada está no seu e-mail, dá pra entrar pelo navegador ou pelo celular.\n\n"
+    "Até já!"
+)
+
+
+def _flag(nome: str, padrao: str) -> bool:
+    return os.environ.get(nome, padrao).strip().lower() in ("1", "true", "sim", "on")
+
+
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return ""
+
+
+def _parse_dt(iso):
+    """Converte ISO do Agendor em datetime com timezone (assume BRT se vier sem)."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
+        return dt
+    except Exception:
+        return None
+
+
+_templates_cache = {"data": [], "ts": 0}
+
+def templates_aprovados():
+    """Lista os templates aprovados da inbox (cache de 30 min)."""
+    if time.time() - _templates_cache["ts"] < 1800 and _templates_cache["data"]:
+        return _templates_cache["data"]
+    try:
+        url = (f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/message_templates"
+               f"?inbox_id={AGENDORCHAT_INBOX_ID}&status=approved")
+        resp = requests.get(url, headers={"api_access_token": AGENDORCHAT_TOKEN}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        _templates_cache["data"] = data.get("payload", data if isinstance(data, list) else [])
+        _templates_cache["ts"] = time.time()
+    except Exception as e:
+        print(f"[lembrete] Erro ao listar templates: {e}", flush=True)
+    return _templates_cache["data"]
+
+
+def template_por_nome(nome: str):
+    for t in templates_aprovados():
+        if t.get("name") == nome:
+            return t
+    return None
+
+
+def enviar_template_conversa(conversation_id, tpl, variaveis, preview):
+    """Dispara um template aprovado numa conversa (funciona fora da janela)."""
+    payload = {
+        "content": preview,
+        "template_params": {
+            "name": tpl.get("name"),
+            "category": tpl.get("category"),
+            "language": tpl.get("language") or "pt_BR",
+            "processed_params": variaveis,
+            "id": tpl.get("template_id") or tpl.get("id"),
+        },
+    }
+    url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+    resp = requests.post(url, headers={"api_access_token": LUCA_SEND_TOKEN,
+                                       "Content-Type": "application/json"},
+                         json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+_phone_cache = {}
+
+def telefone_da_pessoa(person_id):
+    """Busca o telefone/WhatsApp de uma pessoa no Agendor (com cache)."""
+    if person_id in _phone_cache:
+        return _phone_cache[person_id]
+    try:
+        r = requests.get(f"{AGENDOR_BASE}/people/{person_id}", headers=HEADERS, timeout=15)
+        data = r.json().get("data", {}) or {}
+        contato = data.get("contact") or {}
+        for campo in ("whatsapp", "mobile", "phone", "workPhone"):
+            valor = (contato.get(campo) or "").strip()
+            if valor:
+                _phone_cache[person_id] = valor
+                return valor
+    except Exception as e:
+        print(f"[lembrete] Erro ao buscar telefone person={person_id}: {e}", flush=True)
+    _phone_cache[person_id] = ""
+    return ""
+
+
+def conversa_do_telefone(phone):
+    """Localiza a conversa mais recente do lead na inbox da API oficial."""
+    try:
+        digits = "".join(c for c in phone if c.isdigit())
+        for q in (phone, "+" + digits, digits):
+            r = requests.get(
+                f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/contacts/search",
+                headers={"api_access_token": AGENDORCHAT_TOKEN},
+                params={"q": q}, timeout=15)
+            contatos = r.json().get("payload", [])
+            if contatos:
+                break
+        if not contatos:
+            return None
+        contact_id = contatos[0].get("id")
+        r2 = requests.get(
+            f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/contacts/{contact_id}/conversations",
+            headers={"api_access_token": AGENDORCHAT_TOKEN}, timeout=15)
+        convs = r2.json().get("payload", [])
+        convs = [c for c in convs if str(c.get("inbox_id")) == str(AGENDORCHAT_INBOX_ID)]
+        if not convs:
+            return None
+        return sorted(convs, key=lambda c: c.get("id") or 0)[-1]
+    except Exception as e:
+        print(f"[lembrete] Erro ao localizar conversa de {phone}: {e}", flush=True)
+        return None
+
+
+def mensagens_da_conversa(conversation_id):
+    """Mensagens da conversa ordenadas por id (inclui notas privadas)."""
+    try:
+        url = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+        resp = requests.get(url, headers={"api_access_token": AGENDORCHAT_TOKEN}, timeout=15)
+        resp.raise_for_status()
+        msgs = resp.json().get("payload", [])
+        return sorted(msgs, key=lambda m: m.get("id") or 0)
+    except Exception as e:
+        print(f"[lembrete] Erro ao buscar mensagens conv={conversation_id}: {e}", flush=True)
+        return []
+
+
+def janela_aberta(msgs) -> bool:
+    """True se a última mensagem do lead tem menos de 24h (com folga de 30 min)."""
+    ultima_incoming = None
+    for m in msgs:
+        if m.get("message_type") == 0 and not m.get("private"):
+            ultima_incoming = m
+    if not ultima_incoming:
+        return False
+    criada = ultima_incoming.get("created_at") or 0
+    return (time.time() - float(criada)) < (24 * 3600 - 1800)
+
+
+def marcador_existe(msgs, marcador: str) -> bool:
+    return any(marcador in (m.get("content") or "") for m in msgs)
+
+
+def espelho_crm(deal_id, texto):
+    """Registro-espelho no negócio (tipo WhatsApp) para auditoria no CRM."""
+    if not deal_id:
+        return
+    try:
+        r = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                          headers={**HEADERS, "Content-Type": "application/json"},
+                          json={"text": texto, "type": "whatsapp"}, timeout=15)
+        print(f"[lembrete] Espelho CRM deal={deal_id} status={r.status_code}", flush=True)
+    except Exception as e:
+        print(f"[lembrete] Erro no espelho CRM deal={deal_id}: {e}", flush=True)
+
+
+def processar_lembrete(task, tipo, due):
+    task_id = task.get("id")
+    deal_id = (task.get("deal") or {}).get("id")
+    pessoa = task.get("person") or {}
+    person_id = pessoa.get("id")
+    if not person_id:
+        print(f"[lembrete] Reunião sem pessoa vinculada task={task_id} — pulada", flush=True)
+        return
+
+    phone = telefone_da_pessoa(person_id)
+    if not phone:
+        print(f"[lembrete] Pessoa {person_id} sem telefone task={task_id} — pulada", flush=True)
+        return
+
+    conv = conversa_do_telefone(phone)
+    if not conv:
+        print(f"[lembrete] Sem conversa no AgendorChat para {phone} task={task_id}", flush=True)
+        return
+    conv_id = conv.get("id")
+
+    msgs = mensagens_da_conversa(conv_id)
+    marcador = f"[lembrete:{task_id}:{tipo}]"
+    if marcador_existe(msgs, marcador):
+        return  # já tratado
+
+    # Humano atribuído: envia mesmo assim por padrão (com nota), configurável
+    detalhe = get_conversation_details(conv_id) or {}
+    assignee = (detalhe.get("meta") or {}).get("assignee")
+    if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
+        if not _flag("LEMBRETE_ENVIA_COM_ATRIBUICAO", "true"):
+            print(f"[lembrete] Congelado — humano atribuído conv={conv_id} task={task_id}", flush=True)
+            return
+
+    nome = (pessoa.get("name") or "").strip().split(" ")[0] if pessoa.get("name") else ""
+    due_brt = due.astimezone(timezone(timedelta(hours=-3)))
+    hora = due_brt.strftime("%Hh%M").lstrip("0") if due_brt.strftime("%M") != "00" else due_brt.strftime("%Hh").lstrip("0")
+    hora_confirmada = "HORÁRIO A CONFIRMAR" not in (task.get("text") or "").upper()
+
+    # Modo observação: só registra o que faria, sem enviar ao lead
+    if _flag("LEMBRETES_MODO_OBSERVACAO", "true"):
+        send_private_note(conv_id, (
+            f"👁️ [observação] Lembrete {tipo} SERIA enviado agora para {nome or phone} "
+            f"(reunião {due_brt.strftime('%d/%m %H:%M')}, hora confirmada: {'sim' if hora_confirmada else 'não'}, "
+            f"janela: {'aberta' if janela_aberta(msgs) else 'fechada'}). {marcador}"))
+        print(f"[lembrete] OBSERVAÇÃO {tipo} conv={conv_id} task={task_id}", flush=True)
+        return
+
+    if janela_aberta(msgs):
+        # ── Janela aberta: mensagem livre, texto editável no Railway ─────────
+        modelo = os.environ.get("MSG_LEMBRETE_24H" if tipo == "24h" else "MSG_LEMBRETE_1H", "") \
+                 or (MSG_LEMBRETE_24H_PADRAO if tipo == "24h" else MSG_LEMBRETE_1H_PADRAO)
+        hora_txt = f", às {hora}" if hora_confirmada else ""
+        texto = modelo.format_map(_SafeDict(nome=nome, hora=hora, hora_txt=hora_txt))
+        texto = texto.replace("Olá, ,", "Olá,").replace("Olá, !", "Olá!")
+        send_agendorchat_message(conv_id, texto)
+        via = "mensagem livre"
+    else:
+        # ── Janela fechada: template aprovado da Meta ─────────────────────────
+        if tipo == "1h":
+            tpl, variaveis, preview = template_por_nome("lembrete_de_evento"), {}, \
+                "Compromisso confirmado. Sua reunião está agendada para hoje."
+        else:
+            if hora_confirmada and template_por_nome("lembrete_reuniao_amanha_hora"):
+                tpl = template_por_nome("lembrete_reuniao_amanha_hora")
+                variaveis = {"1": nome or "tudo bem", "2": hora}
+                preview = f"Sua reunião com o especialista está confirmada para amanhã, às {hora}."
+            else:
+                tpl = template_por_nome("lembrete_reuniao_amanha")
+                variaveis = {"1": nome or "tudo bem"}
+                preview = "Sua reunião com o especialista está confirmada para amanhã."
+        if not tpl:
+            # Sem template disponível: alerta para contato manual (plano interino)
+            send_private_note(conv_id, (
+                f"🔔 Lembrete {tipo} NÃO enviado (janela fechada e template indisponível). "
+                f"Recomenda-se contato manual com o lead. {marcador}"))
+            espelho_crm(deal_id, f"🤖 Lembrete de reunião ({tipo}) não enviado — janela fechada, "
+                                 f"template pendente. Contato manual recomendado.")
+            print(f"[lembrete] {tipo} SEM TEMPLATE conv={conv_id} task={task_id}", flush=True)
+            return
+        enviar_template_conversa(conv_id, tpl, variaveis, preview)
+        via = f"template {tpl.get('name')}"
+
+    send_private_note(conv_id, f"🔔 Lembrete de reunião ({tipo}) enviado ao lead via {via}. {marcador}")
+    espelho_crm(deal_id, f"🤖 Lembrete de reunião ({tipo}) enviado ao lead via WhatsApp ({via}). "
+                         f"Reunião: {due_brt.strftime('%d/%m/%Y %H:%M')}.")
+    print(f"[lembrete] ✅ {tipo} enviado conv={conv_id} task={task_id} via {via}", flush=True)
+
+
+def varredura_lembretes():
+    if not _flag("LEMBRETES_ATIVOS", "false"):
+        return
+    agora_brt = datetime.utcnow() - timedelta(hours=3)
+    if not (8 <= agora_brt.hour < 20):
+        return  # fora da janela de envio
+
+    tasks = tasks_cache.get("data") or []
+    if not tasks:
+        fetch_tasks_job()
+        tasks = tasks_cache.get("data") or []
+
+    agora = datetime.now(timezone.utc)
+    for t in tasks:
+        try:
+            if t.get("type") != "Reunião" or t.get("finishedAt"):
+                continue
+            due = _parse_dt(t.get("dueDate"))
+            if not due:
+                continue
+            delta = (due - agora).total_seconds()
+            if 72000 <= delta <= 86400:          # 20h a 24h antes
+                processar_lembrete(t, "24h", due)
+            elif 900 <= delta <= 3600:            # 15 a 60 min antes
+                criada = _parse_dt(t.get("createdAt"))
+                if criada and (agora - criada).total_seconds() < 7200:
+                    continue  # reunião marcada há menos de 2h: lembrete redundante
+                processar_lembrete(t, "1h", due)
+        except Exception as e:
+            print(f"[lembrete] Erro na task {t.get('id')}: {e}", flush=True)
+
+
+def varredura_lembretes_safe():
+    try:
+        varredura_lembretes()
+    except Exception as e:
+        print(f"[lembrete] Erro geral na varredura: {e}", flush=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # SCHEDULER + MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
 scheduler.add_job(fetch_tasks_job, "interval", hours=2, id="tasks_recorrente")
+scheduler.add_job(varredura_lembretes_safe, "interval", minutes=15, id="lembretes_reuniao")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.start()
 
