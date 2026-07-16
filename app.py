@@ -1816,6 +1816,32 @@ def varredura_lembretes():
         tasks = tasks_cache.get("data") or []
 
     agora = datetime.now(timezone.utc)
+
+    # Mapa negócio -> status a partir do cache do dashboard (1=andamento, 2=ganho, 3=perdido)
+    status_por_deal = {d.get("id"): (d.get("dealStatus") or {}).get("id")
+                       for d in (cache.get("deals") or [])}
+
+    def negocio_permite_lembrete(task):
+        """Lembrete só para negócio em andamento. Sem negócio vinculado: permite.
+        Status desconhecido: consulta a API; em erro, permite (fail-open)."""
+        deal_id = (task.get("deal") or {}).get("id")
+        if not deal_id:
+            return True
+        status = status_por_deal.get(deal_id)
+        if status is None:
+            try:
+                r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS, timeout=15)
+                status = ((r.json().get("data") or {}).get("dealStatus") or {}).get("id")
+                status_por_deal[deal_id] = status
+            except Exception as e:
+                print(f"[lembrete] Status do negócio {deal_id} indisponível ({e}) — permitindo", flush=True)
+                return True
+        if status == 1 or status is None:
+            return True
+        rotulo = "ganho" if status == 2 else "perdido" if status == 3 else f"status {status}"
+        print(f"[lembrete] Pulado — negócio {deal_id} {rotulo} (task={task.get('id')})", flush=True)
+        return False
+
     for t in tasks:
         try:
             if t.get("type") != "Reunião" or t.get("finishedAt"):
@@ -1824,6 +1850,10 @@ def varredura_lembretes():
             if not due:
                 continue
             delta = (due - agora).total_seconds()
+            if not (72000 <= delta <= 86400 or 900 <= delta <= 3600):
+                continue
+            if not negocio_permite_lembrete(t):
+                continue
             if 72000 <= delta <= 86400:          # 20h a 24h antes
                 processar_lembrete(t, "24h", due)
             elif 900 <= delta <= 3600:            # 15 a 60 min antes
