@@ -1727,6 +1727,16 @@ def processar_lembrete(task, tipo, due):
     deal_id = (task.get("deal") or {}).get("id")
     pessoa = task.get("person") or {}
     person_id = pessoa.get("id")
+    if not person_id and deal_id:
+        # A listagem de tasks não traz a pessoa: busca via negócio
+        try:
+            r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS, timeout=15)
+            dp = ((r.json().get("data") or {}).get("person")) or {}
+            if dp.get("id"):
+                pessoa, person_id = dp, dp.get("id")
+                print(f"[lembrete] pessoa obtida via negócio: person={person_id} task={task_id}", flush=True)
+        except Exception as e:
+            print(f"[lembrete] Erro ao buscar pessoa via negócio {deal_id}: {e}", flush=True)
     if not person_id:
         print(f"[lembrete] Reunião sem pessoa vinculada task={task_id} — pulada", flush=True)
         return
