@@ -1812,15 +1812,20 @@ def processar_lembrete(task, tipo, due):
 
 def varredura_lembretes():
     if not _flag("LEMBRETES_ATIVOS", "false"):
+        print("[lembrete] varredura pulada — LEMBRETES_ATIVOS desligado", flush=True)
         return
     agora_brt = datetime.utcnow() - timedelta(hours=3)
     if not (8 <= agora_brt.hour < 20):
+        print(f"[lembrete] varredura pulada — fora do horário de envio ({agora_brt.strftime('%H:%M')} BRT)", flush=True)
         return  # fora da janela de envio
 
     tasks = tasks_cache.get("data") or []
     if not tasks:
         fetch_tasks_job()
         tasks = tasks_cache.get("data") or []
+
+    reunioes_futuras = 0
+    na_janela = 0
 
     agora = datetime.now(timezone.utc)
 
@@ -1857,8 +1862,14 @@ def varredura_lembretes():
             if not due:
                 continue
             delta = (due - agora).total_seconds()
+            if delta > 0:
+                reunioes_futuras += 1
             if not (72000 <= delta <= 86400 or 900 <= delta <= 3600):
                 continue
+            na_janela += 1
+            print(f"[lembrete] candidata: task={t.get('id')} due={t.get('dueDate')} "
+                  f"delta={int(delta/60)}min pessoa={(t.get('person') or {}).get('id')} "
+                  f"deal={(t.get('deal') or {}).get('id')}", flush=True)
             if not negocio_permite_lembrete(t):
                 continue
             if 72000 <= delta <= 86400:          # 20h a 24h antes
@@ -1870,6 +1881,9 @@ def varredura_lembretes():
                 processar_lembrete(t, "1h", due)
         except Exception as e:
             print(f"[lembrete] Erro na task {t.get('id')}: {e}", flush=True)
+
+    print(f"[lembrete] varredura concluída: {len(tasks)} tasks no cache, "
+          f"{reunioes_futuras} reuniões futuras, {na_janela} na janela de disparo", flush=True)
 
 
 def varredura_lembretes_safe():
