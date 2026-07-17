@@ -842,7 +842,14 @@ def get_last_message_info(conversation_id: int) -> dict:
             return {}
         # A API não garante ordem cronológica — ordena por id (crescente)
         messages = sorted(messages, key=lambda m: m.get("id") or 0)
-        last = messages[-1]
+        # Considera apenas o diálogo real: ignora mensagens de atividade do
+        # sistema ("fulano atribuiu...", message_type=2) e notas privadas,
+        # que mascaravam a última mensagem verdadeira do lead
+        dialogo = [m for m in messages
+                   if m.get("message_type") in (0, 1, 3) and not m.get("private")]
+        if not dialogo:
+            return {}
+        last = dialogo[-1]
         return {
             "id":      last.get("id"),
             "content": last.get("content", ""),
