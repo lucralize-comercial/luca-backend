@@ -1864,6 +1864,11 @@ def varredura_lembretes():
             delta = (due - agora).total_seconds()
             if delta > 0:
                 reunioes_futuras += 1
+                # Diagnóstico: mostra o dado cru de cada reunião futura
+                print(f"[lembrete] futura: task={t.get('id')} dueDate_raw={t.get('dueDate')!r} "
+                      f"parseado={due.isoformat()} delta={int(delta/60)}min "
+                      f"campos_data={ {k: v for k, v in t.items() if 'due' in k.lower() or 'date' in k.lower()} }",
+                      flush=True)
             if not (72000 <= delta <= 86400 or 900 <= delta <= 3600):
                 continue
             na_janela += 1
