@@ -254,7 +254,10 @@ def fetch_tasks_job():
     try:
         print("Buscando tasks do Agendor...", flush=True)
         all_tasks = []
-        date_gt = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        # Janela ampliada de 30 -> 60 dias (calibrada com folga do teto de
+        # paginação abaixo; NÃO ampliar sem recalcular o ritmo de criação,
+        # ver conversa de 20/jul/2026 sobre o risco de corte silencioso)
+        date_gt = (datetime.utcnow() - timedelta(days=60)).strftime("%Y-%m-%d")
         page = 1
         while page <= 100:
             r = requests.get(
@@ -278,6 +281,10 @@ def fetch_tasks_job():
         tasks_cache["data"] = all_tasks
         tasks_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(f"Tasks: {len(all_tasks)} carregadas", flush=True)
+        if len(all_tasks) >= 8000:
+            print(f"[alerta] Volume de tasks ({len(all_tasks)}) se aproxima do teto de paginação "
+                  f"(10.000). Considerar reduzir a janela de {60} dias antes de virar corte silencioso.",
+                  flush=True)
     except Exception as e:
         print(f"Erro fetch tasks: {e}", flush=True)
 
