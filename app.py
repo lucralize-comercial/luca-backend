@@ -216,6 +216,7 @@ CALENDAR_USER       = os.environ.get("CALENDAR_USER",       "ronaldojunior@lucra
 cache = {"deals": [], "total": 0, "updated_at": None}
 history_cache = {"data": [], "updated_at": None, "total_processed": 0, "total_target": 0}
 tasks_cache = {"data": [], "updated_at": None}
+tasks_running = False  # trava contra chamadas concorrentes de fetch_tasks_job
 
 fetch_running = False
 fetch_started_at = None
@@ -251,6 +252,11 @@ def fetch_deal_history(deal_id):
     return []
 
 def fetch_tasks_job():
+    global tasks_running
+    if tasks_running:
+        print("[tasks] Busca já em andamento — chamada ignorada para evitar sobreposição", flush=True)
+        return
+    tasks_running = True
     try:
         print("Buscando tasks do Agendor...", flush=True)
         all_tasks = []
@@ -287,6 +293,8 @@ def fetch_tasks_job():
                   flush=True)
     except Exception as e:
         print(f"Erro fetch tasks: {e}", flush=True)
+    finally:
+        tasks_running = False
 
 def fetch_history_job():
     global history_running
