@@ -174,33 +174,46 @@ def contexto_data_atual() -> str:
             f"Lembre-se: o atendimento é de segunda a quinta das 9h às 17h e sexta das 9h às 16h30, sem fins de semana.")
 
 
-def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROMPT) -> str:
-    """Chama a API Anthropic e retorna o texto da resposta."""
-    system = system + contexto_data_atual()
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key":         ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type":      "application/json",
-        },
-        json={
-            "model":      "claude-sonnet-4-5",
-            "max_tokens": max_tokens,
-            "system":     system,
-            "messages":   messages,
-        },
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        print(f"[claude] Erro API status={resp.status_code} body={resp.text[:300]}", flush=True)
-    resp.raise_for_status()
-    data = resp.json()
-    content = data.get("content") or []
-    if not content or not content[0].get("text"):
-        print(f"[claude] Resposta sem conteúdo: {json.dumps(data)[:300]}", flush=True)
-        raise ValueError("Resposta da Anthropic sem conteúdo de texto")
-    return content[0]["text"].strip()
+def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROMPT, tentativas: int = 3) -> str:
+    """Chama a API Anthropic e retorna o texto da resposta.
+    Tenta novamente se vier resposta vazia (falha transitória rara da API) —
+    sem isso, uma única resposta vazia deixava o Luca em silêncio pro lead."""
+    system_completo = system + contexto_data_atual()
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key":         ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type":      "application/json",
+                },
+                json={
+                    "model":      "claude-sonnet-4-5",
+                    "max_tokens": max_tokens,
+                    "system":     system_completo,
+                    "messages":   messages,
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"[claude] Erro API status={resp.status_code} body={resp.text[:300]} "
+                      f"(tentativa {tentativa}/{tentativas})", flush=True)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content") or []
+            if content and content[0].get("text"):
+                return content[0]["text"].strip()
+            print(f"[claude] Resposta sem conteúdo (tentativa {tentativa}/{tentativas}): "
+                  f"{json.dumps(data)[:300]}", flush=True)
+            ultimo_erro = ValueError("Resposta da Anthropic sem conteúdo de texto")
+        except Exception as e:
+            ultimo_erro = e
+            print(f"[claude] Erro na chamada (tentativa {tentativa}/{tentativas}): {e}", flush=True)
+        if tentativa < tentativas:
+            time.sleep(2)
+    raise ultimo_erro
 
 
 # Histórico de conversas por conversa_id (em memória)
@@ -751,15 +764,12 @@ def criar_pessoa_e_negocio(phone: str, nome: str, email: str):
 
     deal = None
     try:
-        FUNIL_COMERCIAL_ID = 696449
         ETAPA_NOVO_LEAD_ID = 2835663
         payload_deal = {
             "title": f"{nome_final} - via Luca (WhatsApp)",
-            "person": {"id": person["id"]},
-            "funnel": {"id": FUNIL_COMERCIAL_ID},
-            "dealStage": {"id": ETAPA_NOVO_LEAD_ID},
+            "dealStageId": ETAPA_NOVO_LEAD_ID,
         }
-        rd = requests.post(f"{AGENDOR_BASE}/deals",
+        rd = requests.post(f"{AGENDOR_BASE}/people/{person['id']}/deals",
                             headers={**HEADERS, "Content-Type": "application/json"},
                             json=payload_deal, timeout=15)
         print(f"[crm] Criação de negócio status={rd.status_code} body={rd.text[:300]}", flush=True)
