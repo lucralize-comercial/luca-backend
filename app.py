@@ -875,14 +875,18 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             if dt_iso:
                 texto_reuniao = ("[Luca] Reunião com especialista — pré-agendada pelo Luca via WhatsApp, "
                                  f"aguardando confirmação do consultor. Preferência do lead: {preferencia}")
-                due = dt_iso
+                dt_local = datetime.strptime(dt_iso, "%Y-%m-%dT%H:%M")
             else:
                 prox = datetime.utcnow() - timedelta(hours=3) + timedelta(days=1)
                 while prox.weekday() >= 5:
                     prox += timedelta(days=1)
-                due = prox.strftime("%Y-%m-%dT09:00")
+                dt_local = datetime(prox.year, prox.month, prox.day, 9, 0)
                 texto_reuniao = ("[Luca] Reunião com especialista — HORÁRIO A CONFIRMAR com o lead. "
                                  f"Preferência informada: {preferencia}")
+            # Agendor guarda dueDate em UTC com segundos/milissegundos (ex: 2026-07-23T18:00:00.000Z
+            # para 15h de Brasília) — converte o horário local (Brasília, UTC-3) antes de enviar.
+            dt_utc = dt_local + timedelta(hours=3)
+            due = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
             payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "dueDate": due}
             if owner_id:
                 payload_reuniao["assignedUsers"] = [owner_id]
