@@ -862,7 +862,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                 due = prox.strftime("%Y-%m-%dT09:00")
                 texto_reuniao = ("[Luca] Reunião com especialista — HORÁRIO A CONFIRMAR com o lead. "
                                  f"Preferência informada: {preferencia}")
-            payload_reuniao = {"text": texto_reuniao, "type": "meeting", "dueDate": due}
+            payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "dueDate": due}
             if owner_id:
                 payload_reuniao["assignedUsers"] = [owner_id]
             r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
@@ -891,7 +891,13 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                 2835665,  # Follow-up
                 2835666,  # Fechamento
             ]
-            deal_stage = deal.get("dealStage") or {}
+            try:
+                r_fresh = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS, timeout=15)
+                deal_fresco = r_fresh.json().get("data") or {}
+            except Exception as e:
+                print(f"[crm] Erro ao buscar negócio fresco pra checar etapa: {e}", flush=True)
+                deal_fresco = {}
+            deal_stage = deal_fresco.get("dealStage") or {}
             funil_atual_id = (deal_stage.get("funnel") or {}).get("id")
             etapa_atual_id = deal_stage.get("id")
 
@@ -900,9 +906,10 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                              if etapa_atual_id in ORDEM_ETAPAS_FUNIL_COMERCIAL else None)
                 idx_alvo = ORDEM_ETAPAS_FUNIL_COMERCIAL.index(ETAPA_REUNIAO_AGENDADA_ID)
                 if idx_atual is not None and idx_atual < idx_alvo:
+                    sequencia_alvo = idx_alvo + 1  # API espera a posição (1-indexed) dentro do funil, não o ID global
                     r5 = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}/stage",
                                        headers={**HEADERS, "Content-Type": "application/json"},
-                                       json={"dealStageId": ETAPA_REUNIAO_AGENDADA_ID}, timeout=15)
+                                       json={"dealStage": sequencia_alvo}, timeout=15)
                     print(f"[crm] Etapa -> 'Reunião agendada' deal={deal_id} status={r5.status_code} body={r5.text[:200]}", flush=True)
                 else:
                     print(f"[crm] Etapa não movida — atual={etapa_atual_id} já é igual/posterior a 'Reunião agendada' "
@@ -1281,6 +1288,7 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                 conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
 
                 if (dados_completos or conversa_encerrada) and not conv.get("note_sent"):
+                    d["telefone"] = conv.get("phone") or d.get("telefone", "Não informado")
                     note_text = build_lead_note(d)
                     send_private_note(conversation_id, note_text)
                     conv["note_sent"] = True
