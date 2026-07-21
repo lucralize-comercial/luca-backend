@@ -679,7 +679,7 @@ def resolver_campo_agendada_por():
         for campo in campos:
             nome = (campo.get("name") or "").lower()
             if "agendada por" in nome:
-                chave = campo.get("key") or campo.get("slug")
+                chave = campo.get("identifier") or campo.get("key") or campo.get("slug")
                 opcao_luca = None
                 for opt in (campo.get("options") or campo.get("values") or []):
                     if (opt.get("name") or opt.get("value") or "").strip().lower() == "luca":
@@ -687,6 +687,10 @@ def resolver_campo_agendada_por():
                         break
                 _campo_agendada_por_cache = {"key": chave, "luca_id": opcao_luca}
                 print(f"[crm] Campo 'agendada por' resolvido: key={chave} luca_id={opcao_luca}", flush=True)
+                if not chave:
+                    print("[crm] AVISO: campo 'agendada por' encontrado mas sem identifier/key/slug — não será preenchido", flush=True)
+                if not opcao_luca:
+                    print("[crm] AVISO: opção 'Luca' não encontrada nas options do campo — não será preenchido", flush=True)
                 return _campo_agendada_por_cache
         print("[crm] Campo 'Reunião agendada por' não encontrado em /custom_fields/deals", flush=True)
     except Exception as e:
@@ -724,7 +728,9 @@ def registrar_no_crm(conv, conversation_id, contact_name):
     1. Nota com o resumo do lead
     2. Registro WhatsApp com a transcrição da conversa
     3. Reunião [Luca] atribuída ao dono do negócio (se houver preferência)
-    4. Campo personalizado 'Reunião agendada por' = Luca"""
+    4. Campo personalizado 'Reunião agendada por' = Luca
+    5. Move o negócio para a etapa 'Reunião agendada' no Funil Comercial,
+       só se ainda estiver numa etapa anterior (nunca rebaixa)"""
     try:
         if conv.get("crm_registrado"):
             return
@@ -805,6 +811,38 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                                   headers={**HEADERS, "Content-Type": "application/json"},
                                   json={"customFields": {campo["key"]: campo["luca_id"]}}, timeout=15)
                 print(f"[crm] Campo agendada_por=Luca deal={deal_id} status={r4.status_code}", flush=True)
+
+            # ── 5. Move etapa para 'Reunião agendada' (Funil Comercial, só avança) ─
+            FUNIL_COMERCIAL_ID = 696449
+            ETAPA_REUNIAO_AGENDADA_ID = 2845579
+            ORDEM_ETAPAS_FUNIL_COMERCIAL = [
+                2835663,  # Novo Lead
+                3596855,  # 1º Contato (D0)
+                3060060,  # 2° Contato
+                3060061,  # 3° Contato
+                2907497,  # Contato Retornado
+                2845579,  # Reunião agendada
+                2835665,  # Follow-up
+                2835666,  # Fechamento
+            ]
+            deal_stage = deal.get("dealStage") or {}
+            funil_atual_id = (deal_stage.get("funnel") or {}).get("id")
+            etapa_atual_id = deal_stage.get("id")
+
+            if funil_atual_id == FUNIL_COMERCIAL_ID:
+                idx_atual = (ORDEM_ETAPAS_FUNIL_COMERCIAL.index(etapa_atual_id)
+                             if etapa_atual_id in ORDEM_ETAPAS_FUNIL_COMERCIAL else None)
+                idx_alvo = ORDEM_ETAPAS_FUNIL_COMERCIAL.index(ETAPA_REUNIAO_AGENDADA_ID)
+                if idx_atual is not None and idx_atual < idx_alvo:
+                    r5 = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}/stage",
+                                       headers={**HEADERS, "Content-Type": "application/json"},
+                                       json={"dealStageId": ETAPA_REUNIAO_AGENDADA_ID}, timeout=15)
+                    print(f"[crm] Etapa -> 'Reunião agendada' deal={deal_id} status={r5.status_code} body={r5.text[:200]}", flush=True)
+                else:
+                    print(f"[crm] Etapa não movida — atual={etapa_atual_id} já é igual/posterior a 'Reunião agendada' "
+                          f"ou fora da ordem mapeada (ex: Perdido)", flush=True)
+            else:
+                print(f"[crm] Etapa não movida — negócio fora do Funil Comercial (funil={funil_atual_id})", flush=True)
 
         conv["crm_registrado"] = True
         print(f"[crm] ✅ Ciclo registrado no CRM deal={deal_id} conv={conversation_id}", flush=True)
@@ -935,6 +973,7 @@ def build_lead_note(conv_data: dict) -> str:
     nome       = conv_data.get("nome", "Não informado")
     segmento   = conv_data.get("segmento", "Não identificado")
     necessidade = conv_data.get("necessidade", "Não informada")
+    telefone   = conv_data.get("telefone", "Não informado")
     email      = conv_data.get("email", "Não informado")
     preferencia = conv_data.get("preferencia", "")
     status     = conv_data.get("status", "Em atendimento")
@@ -944,6 +983,7 @@ def build_lead_note(conv_data: dict) -> str:
         f"Nome: {nome}",
         f"Segmento: {segmento}",
         f"Necessidade: {necessidade}",
+        f"Telefone: {telefone}",
         f"E-mail: {email}",
     ]
     if preferencia:
