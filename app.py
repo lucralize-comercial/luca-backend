@@ -723,8 +723,57 @@ def parse_preferencia_datetime(preferencia: str):
         return None
 
 
+def criar_pessoa_e_negocio(phone: str, nome: str, email: str):
+    """Cria pessoa e negócio no Agendor quando o lead ainda não existe no CRM
+    (contato só existia no AgendorChat, sem registro no Agendor). Usado quando
+    buscar_pessoa_e_negocio não encontra negócio pra vincular o ciclo do Luca.
+    Retorna (person, deal) ou (None, None) em caso de falha."""
+    phone_clean = phone.replace("+", "").replace(" ", "").strip()
+    nome_final = nome or "Lead via Luca (WhatsApp)"
+
+    person = None
+    try:
+        payload_pessoa = {"name": nome_final, "contact": {"whatsapp": phone_clean}}
+        if email:
+            payload_pessoa["contact"]["email"] = email
+        rp = requests.post(f"{AGENDOR_BASE}/people",
+                            headers={**HEADERS, "Content-Type": "application/json"},
+                            json=payload_pessoa, timeout=15)
+        print(f"[crm] Criação de pessoa status={rp.status_code} body={rp.text[:300]}", flush=True)
+        if rp.status_code in (200, 201):
+            person = rp.json().get("data") or rp.json()
+    except Exception as e:
+        print(f"[crm] Erro ao criar pessoa: {e}", flush=True)
+
+    if not person or not person.get("id"):
+        print("[crm] Pessoa não criada — abortando criação de negócio", flush=True)
+        return None, None
+
+    deal = None
+    try:
+        FUNIL_COMERCIAL_ID = 696449
+        ETAPA_NOVO_LEAD_ID = 2835663
+        payload_deal = {
+            "title": f"{nome_final} - via Luca (WhatsApp)",
+            "person": {"id": person["id"]},
+            "funnel": {"id": FUNIL_COMERCIAL_ID},
+            "dealStage": {"id": ETAPA_NOVO_LEAD_ID},
+        }
+        rd = requests.post(f"{AGENDOR_BASE}/deals",
+                            headers={**HEADERS, "Content-Type": "application/json"},
+                            json=payload_deal, timeout=15)
+        print(f"[crm] Criação de negócio status={rd.status_code} body={rd.text[:300]}", flush=True)
+        if rd.status_code in (200, 201):
+            deal = rd.json().get("data") or rd.json()
+    except Exception as e:
+        print(f"[crm] Erro ao criar negócio: {e}", flush=True)
+
+    return person, deal
+
+
 def registrar_no_crm(conv, conversation_id, contact_name):
     """Fecha o ciclo no Agendor quando a qualificação conclui:
+    0. Se pessoa/negócio não existirem no CRM ainda, cria os dois primeiro
     1. Nota com o resumo do lead
     2. Registro WhatsApp com a transcrição da conversa
     3. Reunião [Luca] atribuída ao dono do negócio (se houver preferência)
@@ -739,11 +788,18 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             print(f"[crm] Sem telefone na conversa {conversation_id} — registro pulado", flush=True)
             return
         person, deal = buscar_pessoa_e_negocio(phone)
-        if not deal:
-            print(f"[crm] Negócio não encontrado para {phone} conv={conversation_id}", flush=True)
-            return
-        deal_id = deal.get("id")
         d = conv.get("lead_data", {})
+        if not deal:
+            nome_lead = d.get("nome") or contact_name
+            email_lead = d.get("email", "")
+            print(f"[crm] Negócio não encontrado para {phone} conv={conversation_id} — "
+                  f"tentando criar pessoa/negócio", flush=True)
+            person, deal = criar_pessoa_e_negocio(phone, nome_lead, email_lead)
+            if not deal:
+                print(f"[crm] Não foi possível criar pessoa/negócio para {phone} "
+                      f"conv={conversation_id} — registro abortado", flush=True)
+                return
+        deal_id = deal.get("id")
 
         # ── 1. Nota: resumo do lead ──────────────────────────────────────────
         nota = (
