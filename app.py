@@ -1306,6 +1306,7 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                     and d.get("segmento") and d.get("segmento") != "Não identificado"
                     and d.get("necessidade") and d.get("necessidade") != "Não informada"
                     and d.get("email") and d.get("email") != "Não informado"
+                    and d.get("preferencia")  # só fecha o ciclo com a reunião já combinada
                 )
 
                 # Detecta encerramento por acompanhamento
