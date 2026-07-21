@@ -887,9 +887,9 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             # para 15h de Brasília) — converte o horário local (Brasília, UTC-3) antes de enviar.
             dt_utc = dt_local + timedelta(hours=3)
             due = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "dueDate": due}
+            payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
             if owner_id:
-                payload_reuniao["assignedUsers"] = [owner_id]
+                payload_reuniao["assigned_users"] = [str(owner_id)]
             r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
                                headers={**HEADERS, "Content-Type": "application/json"},
                                json=payload_reuniao, timeout=15)
