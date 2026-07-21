@@ -674,8 +674,10 @@ def buscar_pessoa_e_negocio(phone):
     if not pessoas:
         return None, None
     person = pessoas[0]
-    r2 = requests.get(f"{AGENDOR_BASE}/deals", headers=HEADERS,
-                      params={"personId": person.get("id"), "per_page": 20}, timeout=15)
+    # IMPORTANTE: GET /deals?personId=X ignora o filtro e devolve negócios de
+    # QUALQUER pessoa (bug confirmado na API) — usa o endpoint aninhado, que
+    # filtra corretamente.
+    r2 = requests.get(f"{AGENDOR_BASE}/people/{person.get('id')}/deals", headers=HEADERS, timeout=15)
     deals = r2.json().get("data", [])
     deals_comercial = [
         d for d in deals
@@ -1151,9 +1153,10 @@ def preencher_origem_whatsapp_pagina(phone):
             print(f"[origem] Pessoa não encontrada para telefone {phone_clean}", flush=True)
             return
         person_id = pessoas[0].get("id")
-        # Busca negócios da pessoa, ordenados por criação desc
-        r2 = requests.get(f"{AGENDOR_BASE}/deals", headers=HEADERS,
-                          params={"personId": person_id, "per_page": 5}, timeout=15)
+        # Busca negócios da pessoa. IMPORTANTE: GET /deals?personId=X ignora o
+        # filtro e devolve negócios de QUALQUER pessoa (bug confirmado na API)
+        # — usa o endpoint aninhado, que filtra corretamente.
+        r2 = requests.get(f"{AGENDOR_BASE}/people/{person_id}/deals", headers=HEADERS, timeout=15)
         deals = r2.json().get("data", [])
         if not deals:
             print(f"[origem] Nenhum negócio encontrado para person_id={person_id}", flush=True)
@@ -1422,6 +1425,14 @@ def agendorchat_webhook():
                 extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
             if contact_phone:
                 extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
+            # IMPORTANTE: não injetar uma mensagem "assistant" como primeira do
+            # array — a API da Anthropic exige que a primeira mensagem seja
+            # sempre "user", e um array começando com "assistant" causava
+            # respostas vazias (stop_reason=end_turn, content=[]). A instrução
+            # de dar boas-vindas de volta vai só no system prompt.
+            extra += (" Esta conversa foi reaberta após um atendimento anterior "
+                      "ter sido encerrado — cumprimente o lead calorosamente, "
+                      "como quem dá boas-vindas de volta, antes de seguir normalmente.")
             conversation_histories[conv_key] = {
                 "system":    SYSTEM_PROMPT + extra,
                 "messages":  [],
@@ -1433,16 +1444,15 @@ def agendorchat_webhook():
                 # "primeira mensagem" (evita o delay de 90s e o refetch de
                 # histórico remoto, que desfariam o reset).
                 "message_count": conv.get("message_count", 1),
+                # Evita que o bloco abaixo ("se memória vazia, busca histórico
+                # remoto") traga de volta o histórico antigo — o reset é
+                # intencional, o array vazio aqui é o estado desejado.
+                "skip_remote_fetch": True,
             }
             conv = conversation_histories[conv_key]
-            # Injeta contexto de reabertura para o Luca tratar como retorno
-            conv["messages"].append({
-                "role": "assistant",
-                "content": f"Oi, {contact_name.split()[0] if contact_name else 'tudo bem'}! Que bom ter você de volta. Como posso te ajudar hoje?"
-            })
 
         # ── Se memória está vazia, busca histórico real do AgendorChat ────────
-        if not conv["messages"]:
+        if not conv["messages"] and not conv.get("skip_remote_fetch"):
             remote_history = fetch_conversation_history(conversation_id)
             if remote_history:
                 print(f"[history] Recuperados {len(remote_history)} msgs da conv={conversation_id}", flush=True)
