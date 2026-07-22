@@ -288,11 +288,20 @@ def fetch_tasks_job():
         date_gt = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
         page = 1
         while page <= 100:
-            r = requests.get(
-                f"{AGENDOR_BASE}/tasks", headers=HEADERS,
-                params={"per_page": 100, "page": page, "createdDateGt": date_gt},
-                timeout=60
-            )
+            # Backoff exponencial em 429/5xx, recomendado pelo suporte do Agendor
+            # (sem Retry-After confiável na API — não depender dele).
+            for tentativa in range(4):
+                r = requests.get(
+                    f"{AGENDOR_BASE}/tasks", headers=HEADERS,
+                    params={"per_page": 100, "page": page, "createdDateGt": date_gt},
+                    timeout=60
+                )
+                if r.status_code not in (429, 500, 502, 503, 504):
+                    break
+                espera = 2 ** tentativa  # 1s, 2s, 4s, 8s
+                print(f"[tasks] status={r.status_code} na página {page}, "
+                      f"tentativa {tentativa+1}/4, aguardando {espera}s", flush=True)
+                time.sleep(espera)
             if r.status_code != 200:
                 print(f"[tasks] API retornou {r.status_code} na página {page} "
                       f"(createdDateGt={date_gt}): {r.text[:300]}", flush=True)
@@ -307,7 +316,7 @@ def fetch_tasks_job():
             if not data.get("links", {}).get("next") or len(page_data) < 100:
                 break
             page += 1
-            time.sleep(0.2)
+            time.sleep(2)  # ~1 req a cada 2s, dentro da margem segura recomendada pelo suporte
         tasks_cache["data"] = all_tasks
         tasks_cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(f"Tasks: {len(all_tasks)} carregadas", flush=True)
@@ -901,7 +910,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             due = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
             payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
             if owner_id:
-                payload_reuniao["assigned_users"] = [str(owner_id)]
+                payload_reuniao["assigned_users"] = [int(owner_id)]
             r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
                                headers={**HEADERS, "Content-Type": "application/json"},
                                json=payload_reuniao, timeout=15)
@@ -1356,6 +1365,9 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
 
         # ── Envia resposta de volta ao AgendorChat ────────────────────────────
         send_agendorchat_message(conversation_id, reply)
+        # Marca o início da espera por resposta do lead — usado pelo follow-up de 1h
+        conv["luca_aguardando_desde"] = time.time()
+        conv["contact_name_cache"] = contact_name
 
         # ── Nota interna — dados completos ou conversa encerrada ─────────────
         try:
@@ -1424,8 +1436,11 @@ def agendorchat_webhook():
         conversation_meta = (body.get("conversation") or {}).get("meta") or {}
         assignee = conversation_meta.get("assignee")
         if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
-            print(f"[webhook] IGNORADO agente humano atribuído: {assignee.get('name')}", flush=True)
-            return jsonify({}), 200
+            if humano_realmente_respondeu(conversation_id):
+                print(f"[webhook] IGNORADO agente humano atribuído: {assignee.get('name')}", flush=True)
+                return jsonify({}), 200
+            print(f"[webhook] Atribuído a {assignee.get('name')} mas sem resposta escrita — "
+                  f"Luca segue normalmente conv={conversation_id}", flush=True)
 
         # ── Extrai campos do payload ──────────────────────────────────────────
         message_text    = (body.get("content") or "").strip()
@@ -1561,6 +1576,9 @@ def agendorchat_webhook():
 
         # ── Adiciona mensagem do lead ao histórico ────────────────────────────
         conv["messages"].append({"role": "user", "content": user_content})
+        # Lead respondeu — cancela o follow-up de 1h de silêncio, se estava contando
+        conv["luca_aguardando_desde"] = None
+        conv["followup_1h_enviado"] = False
 
         # ── Agrupamento de mensagens em sequência rápida ──────────────────────
         # Marca esta como a versão mais recente da conversa; a thread em
@@ -1651,10 +1669,15 @@ def agendorchat_conversation_updated():
             print(f"[conv_updated] IGNORADO — conversa resolvida", flush=True)
             return jsonify({}), 200
 
-        # Se ainda está atribuída a alguém (que não seja o bot), não faz nada
+        # Se ainda está atribuída a alguém (que não seja o bot), só recua se
+        # esse humano já escreveu de fato — não basta estar atribuído
+        # (caso Victor/Luiz Santos: automação atribui sem o humano ter agido)
         if assignee and not eh_assignee_bot(assignee):
-            print(f"[conv_updated] IGNORADO — ainda atribuída a {assignee.get('name')}", flush=True)
-            return jsonify({}), 200
+            if humano_realmente_respondeu(conversation_id):
+                print(f"[conv_updated] IGNORADO — ainda atribuída a {assignee.get('name')}", flush=True)
+                return jsonify({}), 200
+            print(f"[conv_updated] Atribuída a {assignee.get('name')} mas sem resposta escrita — "
+                  f"seguindo verificação normal conv={conversation_id}", flush=True)
 
         # ── Desatribuída e aberta: verifica se há mensagem do lead sem resposta ─
         # Cenário: humano se atribui, conclui/abandona, conversa é desatribuída
@@ -1923,6 +1946,32 @@ def conversa_do_telefone(phone):
         return None
 
 
+def humano_realmente_respondeu(conversation_id: int) -> bool:
+    """True se, depois da última mensagem do lead, existe uma mensagem de
+    saída escrita por um usuário humano de verdade (sender.type == 'user'),
+    não pelo Bot/automação. Usado pra distinguir 'atribuído mas nunca
+    escreveu' (ex: automação nativa atribuindo a um humano no instante da
+    criação da conversa, sem ele ter agido — caso Victor/Luiz Santos) de
+    'humano realmente assumiu e está atendendo'."""
+    try:
+        msgs = mensagens_da_conversa(conversation_id)
+        dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")]
+        ultimo_incoming_idx = None
+        for i, m in enumerate(dialogo):
+            if m.get("message_type") == 0:
+                ultimo_incoming_idx = i
+        apos = dialogo[ultimo_incoming_idx + 1:] if ultimo_incoming_idx is not None else dialogo
+        for m in apos:
+            if m.get("message_type") == 1:
+                sender = m.get("sender") or {}
+                if sender.get("type") == "user":
+                    return True
+        return False
+    except Exception as e:
+        print(f"[handoff] Erro ao checar se humano respondeu conv={conversation_id}: {e}", flush=True)
+        return True  # fail-safe: em erro, assume que respondeu (nunca atropela atendimento humano)
+
+
 def mensagens_da_conversa(conversation_id):
     """Mensagens da conversa ordenadas por id (inclui notas privadas)."""
     try:
@@ -2151,6 +2200,55 @@ def varredura_lembretes_safe():
         print(f"[lembrete] Erro geral na varredura: {e}", flush=True)
 
 
+def verificar_followup_1h_silencio():
+    """A cada 15 min, verifica conversas em que o Luca respondeu por último e
+    o lead ficou 1h+ sem responder. Manda uma mensagem única puxando o lead
+    de volta. Não envia se um humano estiver atribuído à conversa, ou se a
+    conversa já foi resolvida. Baseado em memória (conversation_histories) —
+    reseta se o processo reiniciar nesse meio-tempo."""
+    agora = time.time()
+    for conv_key, conv in list(conversation_histories.items()):
+        aguardando_desde = conv.get("luca_aguardando_desde")
+        if not aguardando_desde or conv.get("followup_1h_enviado"):
+            continue
+        elapsed = agora - aguardando_desde
+        if elapsed < 3600:
+            continue
+        try:
+            conversation_id = int(conv_key)
+        except (TypeError, ValueError):
+            continue
+
+        detalhe = get_conversation_details(conversation_id) or {}
+        meta = detalhe.get("meta") or {}
+        status = detalhe.get("status")
+        assignee = meta.get("assignee")
+        if status == "resolved":
+            continue
+        if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
+            print(f"[followup1h] Pulado — humano atribuído conv={conversation_id}", flush=True)
+            continue
+
+        nome = (conv.get("contact_name_cache") or conv.get("lead_data", {}).get("nome") or "").strip()
+        primeiro_nome = nome.split(" ")[0] if nome else ""
+        texto = (f"{primeiro_nome}, acho que peguei você num momento ruim. "
+                 f"Qual o melhor horário pra gente conversar?") if primeiro_nome else                 ("Acho que peguei você num momento ruim. Qual o melhor horário pra gente conversar?")
+
+        try:
+            send_agendorchat_message(conversation_id, texto)
+            conv["followup_1h_enviado"] = True
+            print(f"[followup1h] Enviado conv={conversation_id} nome={primeiro_nome!r}", flush=True)
+        except Exception as e:
+            print(f"[followup1h] Erro ao enviar conv={conversation_id}: {e}", flush=True)
+
+
+def verificar_followup_1h_silencio_safe():
+    try:
+        verificar_followup_1h_silencio()
+    except Exception as e:
+        print(f"[followup1h] Erro geral na varredura: {e}", flush=True)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SCHEDULER + MAIN
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2159,6 +2257,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
 scheduler.add_job(fetch_tasks_job, "interval", hours=2, id="tasks_recorrente")
 scheduler.add_job(varredura_lembretes_safe, "interval", minutes=15, id="lembretes_reuniao")
+scheduler.add_job(verificar_followup_1h_silencio_safe, "interval", minutes=15, id="followup_1h_silencio")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.start()
 
