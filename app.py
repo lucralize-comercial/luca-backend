@@ -885,10 +885,12 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                 dt_local = datetime(prox.year, prox.month, prox.day, 9, 0)
                 texto_reuniao = ("[Luca] Reunião com especialista — HORÁRIO A CONFIRMAR com o lead. "
                                  f"Preferência informada: {preferencia}")
-            # Agendor guarda dueDate em UTC com segundos/milissegundos (ex: 2026-07-23T18:00:00.000Z
-            # para 15h de Brasília) — converte o horário local (Brasília, UTC-3) antes de enviar.
-            dt_utc = dt_local + timedelta(hours=3)
-            due = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            # IMPORTANTE: a API do Agendor espera o horário LOCAL de Brasília
+            # SEM indicação de timezone (nem "Z", nem offset) — ela mesma faz a
+            # conversão pra UTC internamente (+3h). Mandar já convertido (com "Z"
+            # ou offset) faz a API somar +3h de novo, duplicando o deslocamento
+            # e atrasando a reunião em 3h. Confirmado por teste direto na API.
+            due = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
             payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
             if owner_id:
                 payload_reuniao["assigned_users"] = [str(owner_id)]
