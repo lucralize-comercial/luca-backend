@@ -2049,7 +2049,7 @@ def varredura_lembretes():
                       f"parseado={due.isoformat()} delta={int(delta/60)}min "
                       f"campos_data={ {k: v for k, v in t.items() if 'due' in k.lower() or 'date' in k.lower()} }",
                       flush=True)
-            if not (72000 <= delta <= 86400 or 900 <= delta <= 3600):
+            if not (77400 <= delta <= 86400 or 900 <= delta <= 3600):
                 continue
             na_janela += 1
             print(f"[lembrete] candidata: task={t.get('id')} due={t.get('dueDate')} "
@@ -2057,7 +2057,7 @@ def varredura_lembretes():
                   f"deal={(t.get('deal') or {}).get('id')}", flush=True)
             if not negocio_permite_lembrete(t):
                 continue
-            if 72000 <= delta <= 86400:          # 20h a 24h antes
+            if 77400 <= delta <= 86400:          # 21h30 a 24h antes (2h30 de margem)
                 processar_lembrete(t, "24h", due)
             elif 900 <= delta <= 3600:            # 15 a 60 min antes
                 criada = _parse_dt(t.get("createdAt"))
