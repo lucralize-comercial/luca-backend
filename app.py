@@ -49,7 +49,7 @@ A Lucralize tem duas unidades:
 
 1. LUCRALIZE TECH — contabilidade exclusiva para desenvolvedores, freelancers tech, startups e agências. 100% remoto. Diferenciais: abertura/migração de empresa com honorários gratuitos — a Lucralize não cobra pelo serviço (CNPJ em até 3 dias), endereço fiscal em BH incluso, portal de notas fiscais e invoices, atendimento via WhatsApp, regime tributário otimizado para devs, suporte a operações internacionais e isenção na exportação.
 
-Planos (nunca informe valores): Essencial (até 15k/mês), Exclusivo (até 35k/mês), Plus (até 100k/mês).
+Planos: Essencial (até 15k/mês, a partir de R$147/mês), Exclusivo (até 35k/mês), Plus (até 100k/mês). Pode informar o valor inicial "a partir de R$147/mês" como âncora quando o lead perguntar sobre preço — mas NUNCA informe os valores exatos dos planos Exclusivo e Plus, nem o valor final que o lead pagaria (isso varia por perfil e o especialista detalha na reunião).
 
 2. LUCRALIZE CONTABILIDADE — para Comércio, Serviços, Indústria e Locação. 450 clientes ativos, R$1,6mi em redução de impostos em 2025, 15 contadores, atendimento por setor.
 
@@ -104,7 +104,7 @@ NUNCA diga que vai verificar a agenda ou que o consultor liga agora. Apenas conf
 RESISTÊNCIAS COMUNS:
 As respostas abaixo mostram a INTENÇÃO e o CONTEÚDO esperados para cada objeção — mantenha a mesma intenção e conteúdo, mas adapte a linguagem ao contexto da conversa. Evite repetir exatamente o mesmo texto para todos os leads.
 - "Quero falar com um atendente": deixe claro que o consultor especializado é exatamente quem vai atender, e conduza para o agendamento dessa conversa.
-- "Quanto custa?": explique que o valor depende do perfil do lead, que o especialista mostra isso na conversa junto com o que faz mais sentido pra ele, e emende com o convite pra marcar.
+- "Quanto custa?": informe que os planos começam a partir de R$147/mês, mas que o valor final depende do perfil e faturamento do lead — o especialista mostra na conversa qual plano e quais vantagens fazem mais sentido pra ele. Emende com o convite pra marcar.
 - "Me manda mais informações": ofereça o básico ali no chat, mas reforce que o que realmente faz diferença é a conversa com o especialista, que adapta tudo ao caso do lead, e convide para os 20 minutos.
 - "Vou pensar": acolha sem pressão, mas já proponha reservar um horário tentativo, deixando claro que pode remarcar se não der.
 - Lead em momento incerto (aguardando contrato, decisão, etc.): não force o agendamento. Use: "O que eu sugiro: vamos te deixar aqui em nosso acompanhamento. Assim que você tiver o sinal verde, é só me avisar que a gente resolve rápido." NUNCA diga "lista de espera". Após esse encerramento, NÃO faça mais nenhuma pergunta. Deixe a conversa terminar naturalmente.
@@ -121,7 +121,7 @@ SE PERGUNTAREM SE VOCÊ É IA OU ROBÔ:
 REGRAS INEGOCIÁVEIS:
 - NUNCA escreva "[nome]" ou texto entre colchetes. Use o nome real ou não use
 - NUNCA use e-mail como nome. Se não souber o nome, pergunte
-- NUNCA informe preços ou valores
+- NUNCA informe preços ou valores exatos — EXCEÇÃO: pode informar "a partir de R$147/mês" como valor inicial de referência quando o lead perguntar sobre preço, mesmo fora do fluxo de agendamento. Sempre complemente reforçando que o valor final depende do perfil e que o especialista detalha isso na reunião.
 - NUNCA invente informações ou prometa coisas que não pode cumprir (verificar agenda, ligar agora, encaixar hoje)
 - NUNCA sugira fins de semana. Apenas dias úteis seg a sex
 - NUNCA deixe a conversa morrer. Sempre termine com pergunta ou próximo passo
@@ -1079,27 +1079,53 @@ def fetch_conversation_history(conversation_id: int) -> list:
 
 
 def build_lead_note(conv_data: dict) -> str:
-    """Monta o texto da nota interna com o resumo do lead."""
-    nome       = conv_data.get("nome", "Não informado")
-    segmento   = conv_data.get("segmento", "Não identificado")
-    necessidade = conv_data.get("necessidade", "Não informada")
-    telefone   = conv_data.get("telefone", "Não informado")
-    email      = conv_data.get("email", "Não informado")
-    preferencia = conv_data.get("preferencia", "")
+    """Monta o texto da nota interna com o resumo do lead, em dois blocos:
+    Dados do Lead (operacional) e Inteligência Comercial (contexto de venda).
+    Campos não informados/não inferíveis aparecem como "Não informado" —
+    nunca são deduzidos por suposição."""
+    g = lambda campo, default="Não informado": conv_data.get(campo) or default
+
+    nome       = g("nome")
+    segmento   = g("segmento", "Não identificado")
+    empresa    = g("empresa_situacao")
+    faturamento = g("faturamento_aproximado")
+    contador   = g("contador_atual")
+    telefone   = g("telefone")
+    email      = g("email")
+    agendamento = g("preferencia", "Não agendado")
+
+    objetivo   = g("objetivo")
+    motivo     = g("necessidade", "Não informado")
+    duvida     = g("duvida_principal")
+    dor        = g("dor_identificada")
+    urgencia   = g("urgencia")
+    proxima_acao = g("proxima_acao_consultor")
+    resumo_conversa = g("resumo_conversa")
+
     status     = conv_data.get("status", "Em atendimento")
 
     lines = [
-        "📋 Resumo do Lead",
+        "📋 DADOS DO LEAD",
         f"Nome: {nome}",
         f"Segmento: {segmento}",
-        f"Necessidade: {necessidade}",
+        f"Empresa: {empresa}",
+        f"Faturamento aproximado: {faturamento}",
+        f"Contador atual: {contador}",
         f"Telefone: {telefone}",
         f"E-mail: {email}",
+        f"Agendamento: {agendamento}",
+        "",
+        "🧠 INTELIGÊNCIA COMERCIAL",
+        f"Objetivo: {objetivo}",
+        f"Motivo do contato: {motivo}",
+        f"Principal dúvida: {duvida}",
+        f"Dor identificada: {dor}",
+        f"Urgência: {urgencia}",
+        f"Próxima ação esperada: {proxima_acao}",
+        f"Resumo da conversa: {resumo_conversa}",
     ]
-    if preferencia:
-        lines.append(f"Preferência: {preferencia}")
     note = "\n".join(lines)
-    note += f"Status: {status}"
+    note += f"\n\nStatus: {status}"
     return note
 
 
@@ -1119,23 +1145,47 @@ Retorne APENAS o JSON, sem texto adicional.
 Conversa:
 {history_text}
 
-Retorne este JSON (deixe em branco se não informado):
+Retorne este JSON (deixe em branco "" se não informado OU não puder ser inferido com segurança —
+NUNCA invente, deduza ou chute um valor plausível; vazio é sempre melhor que um palpite):
 {{
   "nome": "",
   "segmento": "",
-  "necessidade": "",
+  "empresa_situacao": "",
+  "faturamento_aproximado": "",
+  "contador_atual": "",
   "email": "",
   "preferencia": "",
+  "objetivo": "",
+  "necessidade": "",
+  "duvida_principal": "",
+  "dor_identificada": "",
+  "urgencia": "",
+  "proxima_acao_consultor": "",
+  "resumo_conversa": "",
   "status": ""
 }}
+
+Campos de DADOS DO LEAD (extração direta, factual):
+"empresa_situacao" = se o lead já tem CNPJ aberto ou vai abrir (ex: "Já possui CNPJ", "Vai abrir novo CNPJ", "Segundo CNPJ").
+"faturamento_aproximado" = valor ou faixa que o lead mencionou (ex: "~R$8mil/mês"). Só se ele disse um número, nunca estime.
+"contador_atual" = "Sim" ou "Não" se o lead mencionou ter contador atualmente; inclua o motivo de troca só se ele disse explicitamente (ex: "Sim, mas contador demora pra responder").
+
+Campos de INTELIGÊNCIA COMERCIAL (exigem mais cuidado — só preencha com evidência clara e literal na conversa):
+"objetivo" = o RESULTADO que o lead espera alcançar (ex: "Abrir um CNPJ", "Trocar de contabilidade", "Reduzir carga tributária", "Entender melhor enquadramento").
+"necessidade" = o MOTIVO/gatilho que levou o lead a procurar a Lucralize agora (ex: "Cliente passou a exigir nota fiscal", "Contador demora pra responder"). Diferente de "objetivo": motivo é a causa, objetivo é o resultado desejado.
+"duvida_principal" = a dúvida ou preocupação específica que o lead levantou (ex: "quanto vai pagar de imposto").
+"dor_identificada" = só preencha se o lead expressou uma insatisfação ou problema de forma EXPLÍCITA (ex: lead disse "meu contador nunca responde"). NUNCA infira dor a partir do tom geral da conversa — se não houver uma frase clara indicando isso, deixe em branco.
+"urgencia" = "Alta", "Média" ou "Baixa" — só preencha se houver sinal EXPLÍCITO de prazo/pressa (ex: lead disse "preciso disso essa semana" = Alta). Sem sinal claro de tempo, deixe em branco — não deduza urgência pelo tom.
+"proxima_acao_consultor" = uma sugestão curta e concreta do que o consultor deveria fazer na reunião (ex: "Simular tributação com faturamento de 8k/mês", "Explicar processo de migração"), baseada só no que já foi discutido — não invente uma ação genérica se não houver base clara na conversa.
+"resumo_conversa" = 1 a 2 frases resumindo o essencial da conversa até agora, em tom neutro e factual.
 
 Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-mail" | "Preferência informada: [dia] às [horário]" | "Agendamento confirmado"
 """
     try:
         reply = call_claude(
             [{"role": "user", "content": prompt}],
-            max_tokens=300,
-            system="Você extrai dados estruturados de conversas. Retorne apenas JSON válido."
+            max_tokens=600,
+            system="Você extrai dados estruturados de conversas. Retorne apenas JSON válido. Nunca invente ou deduza valores sem evidência clara e literal no texto — prefira deixar em branco."
         )
         # Remove possíveis backticks
         reply = reply.replace("```json", "").replace("```", "").strip()
