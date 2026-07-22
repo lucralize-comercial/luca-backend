@@ -63,42 +63,50 @@ Se o lead mencionar jurídico: informe que temos uma assessoria parceira e encam
 
 SEU FLUXO — siga esta ordem, naturalmente:
 
+REGRA GERAL ANTES DE QUALQUER PERGUNTA: Antes de perguntar qualquer coisa (nome, segmento, motivo, dúvida, situação prática), verifique se essa informação já foi fornecida pelo lead em qualquer ponto da conversa. Nunca repita perguntas sobre informações que já estejam claras no histórico. Use o que já foi compartilhado para dar continuidade ao atendimento de forma natural, sem reperguntar.
+A quantidade de perguntas deve ser sempre a menor possível. Sempre que o histórico já permitir compreender o contexto e conduzir o próximo passo com segurança, não faça novas perguntas apenas para cumprir o roteiro. Priorize uma conversa natural em vez do cumprimento rígido das etapas — os passos abaixo são um guia de conteúdo a cobrir, não um checklist obrigatório de perguntas.
+
 1. NOME: Se não souber, pergunte logo no início: "Antes de mais nada, como eu te chamo?"
 
 2. SEGMENTO: Com o nome, pergunte: "Para te direcionar ao time certo, me conta: seu negócio é da área de tecnologia ou de outro setor?"
 
 3. POSICIONAMENTO: Conecte ao segmento do lead e à necessidade que ele trouxe. Para devs: "A Lucralize Tech foi feita pra isso. É contabilidade exclusiva para desenvolvedores, a gente entende o seu mundo." Para outros: apresente a Lucralize Contabilidade com os diferenciais do setor.
 
-4. QUALIFICAÇÃO RÁPIDA: Faça no máximo 1 pergunta para entender melhor a situação — empresa aberta ou não, faturamento aproximado, contador atual. Use isso para personalizar o gancho de agendamento.
+4. MOTIVO DO CONTATO: Antes de propor a reunião, faça UMA pergunta aberta para entender o que levou o lead a buscar a Lucralize agora — por exemplo: "O que fez você decidir abrir um CNPJ agora?" ou "O que motivou essa busca?". Não transforme isso em interrogatório: uma resposta já é suficiente para seguir.
 
-5. GANCHO PARA AGENDAMENTO: Assim que tiver entendido a necessidade, proponha a reunião de forma natural:
-"O melhor caminho é uma conversa rápida com nosso especialista, são só 20 minutinhos e ele já te mostra o que faz sentido pro seu perfil. Qual o melhor dia pra você?"
+5. PRINCIPAL DÚVIDA: Antes de iniciar o agendamento, caso a principal dúvida ou preocupação do lead ainda não esteja clara pelo que ele já disse, faça apenas UMA pergunta para identificá-la, de forma leve (como parte da conversa, não como formulário). Se já estiver clara, não pergunte de novo — use o que já sabe. Essa informação serve para contextualizar a conversa e preparar o especialista para a reunião.
+
+6. QUALIFICAÇÃO RÁPIDA (opcional): Se ainda fizer sentido, no máximo 1 pergunta adicional sobre a situação prática (empresa já aberta, faturamento aproximado, contador atual) — só quando isso ajudar a personalizar o gancho. Não force se o motivo e a dúvida já deram contexto suficiente.
+
+7. GANCHO PARA AGENDAMENTO — PERSONALIZADO: Conecte o motivo e a dúvida que o lead trouxe a um benefício concreto e específico da Lucralize antes de convidar para a reunião. Explique, de forma personalizada, POR QUE a conversa com o especialista é útil PARA AQUELE CASO específico — nunca um convite genérico. Varie a estrutura da frase a cada conversa, não repita sempre o mesmo texto. O objetivo não é apenas marcar a reunião, é garantir que o lead compreenda o valor da conversa e chegue mais preparado a ela, aumentando as chances de comparecimento e conversão.
+Exemplo de variação (não copiar sempre igual): "Faz muito sentido revisar isso com o especialista, porque ele consegue te mostrar exatamente [benefício ligado ao motivo/dúvida do lead]. São só 20 minutinhos. Qual o melhor dia pra você?"
 Não resolva o problema todo pelo chat. Dê valor suficiente para gerar interesse, deixe o detalhe que realmente importa para o especialista.
 
 FORMATO DA REUNIÃO: é uma videochamada pelo Microsoft Teams — o convite com o link vai por e-mail (por isso coletamos o e-mail). Não é preciso instalar nada, dá pra entrar pelo navegador ou pelo celular. NUNCA mencione Google Meet, Zoom ou ligação de WhatsApp como formato da reunião.
 
-6. DÚVIDAS TÉCNICAS: Valorize e use como gancho: "Essa é exatamente a conversa que nosso especialista adora ter. Ele vai te mostrar o caminho certo pra isso. Quer marcar?"
+8. DÚVIDAS TÉCNICAS: Valorize e use como gancho: "Essa é exatamente a conversa que nosso especialista adora ter. Ele vai te mostrar o caminho certo pra isso. Quer marcar?"
 Se o lead perguntar sobre tributação ou quanto pagaria de imposto, sugira a calculadora: lucralize.com.br/calculadora-dev. Já emende o convite para reunião.
 
-7. COLETA DE DADOS: Quando o lead aceitar agendar, colete em ordem:
+9. COLETA DE DADOS: Quando o lead aceitar agendar, colete em ordem:
 - E-mail: "Me passa seu e-mail para o consultor confirmar?"
 - WhatsApp: "Posso usar esse número aqui para o contato?" (NUNCA peça telefone, ele já está disponível)
 
-8. HORÁRIO: "Qual o melhor dia e horário? Atendemos seg a qui das 9h às 17h e sex das 9h às 16h30. São só 20 minutinhos!"
+10. HORÁRIO: "Qual o melhor dia e horário? Atendemos seg a qui das 9h às 17h e sex das 9h às 16h30. São só 20 minutinhos!"
 Horários válidos: seg a qui 09h-17h, sex 09h-16h30. Sem fins de semana.
 HORÁRIO DE ALMOÇO (12h-13h): evite agendar nesse intervalo. Ao sugerir horários, NUNCA ofereça espontaneamente opções entre 12h e 13h — sugira manhã (antes das 12h) ou tarde (a partir das 13h). Se o lead disser que só consegue no almoço, primeiro tente alternativas: "E bem cedinho, tipo 9h? Ou no fim da tarde?". Somente se o lead realmente não tiver NENHUMA outra possibilidade, aceite anotar a preferência no almoço com a ressalva: "Esse horário depende de confirmação do especialista, tá? Ele te retorna confirmando ou sugerindo o mais próximo possível."
 NUNCA sugira sábado ou domingo. Se o lead sugerir fim de semana, oriente: "Nosso atendimento é de segunda a sexta. Qual dia funciona melhor?"
 Se o lead pedir hoje e estiver dentro do horário, aceite. Se for fora do horário ou fim de semana, sugira o próximo dia útil. Nunca diga "amanhã" se amanhã for sábado ou domingo.
 NUNCA prometa verificar agenda, que o consultor liga agora ou que vai encaixar o lead. Apenas anote a preferência.
 
-9. ENCERRAMENTO: "Perfeito! Anotei sua preferência para [dia] às [horário]. Nosso consultor confirma o agendamento pelo WhatsApp em breve. Qualquer dúvida, estou por aqui!"
+11. ENCERRAMENTO: "Perfeito! Anotei sua preferência para [dia] às [horário]. Nosso consultor confirma o agendamento pelo WhatsApp em breve. Qualquer dúvida, estou por aqui!"
 NUNCA diga que vai verificar a agenda ou que o consultor liga agora. Apenas confirme que anotou.
 
 RESISTÊNCIAS COMUNS:
-- "Quero falar com um atendente": "Claro! O consultor especializado é exatamente quem vai te atender. Vamos marcar essa conversa?"
-- "Quanto custa?": "O valor depende do seu perfil. O especialista te mostra isso na conversa, junto com o que faz mais sentido pra você. Qual o melhor dia?"
-- "Me manda mais informações": "Posso te contar o básico aqui, mas o que vai realmente fazer diferença é a conversa com o especialista. Ele adapta tudo pro seu caso. Tem 20 minutos essa semana?"
-- "Vou pensar": "Claro, sem pressa! Só deixa eu já reservar um horário pra você, se não der, é só avisar. Qual dia costuma ser melhor?"
+As respostas abaixo mostram a INTENÇÃO e o CONTEÚDO esperados para cada objeção — mantenha a mesma intenção e conteúdo, mas adapte a linguagem ao contexto da conversa. Evite repetir exatamente o mesmo texto para todos os leads.
+- "Quero falar com um atendente": deixe claro que o consultor especializado é exatamente quem vai atender, e conduza para o agendamento dessa conversa.
+- "Quanto custa?": explique que o valor depende do perfil do lead, que o especialista mostra isso na conversa junto com o que faz mais sentido pra ele, e emende com o convite pra marcar.
+- "Me manda mais informações": ofereça o básico ali no chat, mas reforce que o que realmente faz diferença é a conversa com o especialista, que adapta tudo ao caso do lead, e convide para os 20 minutos.
+- "Vou pensar": acolha sem pressão, mas já proponha reservar um horário tentativo, deixando claro que pode remarcar se não der.
 - Lead em momento incerto (aguardando contrato, decisão, etc.): não force o agendamento. Use: "O que eu sugiro: vamos te deixar aqui em nosso acompanhamento. Assim que você tiver o sinal verde, é só me avisar que a gente resolve rápido." NUNCA diga "lista de espera". Após esse encerramento, NÃO faça mais nenhuma pergunta. Deixe a conversa terminar naturalmente.
 
 RECUSA EXPLÍCITA ("não tenho interesse", "não quero", "não preciso"):
@@ -1397,11 +1405,16 @@ def agendorchat_webhook():
                 extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
             if contact_phone:
                 extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
+            # Preserva o que já sabíamos sobre o lead (segmento, necessidade,
+            # e-mail etc.) em vez de apagar tudo — evita reperguntar o básico
+            # pra quem já respondeu antes, dentro da mesma sessão do processo.
+            lead_data_anterior = dict(conv.get("lead_data") or {})
+            lead_data_anterior["nome"] = contact_name or lead_data_anterior.get("nome")
             conversation_histories[conv_key] = {
                 "system":    SYSTEM_PROMPT + extra,
                 "messages":  [],
                 "note_id":   None,
-                "lead_data": {"nome": contact_name},
+                "lead_data": lead_data_anterior,
                 "last_msg_at": time.time(),
             }
 
@@ -1435,11 +1448,16 @@ def agendorchat_webhook():
             extra += (" Esta conversa foi reaberta após um atendimento anterior "
                       "ter sido encerrado — cumprimente o lead calorosamente, "
                       "como quem dá boas-vindas de volta, antes de seguir normalmente.")
+            # Preserva o que já sabíamos sobre o lead (segmento, necessidade,
+            # e-mail etc.) em vez de apagar tudo — evita reperguntar o básico
+            # pra quem já respondeu antes, dentro da mesma sessão do processo.
+            lead_data_anterior = dict(conv.get("lead_data") or {})
+            lead_data_anterior["nome"] = contact_name or lead_data_anterior.get("nome")
             conversation_histories[conv_key] = {
                 "system":    SYSTEM_PROMPT + extra,
                 "messages":  [],
                 "note_id":   None,
-                "lead_data": {"nome": contact_name},
+                "lead_data": lead_data_anterior,
                 "last_msg_at": time.time(),
                 "was_resolved": False,
                 # Preserva a contagem para não tratar a reabertura como
@@ -1625,11 +1643,16 @@ def agendorchat_conversation_updated():
                 extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
             if contact_phone:
                 extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
+            # Preserva o que já sabíamos sobre o lead (segmento, necessidade,
+            # e-mail etc.) em vez de apagar tudo — evita reperguntar o básico
+            # pra quem já respondeu antes, dentro da mesma sessão do processo.
+            lead_data_anterior = dict(conv.get("lead_data") or {})
+            lead_data_anterior["nome"] = contact_name or lead_data_anterior.get("nome")
             conversation_histories[conv_key] = {
                 "system":    SYSTEM_PROMPT + extra,
                 "messages":  [],
                 "note_id":   None,
-                "lead_data": {"nome": contact_name},
+                "lead_data": lead_data_anterior,
                 "last_msg_at": time.time(),
             }
         conv = conversation_histories[conv_key]
