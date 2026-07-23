@@ -1544,6 +1544,13 @@ def agendorchat_webhook():
                 "lead_data": lead_data_anterior,
                 "last_msg_at": time.time(),
                 "was_resolved": False,
+                # Preserva se a reunião já foi agendada/registrada no CRM —
+                # sem isso, o follow-up de 1h achava que ainda havia algo
+                # pendente mesmo depois de um agendamento já confirmado,
+                # só porque a conversa reabriu de novo (ex: lead tirando uma
+                # dúvida rápida depois de já ter marcado).
+                "crm_registrado": conv.get("crm_registrado", False),
+                "note_sent": conv.get("note_sent", False),
                 # Preserva a contagem para não tratar a reabertura como
                 # "primeira mensagem" (evita o delay de 90s e o refetch de
                 # histórico remoto, que desfariam o reset).
@@ -2301,6 +2308,48 @@ def varredura_lembretes_safe():
         print(f"[lembrete] Erro geral na varredura: {e}", flush=True)
 
 
+def conversa_parece_estagnada(conversation_id: int) -> bool:
+    """Usa o Claude pra ler as últimas mensagens reais da conversa e decidir
+    se ela está genuinamente parada no meio de uma negociação (vale puxar o
+    lead de volta) ou se já teve um fechamento natural (reunião confirmada,
+    despedida, lead disse que não tem interesse agora, etc — nesses casos o
+    silêncio é esperado, não deve gerar o follow-up). Mais robusto que uma
+    flag em memória: lê o conteúdo de verdade, direto da API, então não
+    depende de estado que se perde em reset/restart."""
+    try:
+        msgs = mensagens_da_conversa(conversation_id)
+        dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")
+                   and not (m.get("additional_attributes") or {}).get("automation_id")
+                   and "Em breve um de nossos consultores dará andamento" not in (m.get("content") or "")]
+        ultimas = dialogo[-8:]
+        if not ultimas:
+            return True  # sem contexto suficiente — mantém comportamento conservador (permite envio)
+
+        transcript = "\n".join(
+            f"{'Lead' if m.get('message_type') == 0 else 'Luca/Consultor'}: {m.get('content', '')}"
+            for m in ultimas
+        )
+        prompt = f"""Aqui estão as últimas mensagens de uma conversa de atendimento comercial:
+
+{transcript}
+
+A conversa está genuinamente PARADA no meio de uma negociação (o lead ficou
+sem responder algo pendente, ou sumiu no meio de um processo em aberto)?
+Ou ela já teve um FECHAMENTO NATURAL (reunião confirmada, despedida, lead
+disse que não tem interesse por ora, ou a última mensagem já é uma resposta
+completa que não pede mais nada do lead)?
+
+Responda apenas com uma palavra: PARADA ou FECHADA."""
+        resposta = call_claude(
+            [{"role": "user", "content": prompt}], max_tokens=10,
+            system="Você classifica o estado de conversas comerciais. Responda só com uma palavra: PARADA ou FECHADA."
+        )
+        return "PARADA" in resposta.upper()
+    except Exception as e:
+        print(f"[followup1h] Erro ao classificar conversa conv={conversation_id}: {e}", flush=True)
+        return True  # fail-open: em erro, mantém comportamento anterior (permite envio)
+
+
 def verificar_followup_1h_silencio():
     """A cada 15 min, verifica conversas em que o Luca respondeu por último e
     o lead ficou 1h+ sem responder. Manda uma mensagem única puxando o lead
@@ -2332,6 +2381,10 @@ def verificar_followup_1h_silencio():
             continue
         if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
             print(f"[followup1h] Pulado — humano atribuído conv={conversation_id}", flush=True)
+            continue
+
+        if not conversa_parece_estagnada(conversation_id):
+            print(f"[followup1h] Pulado — conversa parece concluída naturalmente conv={conversation_id}", flush=True)
             continue
 
         nome = (conv.get("contact_name_cache") or conv.get("lead_data", {}).get("nome") or "").strip()
