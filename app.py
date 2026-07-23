@@ -2304,14 +2304,18 @@ def varredura_lembretes_safe():
 def verificar_followup_1h_silencio():
     """A cada 15 min, verifica conversas em que o Luca respondeu por último e
     o lead ficou 1h+ sem responder. Manda uma mensagem única puxando o lead
-    de volta. Não envia se um humano estiver atribuído à conversa, ou se a
-    conversa já foi resolvida. Baseado em memória (conversation_histories) —
-    reseta se o processo reiniciar nesse meio-tempo."""
+    de volta. Não envia se um humano estiver atribuído à conversa, se a
+    conversa já foi resolvida, ou se o ciclo do CRM já foi registrado (ou
+    seja, a reunião já foi agendada com sucesso — silêncio nesse caso é
+    esperado, não é "sumiço no meio da negociação"). Baseado em memória
+    (conversation_histories) — reseta se o processo reiniciar nesse meio-tempo."""
     agora = time.time()
     for conv_key, conv in list(conversation_histories.items()):
         aguardando_desde = conv.get("luca_aguardando_desde")
         if not aguardando_desde or conv.get("followup_1h_enviado"):
             continue
+        if conv.get("crm_registrado"):
+            continue  # reunião já agendada com sucesso — silêncio é esperado
         elapsed = agora - aguardando_desde
         if elapsed < 3600:
             continue
