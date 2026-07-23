@@ -1435,6 +1435,7 @@ def agendorchat_webhook():
         # do Luca — conversas atribuídas a ele são respondidas normalmente.
         conversation_meta = (body.get("conversation") or {}).get("meta") or {}
         assignee = conversation_meta.get("assignee")
+        conversation_id = (body.get("conversation") or {}).get("id")  # precisa vir antes do check abaixo
         if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
             if humano_realmente_respondeu(conversation_id):
                 print(f"[webhook] IGNORADO agente humano atribuído: {assignee.get('name')}", flush=True)
@@ -1465,21 +1466,19 @@ def agendorchat_webhook():
         # ── Recupera ou inicializa histórico ──────────────────────────────────
         conv_key = str(conversation_id)
         if conv_key not in conversation_histories:
+            # Conversa nova de verdade nesta memória do processo — não há
+            # "conv" anterior pra preservar (diferente do reset por conversa
+            # reaberta, onde já existe um "conv" anterior com was_resolved).
             extra = ""
             if contact_name:
                 extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
             if contact_phone:
                 extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
-            # Preserva o que já sabíamos sobre o lead (segmento, necessidade,
-            # e-mail etc.) em vez de apagar tudo — evita reperguntar o básico
-            # pra quem já respondeu antes, dentro da mesma sessão do processo.
-            lead_data_anterior = dict(conv.get("lead_data") or {})
-            lead_data_anterior["nome"] = contact_name or lead_data_anterior.get("nome")
             conversation_histories[conv_key] = {
                 "system":    SYSTEM_PROMPT + extra,
                 "messages":  [],
                 "note_id":   None,
-                "lead_data": lead_data_anterior,
+                "lead_data": {"nome": contact_name},
                 "last_msg_at": time.time(),
             }
 
@@ -1711,21 +1710,19 @@ def agendorchat_conversation_updated():
         contact_identifier = contact_inbox.get("pubsub_token", "")
 
         if conv_key not in conversation_histories:
+            # Não existe entrada anterior nesta memória do processo — não há
+            # nada de "conv" pra preservar aqui (diferente do reset por
+            # conversa reaberta, onde já existe um "conv" anterior).
             extra = ""
             if contact_name:
                 extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
             if contact_phone:
                 extra += f" Telefone/WhatsApp já disponível: {contact_phone}. NUNCA peça o telefone."
-            # Preserva o que já sabíamos sobre o lead (segmento, necessidade,
-            # e-mail etc.) em vez de apagar tudo — evita reperguntar o básico
-            # pra quem já respondeu antes, dentro da mesma sessão do processo.
-            lead_data_anterior = dict(conv.get("lead_data") or {})
-            lead_data_anterior["nome"] = contact_name or lead_data_anterior.get("nome")
             conversation_histories[conv_key] = {
                 "system":    SYSTEM_PROMPT + extra,
                 "messages":  [],
                 "note_id":   None,
-                "lead_data": lead_data_anterior,
+                "lead_data": {"nome": contact_name},
                 "last_msg_at": time.time(),
             }
         conv = conversation_histories[conv_key]
