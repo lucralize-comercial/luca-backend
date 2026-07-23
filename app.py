@@ -817,6 +817,39 @@ def criar_pessoa_e_negocio(phone: str, nome: str, email: str):
     return person, deal
 
 
+def atualizar_pessoa_se_incompleta(person: dict, nome_lead: str, email_lead: str):
+    """Completa nome e/ou e-mail da pessoa no Agendor quando estiverem
+    faltando ou parecerem genéricos (ex: nome igual ao identificador do
+    WhatsApp, sem espaço, quando temos um nome completo capturado na
+    conversa; e-mail vazio). NUNCA sobrescreve um dado que já pareça
+    legítimo — evita "corrigir" algo que já estava certo."""
+    if not person or not person.get("id"):
+        return
+    contato = person.get("contact") or {}
+    nome_atual = (person.get("name") or "").strip()
+    email_atual = (contato.get("email") or "").strip()
+
+    updates = {}
+    if nome_lead and nome_lead.strip():
+        nome_lead_limpo = nome_lead.strip()
+        if (not nome_atual) or (" " not in nome_atual and " " in nome_lead_limpo):
+            updates["name"] = nome_lead_limpo
+    if email_lead and email_lead.strip() and not email_atual:
+        updates["contact"] = {"email": email_lead.strip()}
+
+    if not updates:
+        return
+
+    try:
+        r = requests.put(f"{AGENDOR_BASE}/people/{person['id']}",
+                          headers={**HEADERS, "Content-Type": "application/json"},
+                          json=updates, timeout=15)
+        print(f"[crm] Pessoa atualizada (nome/e-mail) person={person['id']} "
+              f"status={r.status_code} campos={list(updates.keys())}", flush=True)
+    except Exception as e:
+        print(f"[crm] Erro ao atualizar pessoa {person.get('id')}: {e}", flush=True)
+
+
 def registrar_no_crm(conv, conversation_id, contact_name):
     """Fecha o ciclo no Agendor quando a qualificação conclui:
     0. Se pessoa/negócio não existirem no CRM ainda, cria os dois primeiro
@@ -851,6 +884,12 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                       f"conv={conversation_id} — registro abortado", flush=True)
                 return
         deal_id = deal.get("id")
+
+        # ── Completa nome/e-mail da pessoa no Agendor, se estiverem faltando
+        # ou genéricos (ex: nome só do WhatsApp, sem e-mail) ─────────────────
+        nome_pessoa = d.get("nome") or contact_name
+        email_pessoa = d.get("email", "")
+        atualizar_pessoa_se_incompleta(person, nome_pessoa, email_pessoa)
 
         # ── 1. Nota: resumo do lead (idempotente) ────────────────────────────
         nota_marcador = f"[luca:nota:{conversation_id}]"
