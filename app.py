@@ -1018,10 +1018,14 @@ def get_last_message_info(conversation_id: int) -> dict:
         # A API não garante ordem cronológica — ordena por id (crescente)
         messages = sorted(messages, key=lambda m: m.get("id") or 0)
         # Considera apenas o diálogo real: ignora mensagens de atividade do
-        # sistema ("fulano atribuiu...", message_type=2) e notas privadas,
-        # que mascaravam a última mensagem verdadeira do lead
+        # sistema ("fulano atribuiu...", message_type=2), notas privadas, e
+        # templates disparados por automação nativa (additional_attributes.
+        # automation_id) — como o "boas_vindas_primeiro_contato", que reenvia
+        # sozinho e mascarava a última mensagem verdadeira do lead como "já
+        # respondida" sem ninguém (humano ou Luca) ter feito nada de fato.
         dialogo = [m for m in messages
-                   if m.get("message_type") in (0, 1, 3) and not m.get("private")]
+                   if m.get("message_type") in (0, 1, 3) and not m.get("private")
+                   and not (m.get("additional_attributes") or {}).get("automation_id")]
         if not dialogo:
             return {}
         last = dialogo[-1]
@@ -1952,7 +1956,8 @@ def humano_realmente_respondeu(conversation_id: int) -> bool:
     'humano realmente assumiu e está atendendo'."""
     try:
         msgs = mensagens_da_conversa(conversation_id)
-        dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")]
+        dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")
+                   and not (m.get("additional_attributes") or {}).get("automation_id")]
         ultimo_incoming_idx = None
         for i, m in enumerate(dialogo):
             if m.get("message_type") == 0:
@@ -2042,7 +2047,11 @@ def processar_lembrete(task, tipo, due):
     conv_id = conv.get("id")
 
     msgs = mensagens_da_conversa(conv_id)
-    marcador = f"[lembrete:{task_id}:{tipo}]"
+    # Inclui o horário da reunião na marca — se a reunião for reagendada
+    # (mesma task, dueDate diferente), a marca muda e não colide com um
+    # aviso antigo de um horário diferente (bug real encontrado: reagendar
+    # depois de um teste em modo observação bloqueava o envio de verdade).
+    marcador = f"[lembrete:{task_id}:{tipo}:{due.strftime('%Y%m%dT%H%M')}]"
     if marcador_existe(msgs, marcador):
         return  # já tratado
 
