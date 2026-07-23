@@ -49,7 +49,7 @@ A Lucralize tem duas unidades:
 
 1. LUCRALIZE TECH — contabilidade exclusiva para desenvolvedores, freelancers tech, startups e agências. 100% remoto. Diferenciais: abertura/migração de empresa com honorários gratuitos — a Lucralize não cobra pelo serviço (CNPJ em até 3 dias), endereço fiscal em BH incluso, portal de notas fiscais e invoices, atendimento via WhatsApp, regime tributário otimizado para devs, suporte a operações internacionais e isenção na exportação.
 
-Planos: Essencial (até 15k/mês, a partir de R$147/mês), Exclusivo (até 35k/mês), Plus (até 100k/mês). Pode informar o valor inicial "a partir de R$147/mês" como âncora quando o lead perguntar sobre preço — mas NUNCA informe os valores exatos dos planos Exclusivo e Plus, nem o valor final que o lead pagaria (isso varia por perfil e o especialista detalha na reunião).
+Planos: Essencial (até 15k/mês, a partir de R$147/mês), Exclusivo (até 35k/mês), Plus (até 100k/mês). Pode informar o valor inicial "a partir de R$147/mês" como âncora SOMENTE quando o lead perguntar diretamente sobre preço — não se antecipe oferecendo esse valor por conta própria ao conectar benefícios ou responder outras dúvidas. NUNCA informe os valores exatos dos planos Exclusivo e Plus, nem o valor final que o lead pagaria (isso varia por perfil e o especialista detalha na reunião).
 
 2. LUCRALIZE CONTABILIDADE — para Comércio, Serviços, Indústria e Locação. 450 clientes ativos, R$1,6mi em redução de impostos em 2025, 15 contadores, atendimento por setor.
 
@@ -121,7 +121,7 @@ SE PERGUNTAREM SE VOCÊ É IA OU ROBÔ:
 REGRAS INEGOCIÁVEIS:
 - NUNCA escreva "[nome]" ou texto entre colchetes. Use o nome real ou não use
 - NUNCA use e-mail como nome. Se não souber o nome, pergunte
-- NUNCA informe preços ou valores exatos — EXCEÇÃO: pode informar "a partir de R$147/mês" como valor inicial de referência quando o lead perguntar sobre preço, mesmo fora do fluxo de agendamento. Sempre complemente reforçando que o valor final depende do perfil e que o especialista detalha isso na reunião.
+- NUNCA informe preços ou valores exatos — EXCEÇÃO: pode informar "a partir de R$147/mês" como valor inicial de referência SOMENTE quando o lead perguntar DIRETAMENTE sobre preço/valor/mensalidade (ex: "quanto custa?", "qual o valor?"). Mencionar "mensalidade" ou "custo" como parte de uma dúvida geral (ex: "minha dúvida é sobre impostos e mensalidade") NÃO conta como pergunta direta — não se antecipe oferecendo o valor nesse caso, aprofunde a dúvida ou já encaminhe pro agendamento sem citar preço. Sempre complemente reforçando que o valor final depende do perfil e que o especialista detalha isso na reunião.
 - NUNCA invente informações ou prometa coisas que não pode cumprir (verificar agenda, ligar agora, encaixar hoje)
 - NUNCA sugira fins de semana. Apenas dias úteis seg a sex
 - NUNCA deixe a conversa morrer. Sempre termine com pergunta ou próximo passo
@@ -699,6 +699,7 @@ def buscar_pessoa_e_negocio(phone):
     deals_comercial = [
         d for d in deals
         if ((d.get("dealStage") or {}).get("funnel") or {}).get("id") == FUNIL_COMERCIAL_ID
+        and not d.get("wonAt") and not d.get("lostAt")  # ignora negócios já ganhos/perdidos
     ]
     if not deals_comercial:
         return person, None
@@ -1553,6 +1554,8 @@ def agendorchat_webhook():
                 "skip_remote_fetch": True,
             }
             conv = conversation_histories[conv_key]
+            if contact_phone:
+                conv["phone"] = contact_phone
 
         # ── Se memória está vazia, busca histórico real do AgendorChat ────────
         if not conv["messages"] and not conv.get("skip_remote_fetch"):
@@ -2231,6 +2234,66 @@ def varredura_lembretes():
           f"{reunioes_futuras} reuniões futuras, {na_janela} na janela de disparo", flush=True)
 
 
+def mover_novos_leads_sem_conversa():
+    """Move negócios parados em 'Novo Lead' (Funil Comercial) para
+    '1º Contato (D0)' quando NÃO existe conversa aberta pro telefone da
+    pessoa vinculada.
+
+    Contexto: a automação nativa de boas-vindas foi realocada do gatilho
+    'chegar em Novo Lead' para 'chegar em 1º Contato (D0)', porque leads
+    vindos de formulários/LPs/calculadora nascem em 'Novo Lead' e, se já
+    houver uma conversa em andamento com o Luca (o mesmo telefone convertendo
+    de novo em outra página, por exemplo), a automação disparava a saudação
+    de novo no meio do atendimento. Agora: negócio sem conversa aberta ->
+    avança pra '1º Contato (D0)' -> aciona a automação de boas-vindas
+    normalmente (fluxo de lead genuinamente novo). Negócio com conversa
+    aberta -> fica parado em 'Novo Lead' -> nunca aciona a automação."""
+    FUNIL_COMERCIAL_ID = 696449
+    ETAPA_NOVO_LEAD_ID = 2835663
+    SEQUENCIA_1_CONTATO = 2  # posição de "1º Contato (D0)" no Funil Comercial
+
+    deals = cache.get("deals") or []
+    candidatos = [
+        d for d in deals
+        if ((d.get("dealStage") or {}).get("funnel") or {}).get("id") == FUNIL_COMERCIAL_ID
+        and (d.get("dealStage") or {}).get("id") == ETAPA_NOVO_LEAD_ID
+    ]
+
+    movidos = 0
+    for d in candidatos:
+        deal_id = d.get("id")
+        person = d.get("person") or {}
+        person_id = person.get("id")
+        if not person_id:
+            continue
+        try:
+            phone = telefone_da_pessoa(person_id)
+            if not phone:
+                continue
+            conv = conversa_do_telefone(phone)
+            if conv and conv.get("status") == "open":
+                continue  # tem conversa aberta — deixa em Novo Lead de propósito
+            r = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}/stage",
+                              headers={**HEADERS, "Content-Type": "application/json"},
+                              json={"dealStage": SEQUENCIA_1_CONTATO}, timeout=15)
+            print(f"[novo_lead] Movido pra 1º Contato (D0) deal={deal_id} status={r.status_code}", flush=True)
+            movidos += 1
+        except Exception as e:
+            print(f"[novo_lead] Erro ao processar deal={deal_id}: {e}", flush=True)
+
+    print(f"[novo_lead] varredura concluída: {len(candidatos)} em 'Novo Lead', {movidos} movidos", flush=True)
+
+
+def mover_novos_leads_sem_conversa_safe():
+    if not _flag("MOVER_NOVOS_LEADS_ATIVO", "false"):
+        print("[novo_lead] varredura pulada — MOVER_NOVOS_LEADS_ATIVO desligado", flush=True)
+        return
+    try:
+        mover_novos_leads_sem_conversa()
+    except Exception as e:
+        print(f"[novo_lead] Erro geral na varredura: {e}", flush=True)
+
+
 def varredura_lembretes_safe():
     try:
         varredura_lembretes()
@@ -2295,6 +2358,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
 scheduler.add_job(fetch_tasks_job, "interval", hours=2, id="tasks_recorrente")
 scheduler.add_job(varredura_lembretes_safe, "interval", minutes=15, id="lembretes_reuniao")
+scheduler.add_job(mover_novos_leads_sem_conversa_safe, "interval", minutes=15, id="mover_novos_leads")
 scheduler.add_job(verificar_followup_1h_silencio_safe, "interval", minutes=15, id="followup_1h_silencio")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.start()
