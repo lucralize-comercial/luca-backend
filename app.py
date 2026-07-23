@@ -1018,14 +1018,17 @@ def get_last_message_info(conversation_id: int) -> dict:
         # A API não garante ordem cronológica — ordena por id (crescente)
         messages = sorted(messages, key=lambda m: m.get("id") or 0)
         # Considera apenas o diálogo real: ignora mensagens de atividade do
-        # sistema ("fulano atribuiu...", message_type=2), notas privadas, e
+        # sistema ("fulano atribuiu...", message_type=2), notas privadas,
         # templates disparados por automação nativa (additional_attributes.
-        # automation_id) — como o "boas_vindas_primeiro_contato", que reenvia
-        # sozinho e mascarava a última mensagem verdadeira do lead como "já
-        # respondida" sem ninguém (humano ou Luca) ter feito nada de fato.
+        # automation_id — ex: "boas_vindas_primeiro_contato"), e a saudação
+        # automática de canal (que NÃO tem automation_id, additional_attributes
+        # vem vazio — identificada aqui pelo texto fixo). Qualquer uma dessas
+        # mascarava a última mensagem verdadeira do lead como "já respondida"
+        # sem ninguém (humano ou Luca) ter feito nada de fato.
         dialogo = [m for m in messages
                    if m.get("message_type") in (0, 1, 3) and not m.get("private")
-                   and not (m.get("additional_attributes") or {}).get("automation_id")]
+                   and not (m.get("additional_attributes") or {}).get("automation_id")
+                   and "Em breve um de nossos consultores dará andamento" not in (m.get("content") or "")]
         if not dialogo:
             return {}
         last = dialogo[-1]
@@ -1957,7 +1960,8 @@ def humano_realmente_respondeu(conversation_id: int) -> bool:
     try:
         msgs = mensagens_da_conversa(conversation_id)
         dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")
-                   and not (m.get("additional_attributes") or {}).get("automation_id")]
+                   and not (m.get("additional_attributes") or {}).get("automation_id")
+                   and "Em breve um de nossos consultores dará andamento" not in (m.get("content") or "")]
         ultimo_incoming_idx = None
         for i, m in enumerate(dialogo):
             if m.get("message_type") == 0:
