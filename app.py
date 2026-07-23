@@ -851,40 +851,52 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                 return
         deal_id = deal.get("id")
 
-        # ── 1. Nota: resumo do lead ──────────────────────────────────────────
-        nota = (
-            "📋 Atendimento via Luca (WhatsApp)\n"
-            f"Nome: {d.get('nome') or contact_name}\n"
-            f"Segmento: {d.get('segmento', '')}\n"
-            f"Necessidade: {d.get('necessidade', '')}\n"
-            f"E-mail: {d.get('email', '')}\n"
-            f"Preferência de reunião: {d.get('preferencia', '')}\n"
-            f"Status: {d.get('status', '')}"
-        )
-        r1 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
-                           headers={**HEADERS, "Content-Type": "application/json"},
-                           json={"text": nota}, timeout=15)
-        print(f"[crm] Nota resumo deal={deal_id} status={r1.status_code}", flush=True)
-
-        # ── 2. Registro WhatsApp: transcrição compacta ───────────────────────
-        linhas = []
-        for m in conv.get("messages", []):
-            papel = "Lead" if m["role"] == "user" else "Luca"
-            texto = m["content"]
-            # Remove instruções internas injetadas entre colchetes no início
-            if texto.startswith("["):
-                fim = texto.find("]\n\n")
-                if fim != -1:
-                    texto = texto[fim + 3:]
-            linhas.append(f"{papel}: {texto}")
-        transcricao = "💬 Conversa via Luca (WhatsApp):\n\n" + "\n\n".join(linhas)
-        blocos = [transcricao[i:i + 9000] for i in range(0, len(transcricao), 9000)]
-        for idx, bloco in enumerate(blocos):
-            sufixo = f" (parte {idx+1}/{len(blocos)})" if len(blocos) > 1 else ""
-            r2 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+        # ── 1. Nota: resumo do lead (idempotente) ────────────────────────────
+        nota_marcador = f"[luca:nota:{conversation_id}]"
+        if deal_tem_marca(deal_id, nota_marcador):
+            print(f"[crm] Nota já existe (idempotência) deal={deal_id} conv={conversation_id}", flush=True)
+        else:
+            nota = (
+                "📋 Atendimento via Luca (WhatsApp)\n"
+                f"Nome: {d.get('nome') or contact_name}\n"
+                f"Segmento: {d.get('segmento', '')}\n"
+                f"Necessidade: {d.get('necessidade', '')}\n"
+                f"E-mail: {d.get('email', '')}\n"
+                f"Preferência de reunião: {d.get('preferencia', '')}\n"
+                f"Status: {d.get('status', '')}\n"
+                f"{nota_marcador}"
+            )
+            r1 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
                                headers={**HEADERS, "Content-Type": "application/json"},
-                               json={"text": bloco + sufixo, "type": "whatsapp"}, timeout=15)
-            print(f"[crm] Transcrição{sufixo} deal={deal_id} status={r2.status_code}", flush=True)
+                               json={"text": nota}, timeout=15)
+            print(f"[crm] Nota resumo deal={deal_id} status={r1.status_code}", flush=True)
+
+        # ── 2. Registro WhatsApp: transcrição compacta (idempotente) ─────────
+        transcricao_marcador = f"[luca:transcricao:{conversation_id}]"
+        if deal_tem_marca(deal_id, transcricao_marcador):
+            print(f"[crm] Transcrição já existe (idempotência) deal={deal_id} conv={conversation_id}", flush=True)
+        else:
+            linhas = []
+            for m in conv.get("messages", []):
+                papel = "Lead" if m["role"] == "user" else "Luca"
+                texto = m["content"]
+                # Remove instruções internas injetadas entre colchetes no início
+                if texto.startswith("["):
+                    fim = texto.find("]\n\n")
+                    if fim != -1:
+                        texto = texto[fim + 3:]
+                linhas.append(f"{papel}: {texto}")
+            transcricao = "💬 Conversa via Luca (WhatsApp):\n\n" + "\n\n".join(linhas)
+            blocos = [transcricao[i:i + 9000] for i in range(0, len(transcricao), 9000)]
+            for idx, bloco in enumerate(blocos):
+                sufixo = f" (parte {idx+1}/{len(blocos)})" if len(blocos) > 1 else ""
+                texto_bloco = bloco + sufixo
+                if idx == 0:
+                    texto_bloco += f"\n{transcricao_marcador}"
+                r2 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                                   headers={**HEADERS, "Content-Type": "application/json"},
+                                   json={"text": texto_bloco, "type": "whatsapp"}, timeout=15)
+                print(f"[crm] Transcrição{sufixo} deal={deal_id} status={r2.status_code}", flush=True)
 
         # ── 3. Reunião [Luca] — somente se há preferência de horário ─────────
         preferencia = (d.get("preferencia") or "").strip()
@@ -1948,6 +1960,22 @@ def conversa_do_telefone(phone):
     except Exception as e:
         print(f"[lembrete] Erro ao localizar conversa de {phone}: {e}", flush=True)
         return None
+
+
+def deal_tem_marca(deal_id, marcador: str) -> bool:
+    """Verifica se já existe uma tarefa no negócio com essa marca — usado pra
+    tornar a nota e a transcrição idempotentes de verdade (sobrevive a
+    restart do container e a dois containers rodando em paralelo durante um
+    deploy, diferente das flags note_sent/crm_registrado, que são só RAM)."""
+    try:
+        date_gt = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/tasks", headers=HEADERS,
+                          params={"updatedDateGt": date_gt, "per_page": 100}, timeout=15)
+        tasks = r.json().get("data", [])
+        return any(marcador in (t.get("text") or "") for t in tasks)
+    except Exception as e:
+        print(f"[crm] Erro ao checar marca no negócio {deal_id}: {e}", flush=True)
+        return False  # fail-open: em erro na checagem, permite criar (não trava o fluxo)
 
 
 def humano_realmente_respondeu(conversation_id: int) -> bool:
