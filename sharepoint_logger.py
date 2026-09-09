@@ -79,8 +79,12 @@ def _normalizar(msg: str) -> str:
     return " ".join(out.split())[:500]
 
 
-def _fingerprint(etapa: str, tipo_erro: str, mensagem: str) -> str:
-    base = f"{etapa}|{tipo_erro}|{_normalizar(mensagem)}"
+def _fingerprint(etapa: str, tipo_erro: str, mensagem: str, lead_id: str = "") -> str:
+    # lead_id entra sem normalização de propósito: dois leads diferentes com o
+    # mesmo tipo de erro devem gerar entradas separadas na lista (senão "3
+    # leads sem telefone" vira uma única linha com Ocorrencias=3, escondendo
+    # QUAIS leads são). Sem lead_id (erro genérico, de infra), agrupa normal.
+    base = f"{etapa}|{tipo_erro}|{_normalizar(mensagem)}|{lead_id}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:32]
 
 
@@ -323,7 +327,7 @@ def log_erro(
 
         detalhe = "\n\n".join(p for p in (stack, corpo) if p)[:_PAYLOAD_MAX]
         agora = datetime.now(timezone.utc).isoformat()
-        fp = _fingerprint(etapa, tipo_erro, mensagem)
+        fp = _fingerprint(etapa, tipo_erro, mensagem, str(lead_id) if lead_id is not None else "")
 
         campos = {
             "Title": f"[{etapa}] {tipo_erro}"[:_MSG_MAX],
