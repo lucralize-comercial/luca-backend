@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
+import sharepoint_logger as splog
 from datetime import datetime, timedelta, timezone
 import requests
 import re
@@ -1757,9 +1758,19 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                     except Exception as e:
                         print(f"[crm] Erro ao criar reunião no Teams deal={deal_id}: {e} — "
                               f"seguindo sem o link automático (consultor confirma manualmente)", flush=True)
+                        splog.log_erro(
+                            etapa="agendamento", erro=e, plataforma="teams",
+                            lead_id=deal_id,
+                            extra={"Telefone": "", "ConsultorId": str(owner_id_int or "")},
+                        )
                 else:
                     print(f"[crm] Sem e-mail do lead — não foi possível criar reunião automática "
                           f"no Teams deal={deal_id} (consultor confirma manualmente)", flush=True)
+                    splog.log_falha_silenciosa(
+                        etapa="agendamento",
+                        motivo="lead confirmou preferência de horário mas não tem e-mail cadastrado",
+                        plataforma="agendor", lead_id=deal_id,
+                    )
             else:
                 prox = datetime.utcnow() - timedelta(hours=3) + timedelta(days=1)
                 while prox.weekday() >= 5:
@@ -3193,6 +3204,10 @@ def agendar():
             detail = e.response.json().get("error", {}).get("message", "")
         except Exception:
             pass
+        splog.log_erro(
+            etapa="agendamento", erro=e, plataforma="teams",
+            extra={"StatusHTTP": str(status), "Detalhe": detail},
+        )
         if status == 403:
             return jsonify({
                 "error": "Permissão Calendars.ReadWrite ainda não concedida no Azure AD.",
@@ -3202,6 +3217,7 @@ def agendar():
         return jsonify({"error": str(e), "detail": detail}), 500
 
     except Exception as e:
+        splog.log_erro(etapa="agendamento", erro=e, plataforma="teams")
         return jsonify({"error": str(e)}), 500
 
 
@@ -3826,14 +3842,27 @@ def mover_novos_leads_para_1contato():
             # motivo — telefone inválido, automação desativada, etc.).
             if not person_id:
                 print(f"[novo_lead] Pulado — sem person_id deal={deal_id}", flush=True)
+                splog.log_falha_silenciosa(
+                    etapa="primeiro_contato", motivo="deal sem person_id vinculado",
+                    plataforma="agendor", lead_id=deal_id,
+                )
                 continue
             telefone = telefone_da_pessoa(person_id)
             if not telefone:
                 print(f"[novo_lead] Pulado — sem telefone person={person_id} deal={deal_id}", flush=True)
+                splog.log_falha_silenciosa(
+                    etapa="primeiro_contato", motivo="pessoa sem telefone cadastrado",
+                    plataforma="agendor", lead_id=deal_id,
+                    extra={"PersonId": str(person_id)},
+                )
                 continue
             conv = conversa_do_telefone(telefone)
             if not conv:
                 print(f"[novo_lead] Pulado — conversa não encontrada telefone={telefone} deal={deal_id}", flush=True)
+                splog.log_falha_silenciosa(
+                    etapa="primeiro_contato", motivo="nenhuma conversa encontrada no Chatwoot para este telefone",
+                    plataforma="agendorchat", lead_id=deal_id, telefone=telefone,
+                )
                 continue
             msgs = mensagens_da_conversa(conv["id"])
             # Aceita QUALQUER mensagem enviada (não só as com automation_id
@@ -3854,6 +3883,17 @@ def mover_novos_leads_para_1contato():
             if not saudacao_enviada:
                 print(f"[novo_lead] Pulado — saudação ainda não confirmada na conversa "
                       f"deal={deal_id}", flush=True)
+                # Cada varredura roda a cada 15 min; se este deal aparecer aqui
+                # de novo em varreduras seguintes, o Ocorrencias na lista do
+                # SharePoint sobe — Ocorrencias alto é o sinal de que a
+                # automação nativa do Agendor não disparou pra este lead
+                # (1 ocorrência isolada é normal, é só o deal ainda não ter
+                # sido processado pela automação).
+                splog.log_falha_silenciosa(
+                    etapa="primeiro_contato",
+                    motivo="saudação automática do Agendor ainda não confirmada na conversa",
+                    plataforma="agendorchat", lead_id=deal_id, telefone=telefone,
+                )
                 continue
 
             # Confere a etapa FRESCA antes de mover — o cache de negócios só
