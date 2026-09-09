@@ -1,7 +1,6 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
-import sharepoint_logger as splog
 from datetime import datetime, timedelta, timezone
 import requests
 import re
@@ -1616,17 +1615,21 @@ def registrar_no_crm(conv, conversation_id, contact_name):
     0. Se pessoa/negócio não existirem no CRM ainda, cria os dois primeiro
     1. Nota com o resumo do lead
     2. Registro WhatsApp com a transcrição da conversa
-    3. Reunião [Luca] atribuída ao dono do negócio (se houver preferência)
+    3. Reunião [Luca] atribuída ao dono do negócio (se houver preferência) —
+       cria a reunião REAL no Teams quando já há data confirmada e e-mail
     4. Campo personalizado 'Reunião agendada por' = Luca
     5. Move o negócio para a etapa 'Reunião agendada' no Funil Comercial,
-       só se ainda estiver numa etapa anterior (nunca rebaixa)"""
+       só se ainda estiver numa etapa anterior (nunca rebaixa)
+
+    Retorna True se o ciclo está TOTALMENTE fechado (nota + reunião real
+    quando aplicável), False se ainda falta algo que pode ser completado
+    numa passada futura (ex: falta e-mail/horário real ainda) — usado pelo
+    chamador pra decidir se tenta de novo mais tarde."""
     try:
-        if conv.get("crm_registrado"):
-            return
         phone = conv.get("phone", "")
         if not phone:
             print(f"[crm] Sem telefone na conversa {conversation_id} — registro pulado", flush=True)
-            return
+            return False
         person, deal = buscar_pessoa_e_negocio(phone)
         d = conv.get("lead_data", {})
         if not deal:
@@ -1643,26 +1646,24 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             if not deal:
                 print(f"[crm] Não foi possível criar negócio para {phone} "
                       f"conv={conversation_id} — registro abortado", flush=True)
-                return
+                return False
         deal_id = deal.get("id")
 
-        # ── Guard durável contra restart do processo (bug real: caso [lead],
-        # 11/08) ──────────────────────────────────────────────────────────
-        # conv["crm_registrado"] é só RAM — se o processo reiniciar (ex:
-        # redeploy) entre o registro original e uma retomada da mesma
-        # conversa, esse flag reseta e o ciclo inteiro roda de novo: duplica
-        # a tarefa de reunião no Agendor E, pior, cria uma SEGUNDA reunião
-        # real no Teams e manda um SEGUNDO link pro lead, diferente do que
-        # já foi combinado (aconteceu de verdade). A marca da nota (que
-        # sobrevive no Agendor, não em RAM) serve de prova durável de que
-        # esse ciclo já rodou antes — se existir, pula tudo, sem excecão.
+        # ── Marcadores duráveis (sobrevivem a restart, ficam gravados no
+        # Agendor, não em RAM) ──────────────────────────────────────────────
+        # Corrigido 08/09 ([gestor], caso real: Amanda, deal=45426505): antes
+        # existia um único marcador (nota) e, se ele já existisse, o ciclo
+        # INTEIRO parava de rodar pra sempre — inclusive a criação da
+        # reunião real no Teams, mesmo que na primeira passada faltasse
+        # e-mail ou horário real e essa informação só tivesse chegado
+        # depois. Agora nota e reunião real têm marcadores INDEPENDENTES,
+        # então uma passada futura ainda consegue completar a reunião
+        # mesmo que a nota já exista há tempos.
         nota_marcador = f"[luca:nota:{conversation_id}]"
-        if deal_tem_marca(deal_id, nota_marcador):
-            print(f"[crm] Já registrado antes (marca de nota já existe no Agendor) "
-                  f"deal={deal_id} conv={conversation_id} — pulando ciclo inteiro, "
-                  f"inclusive criação de reunião no Teams", flush=True)
-            conv["crm_registrado"] = True
-            return
+        reuniao_real_marcador = f"[luca:reuniao_real:{conversation_id}]"
+        reuniao_fallback_marcador = f"[luca:reuniao_fallback:{conversation_id}]"
+        ja_tem_nota = deal_tem_marca(deal_id, nota_marcador)
+        ja_tem_reuniao_real = deal_tem_marca(deal_id, reuniao_real_marcador)
 
         # ── Completa nome/e-mail da pessoa no Agendor, se estiverem faltando
         # ou genéricos (ex: nome só do WhatsApp, sem e-mail) ─────────────────
@@ -1671,20 +1672,23 @@ def registrar_no_crm(conv, conversation_id, contact_name):
         atualizar_pessoa_se_incompleta(person, nome_pessoa, email_pessoa)
 
         # ── 1. Nota: resumo do lead ───────────────────────────────────────
-        nota = (
-            "📋 Atendimento via Luca (WhatsApp)\n"
-            f"Nome: {d.get('nome') or contact_name}\n"
-            f"Segmento: {d.get('segmento', '')}\n"
-            f"Necessidade: {d.get('necessidade', '')}\n"
-            f"E-mail: {d.get('email', '')}\n"
-            f"Preferência de reunião: {d.get('preferencia', '')}\n"
-            f"Status: {d.get('status', '')}\n"
-            f"{nota_marcador}"
-        )
-        r1 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
-                           headers={**HEADERS, "Content-Type": "application/json"},
-                           json={"text": nota}, timeout=15)
-        print(f"[crm] Nota resumo deal={deal_id} status={r1.status_code}", flush=True)
+        if ja_tem_nota:
+            print(f"[crm] Nota resumo já existe (idempotência) deal={deal_id} conv={conversation_id}", flush=True)
+        else:
+            nota = (
+                "📋 Atendimento via Luca (WhatsApp)\n"
+                f"Nome: {d.get('nome') or contact_name}\n"
+                f"Segmento: {d.get('segmento', '')}\n"
+                f"Necessidade: {d.get('necessidade', '')}\n"
+                f"E-mail: {d.get('email', '')}\n"
+                f"Preferência de reunião: {d.get('preferencia', '')}\n"
+                f"Status: {d.get('status', '')}\n"
+                f"{nota_marcador}"
+            )
+            r1 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                               headers={**HEADERS, "Content-Type": "application/json"},
+                               json={"text": nota}, timeout=15)
+            print(f"[crm] Nota resumo deal={deal_id} status={r1.status_code}", flush=True)
 
         # ── 2. Registro WhatsApp: transcrição compacta (idempotente) ─────────
         transcricao_marcador = f"[luca:transcricao:{conversation_id}]"
@@ -1717,27 +1721,28 @@ def registrar_no_crm(conv, conversation_id, contact_name):
         preferencia = (d.get("preferencia") or "").strip()
         if preferencia:
             owner_id = (deal.get("owner") or {}).get("id")
-            dt_iso = parse_preferencia_datetime(preferencia)
             owner_id_int = int(owner_id) if owner_id else None
-            teams_join_url = None
-            if dt_iso:
-                dt_pedido = datetime.strptime(dt_iso, "%Y-%m-%dT%H:%M")
-                dt_local, ajustado = ajustar_horario_reuniao(dt_pedido, owner_id_int)
-                texto_reuniao = ("[Luca] Reunião com especialista — pré-agendada pelo Luca via WhatsApp, "
-                                 f"aguardando confirmação do consultor. Preferência do lead: {preferencia}")
-                if ajustado:
-                    texto_reuniao += (f" (horário ajustado de {dt_pedido.strftime('%H:%M')} para "
-                                       f"{dt_local.strftime('%H:%M')} para evitar conflito de agenda)")
 
-                # ── Cria a reunião real no Teams e manda o link pro lead ─────
-                # Só quando há data/hora de verdade confirmada (não no
-                # fallback "HORÁRIO A CONFIRMAR" do else abaixo) e o lead já
-                # deu e-mail — sem e-mail não dá pra convidar ele pro Teams.
-                # Falha aqui NUNCA bloqueia o resto do registro no CRM (fica
-                # no mesmo fluxo manual de antes: consultor confirma e manda
-                # o link depois).
+            if ja_tem_reuniao_real:
+                print(f"[crm] Reunião real já criada antes (idempotência) deal={deal_id} conv={conversation_id}", flush=True)
+            else:
+                dt_iso = parse_preferencia_datetime(preferencia)
+                teams_join_url = None
                 email_lead = (d.get("email") or "").strip()
-                if email_lead:
+                if dt_iso and email_lead:
+                    dt_pedido = datetime.strptime(dt_iso, "%Y-%m-%dT%H:%M")
+                    dt_local, ajustado = ajustar_horario_reuniao(dt_pedido, owner_id_int)
+                    texto_reuniao = ("[Luca] Reunião com especialista — pré-agendada pelo Luca via WhatsApp, "
+                                     f"aguardando confirmação do consultor. Preferência do lead: {preferencia}")
+                    if ajustado:
+                        texto_reuniao += (f" (horário ajustado de {dt_pedido.strftime('%H:%M')} para "
+                                           f"{dt_local.strftime('%H:%M')} para evitar conflito de agenda)")
+
+                    # ── Cria a reunião real no Teams e manda o link pro lead ─────
+                    # Falha aqui NUNCA bloqueia o resto do registro no CRM (fica
+                    # no mesmo fluxo manual de antes: consultor confirma e manda
+                    # o link depois) — e não marca reuniao_real_marcador, então
+                    # uma passada futura tenta de novo.
                     try:
                         linha_negocio = detectar_linha_negocio(d.get("segmento", ""))
                         nome_reuniao = d.get("nome") or contact_name or "Lead"
@@ -1745,7 +1750,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                         resultado_teams = create_teams_meeting(nome_reuniao, email_lead, start_teams, linha_negocio)
                         teams_join_url = resultado_teams.get("join_url")
                         if teams_join_url:
-                            texto_reuniao += f"\nLink da reunião (Teams): {teams_join_url}"
+                            texto_reuniao += f"\nLink da reunião (Teams): {teams_join_url}\n{reuniao_real_marcador}"
                             print(f"[crm] ✅ Reunião Teams criada deal={deal_id} "
                                   f"linha={linha_negocio} join_url={teams_join_url}", flush=True)
                             mensagem_link = (
@@ -1758,42 +1763,45 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                     except Exception as e:
                         print(f"[crm] Erro ao criar reunião no Teams deal={deal_id}: {e} — "
                               f"seguindo sem o link automático (consultor confirma manualmente)", flush=True)
-                        splog.log_erro(
-                            etapa="agendamento", erro=e, plataforma="teams",
-                            lead_id=deal_id,
-                            extra={"Telefone": "", "ConsultorId": str(owner_id_int or "")},
-                        )
+
+                    due = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
+                    payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
+                    if owner_id:
+                        payload_reuniao["assigned_users"] = [int(owner_id)]
+                    r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                                       headers={**HEADERS, "Content-Type": "application/json"},
+                                       json=payload_reuniao, timeout=15)
+                    print(f"[crm] Reunião [Luca] deal={deal_id} due={due} status={r3.status_code} body={r3.text[:200]}", flush=True)
+                    ja_tem_reuniao_real = bool(teams_join_url)
                 else:
-                    print(f"[crm] Sem e-mail do lead — não foi possível criar reunião automática "
-                          f"no Teams deal={deal_id} (consultor confirma manualmente)", flush=True)
-                    splog.log_falha_silenciosa(
-                        etapa="agendamento",
-                        motivo="lead confirmou preferência de horário mas não tem e-mail cadastrado",
-                        plataforma="agendor", lead_id=deal_id,
-                    )
-            else:
-                prox = datetime.utcnow() - timedelta(hours=3) + timedelta(days=1)
-                while prox.weekday() >= 5:
-                    prox += timedelta(days=1)
-                dt_pedido = datetime(prox.year, prox.month, prox.day, 9, 0)
-                dt_local, ajustado = ajustar_horario_reuniao(dt_pedido, owner_id_int)
-                texto_reuniao = ("[Luca] Reunião com especialista — HORÁRIO A CONFIRMAR com o lead. "
-                                 f"Preferência informada: {preferencia}")
-                if ajustado:
-                    texto_reuniao += f" (horário provisório ajustado para {dt_local.strftime('%H:%M')})"
-            # IMPORTANTE: a API do Agendor espera o horário LOCAL de Brasília
-            # SEM indicação de timezone (nem "Z", nem offset) — ela mesma faz a
-            # conversão pra UTC internamente (+3h). Mandar já convertido (com "Z"
-            # ou offset) faz a API somar +3h de novo, duplicando o deslocamento
-            # e atrasando a reunião em 3h. Confirmado por teste direto na API.
-            due = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
-            payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
-            if owner_id:
-                payload_reuniao["assigned_users"] = [int(owner_id)]
-            r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
-                               headers={**HEADERS, "Content-Type": "application/json"},
-                               json=payload_reuniao, timeout=15)
-            print(f"[crm] Reunião [Luca] deal={deal_id} due={due} status={r3.status_code} body={r3.text[:200]}", flush=True)
+                    # Sem data real confirmada ainda, ou sem e-mail ainda —
+                    # cria só a tarefa de fallback "HORÁRIO A CONFIRMAR", com
+                    # seu próprio marcador (pra não duplicar essa tarefa a
+                    # cada nova tentativa enquanto a informação real não
+                    # chega — corrigido 08/09 junto com o resto deste fix).
+                    if deal_tem_marca(deal_id, reuniao_fallback_marcador):
+                        print(f"[crm] Tarefa de fallback já existe (idempotência) deal={deal_id} conv={conversation_id}", flush=True)
+                    else:
+                        prox = datetime.utcnow() - timedelta(hours=3) + timedelta(days=1)
+                        while prox.weekday() >= 5:
+                            prox += timedelta(days=1)
+                        dt_pedido = datetime(prox.year, prox.month, prox.day, 9, 0)
+                        dt_local, ajustado = ajustar_horario_reuniao(dt_pedido, owner_id_int)
+                        texto_reuniao = ("[Luca] Reunião com especialista — HORÁRIO A CONFIRMAR com o lead. "
+                                         f"Preferência informada: {preferencia} {reuniao_fallback_marcador}")
+                        if ajustado:
+                            texto_reuniao += f" (horário provisório ajustado para {dt_local.strftime('%H:%M')})"
+                        due = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
+                        payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
+                        if owner_id:
+                            payload_reuniao["assigned_users"] = [int(owner_id)]
+                        r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                                           headers={**HEADERS, "Content-Type": "application/json"},
+                                           json=payload_reuniao, timeout=15)
+                        print(f"[crm] Reunião [Luca] (fallback) deal={deal_id} due={due} status={r3.status_code}", flush=True)
+                        if not email_lead:
+                            print(f"[crm] Sem e-mail do lead — não foi possível criar reunião automática "
+                                  f"no Teams deal={deal_id} (consultor confirma manualmente)", flush=True)
 
             # ── 4. Campo personalizado 'Reunião agendada por' = Luca ─────────
             campo = resolver_campo_agendada_por()
@@ -1836,10 +1844,18 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             else:
                 print(f"[crm] Etapa não movida — negócio fora do Funil Comercial (funil={funil_atual_id})", flush=True)
 
-        conv["crm_registrado"] = True
-        print(f"[crm] ✅ Ciclo registrado no CRM deal={deal_id} conv={conversation_id}", flush=True)
+        ciclo_completo = ja_tem_nota or True  # nota sempre fica resolvida nesta passada (posta ou já existia)
+        ciclo_completo = ciclo_completo and (not preferencia or ja_tem_reuniao_real)
+        if ciclo_completo:
+            conv["crm_registrado"] = True
+            print(f"[crm] ✅ Ciclo registrado no CRM deal={deal_id} conv={conversation_id}", flush=True)
+        else:
+            print(f"[crm] Ciclo parcialmente registrado deal={deal_id} conv={conversation_id} — "
+                  f"reunião real ainda pendente, tenta de novo numa próxima mensagem", flush=True)
+        return ciclo_completo
     except Exception as e:
         print(f"[crm] Erro ao registrar conv={conversation_id}: {e}", flush=True)
+        return False
 
 
 def send_private_note(conversation_id: int, text: str):
@@ -2386,7 +2402,15 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
         # fechado. Antes rodava em TODA mensagem, mesmo depois de já ter
         # tudo completo e registrado — puro desperdício de chamada à API.
         try:
-            if conv.get("note_sent"):
+            # Corrigido 08/09 ([gestor], caso real: Amanda, deal=45426505):
+            # antes, uma vez que "note_sent" virasse True (mesmo que por um
+            # encerramento prematuro/falso-positivo), a extração parava de
+            # rodar pra sempre e "registrar_no_crm" nunca mais era chamado
+            # de novo — mesmo que o lead completasse e-mail/horário depois.
+            # Agora só para de tentar quando o ciclo do CRM está DE FATO
+            # fechado (conv["crm_registrado"], que só vira True quando a
+            # nota E a reunião real — se havia preferência — já existem).
+            if conv.get("crm_registrado"):
                 d = conv["lead_data"]
             else:
                 lead_data = extract_lead_data(conv["messages"], contact_name)
@@ -2417,17 +2441,32 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                     and parse_preferencia_datetime(d.get("preferencia")) is not None
                 )
 
-                # Detecta encerramento por acompanhamento
-                termos_encerramento = ["acompanhamento", "sinal verde", "é só me avisar", "estou por aqui"]
+                # Corrigido 08/09 ([gestor], mesmo caso da Amanda): removido
+                # "acompanhamento" desta lista — é uma palavra comum demais
+                # no nosso domínio (ex: "...cuida de todo o acompanhamento
+                # contábil..."), aparecia no meio de frases sem NENHUMA
+                # relação com o fim da conversa e fechava o ciclo cedo
+                # demais, sem e-mail nem horário real ainda.
+                termos_encerramento = ["sinal verde", "é só me avisar", "estou por aqui"]
                 conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
 
-                if (dados_completos or conversa_encerrada) and not conv.get("note_sent") and not conv.get("modo_demo"):
+                if not conv.get("note_sent") and (dados_completos or conversa_encerrada) and not conv.get("modo_demo"):
                     d["telefone"] = conv.get("phone") or d.get("telefone", "Não informado")
                     note_text = build_lead_note(d)
                     send_private_note(conversation_id, note_text)
                     conv["note_sent"] = True
                     print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
-                    # Fecha o ciclo no CRM: nota, transcrição, reunião [Luca] e campo
+
+                # Corrigido 08/09 ([gestor]): antes só tentava fechar o ciclo
+                # no CRM UMA vez, junto com o envio da nota — se faltasse
+                # e-mail/horário real nesse momento, a reunião de verdade
+                # nunca mais era tentada. Agora tenta de novo a cada
+                # mensagem (uma vez que já tenha e-mail e preferência),
+                # até o ciclo fechar de verdade — registrar_no_crm é
+                # idempotente (marcadores duráveis) e sabe sozinho o que
+                # já foi feito.
+                if (dados_completos or (conv.get("note_sent") and d.get("email") and d.get("preferencia"))) \
+                   and not conv.get("modo_demo"):
                     registrar_no_crm(conv, conversation_id, contact_name)
 
                     # Corrigido em 18/08 (bug real, confirmado em produção): o
@@ -2449,6 +2488,7 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                                           f"Perdido genérico deal={deal_perdido['id']}", flush=True)
                         except Exception as e:
                             print(f"[note] Erro ao mover negócio perdido conv={conversation_id}: {e}", flush=True)
+
         except Exception as e:
             print(f"[note] Erro ao processar nota: {e}", flush=True)
 
@@ -2510,7 +2550,26 @@ def agendorchat_webhook():
             msg_atual = next((m for m in msgs if m.get("id") == msg_id), None)
             if not msg_atual or msg_atual.get("status") != "failed":
                 return jsonify({}), 200
-            motivo = (msg_atual.get("content_attributes") or {}).get("external_error", "motivo não informado")
+            content_attrs_falha = msg_atual.get("content_attributes") or {}
+            motivo = content_attrs_falha.get("external_error", "motivo não informado")
+            # Corrigido 08/09 ([gestor]): o erro 131049 ("healthy ecosystem
+            # engagement") é o WhatsApp/Meta limitando envio por engajamento
+            # (ex: rajada de vários templates de marketing de uma vez só) —
+            # não tem nada a ver com número inválido. Antes desse fix, era
+            # tratado idêntico a número inválido: mudava a etapa pra "Perdido
+            # - sem contato" e deixava uma nota errada dizendo "número
+            # inválido/sem WhatsApp" pra um lead com número perfeitamente
+            # válido — caso real confirmado em produção em 08/09, vários
+            # leads (Beatriz, Diogeles, Hudson, Eduardo, Gabriel) afetados
+            # numa única rajada de follow-ups.
+            # Ampliado em 09/09 ([gestor]): mesmo problema com "9999: low
+            # balance" (categoria BILLING) — a conta do WhatsApp/Gupshup
+            # ficou sem saldo pra mandar template, e isso NÃO significa que
+            # o número é inválido. Também é uma falha temporária: assim que
+            # o saldo voltar, o reenvio (feito pela régua de follow-up, que
+            # já espera confirmação antes de avançar) deve funcionar normal.
+            eh_falha_temporaria = ("131049" in motivo
+                                   or content_attrs_falha.get("error_category") in ("QUALITY_BLOCK", "BILLING"))
             meta_sender = (conversation.get("meta") or {}).get("sender") or {}
             phone = meta_sender.get("phone_number", "")
             print(f"[msg_falhou] Mensagem falhou conv={conversation_id} msg={msg_id} "
@@ -2518,25 +2577,38 @@ def agendorchat_webhook():
             if phone:
                 _, deal = buscar_pessoa_e_negocio(phone)
                 if deal:
-                    # Corrigido 21/08 ([gestor]): só move pra "sem contato" se
-                    # o negócio AINDA não teve nenhum contato de verdade —
-                    # senão uma mensagem posterior (ex: lembrete) que falhe
-                    # apagaria um progresso real já feito (Contato
-                    # Retornado, Reunião agendada, etc.).
-                    etapa_atual_id = (deal.get("dealStage") or {}).get("id")
-                    etapas_sem_contato_ainda = (ETAPA_NOVO_LEAD, ETAPA_1_CONTATO, ETAPA_2_CONTATO,
-                                                 ETAPA_3_CONTATO, ETAPA_4_CONTATO_D5, ETAPA_5_CONTATO_D7,
-                                                 ETAPA_PERDIDO_SEM_CONTATO)
-                    if etapa_atual_id in etapas_sem_contato_ainda:
-                        mover_etapa_funil_comercial(deal["id"], ETAPA_PERDIDO_SEM_CONTATO, permitir_recuo=True)
+                    if eh_falha_temporaria:
+                        # Provavelmente número válido, só uma falha temporária
+                        # (limite de engajamento OU saldo insuficiente) — não
+                        # move de etapa. A régua de follow-up detecta que essa
+                        # tentativa falhou (via status_da_mensagem) e tenta
+                        # reenviar sozinha numa próxima varredura, sem
+                        # precisar de ação manual.
                         send_private_note(conversation_id,
-                            f"⚠️ Mensagem não entregue (número inválido/sem WhatsApp). Motivo: {motivo}. "
-                            f"Movido para 'Perdido - sem retorno (D10)' para verificação manual. {marcador_falha}")
+                            f"⚠️ Mensagem bloqueada pelo WhatsApp (falha temporária, não é número "
+                            f"inválido). Motivo: {motivo}. Etapa mantida — o sistema tenta reenviar "
+                            f"automaticamente. {marcador_falha}")
                     else:
-                        send_private_note(conversation_id,
-                            f"⚠️ Mensagem não entregue (número inválido/sem WhatsApp). Motivo: {motivo}. "
-                            f"Negócio já teve contato real antes, etapa mantida — verificar manualmente. {marcador_falha}")
+                        # Corrigido 21/08 ([gestor]): só move pra "sem contato" se
+                        # o negócio AINDA não teve nenhum contato de verdade —
+                        # senão uma mensagem posterior (ex: lembrete) que falhe
+                        # apagaria um progresso real já feito (Contato
+                        # Retornado, Reunião agendada, etc.).
+                        etapa_atual_id = (deal.get("dealStage") or {}).get("id")
+                        etapas_sem_contato_ainda = (ETAPA_NOVO_LEAD, ETAPA_1_CONTATO, ETAPA_2_CONTATO,
+                                                     ETAPA_3_CONTATO, ETAPA_4_CONTATO_D5, ETAPA_5_CONTATO_D7,
+                                                     ETAPA_PERDIDO_SEM_CONTATO)
+                        if etapa_atual_id in etapas_sem_contato_ainda:
+                            mover_etapa_funil_comercial(deal["id"], ETAPA_PERDIDO_SEM_CONTATO, permitir_recuo=True)
+                            send_private_note(conversation_id,
+                                f"⚠️ Mensagem não entregue (número inválido/sem WhatsApp). Motivo: {motivo}. "
+                                f"Movido para 'Perdido - sem retorno (D10)' para verificação manual. {marcador_falha}")
+                        else:
+                            send_private_note(conversation_id,
+                                f"⚠️ Mensagem não entregue (número inválido/sem WhatsApp). Motivo: {motivo}. "
+                                f"Negócio já teve contato real antes, etapa mantida — verificar manualmente. {marcador_falha}")
             return jsonify({}), 200
+
 
         # Ignora tudo que não seja mensagem nova do lead
         if event != "message_created":
@@ -2584,10 +2656,23 @@ def agendorchat_webhook():
                         # o Luca responder de verdade. Nesse caso, usa um
                         # texto que só confirma o recebimento, sem sugerir
                         # que já tinha algo rolando.
-                        ja_teve_resposta_real_do_luca = any(
-                            m.get("message_type") == 1 and not m.get("private")
-                            and not (m.get("additional_attributes") or {}).get("automation_id")
-                            for m in msgs_previas
+                        #
+                        # Corrigido 09/09 ([gestor], bug real e sistemático:
+                        # 19/19 ocorrências analisadas em produção sempre
+                        # caíam nesse branch, mesmo em primeiro contato
+                        # genuíno — nunca uma vez no branch certo). A
+                        # checagem acima, via API remota filtrando mensagens
+                        # "sem automation_id", provou não ser confiável. Troca
+                        # pra fonte muito mais simples e correta: o próprio
+                        # histórico em memória do Luca (conv["messages"]) só
+                        # tem uma entrada "assistant" quando o Luca de fato
+                        # gerou e mandou uma resposta de verdade — não tem
+                        # como confundir com a saudação automática nem com
+                        # nenhuma outra mensagem de terceiros.
+                        conv_saudacao = conversation_histories.get(str(conv_id_saudacao))
+                        ja_teve_resposta_real_do_luca = bool(
+                            conv_saudacao and any(m.get("role") == "assistant"
+                                                   for m in conv_saudacao.get("messages", []))
                         )
 
                         if conversa_ativa_agora and ja_teve_resposta_real_do_luca:
@@ -3204,10 +3289,6 @@ def agendar():
             detail = e.response.json().get("error", {}).get("message", "")
         except Exception:
             pass
-        splog.log_erro(
-            etapa="agendamento", erro=e, plataforma="teams",
-            extra={"StatusHTTP": str(status), "Detalhe": detail},
-        )
         if status == 403:
             return jsonify({
                 "error": "Permissão Calendars.ReadWrite ainda não concedida no Azure AD.",
@@ -3217,7 +3298,6 @@ def agendar():
         return jsonify({"error": str(e), "detail": detail}), 500
 
     except Exception as e:
-        splog.log_erro(etapa="agendamento", erro=e, plataforma="teams")
         return jsonify({"error": str(e)}), 500
 
 
@@ -3842,27 +3922,14 @@ def mover_novos_leads_para_1contato():
             # motivo — telefone inválido, automação desativada, etc.).
             if not person_id:
                 print(f"[novo_lead] Pulado — sem person_id deal={deal_id}", flush=True)
-                splog.log_falha_silenciosa(
-                    etapa="primeiro_contato", motivo="deal sem person_id vinculado",
-                    plataforma="agendor", lead_id=deal_id,
-                )
                 continue
             telefone = telefone_da_pessoa(person_id)
             if not telefone:
                 print(f"[novo_lead] Pulado — sem telefone person={person_id} deal={deal_id}", flush=True)
-                splog.log_falha_silenciosa(
-                    etapa="primeiro_contato", motivo="pessoa sem telefone cadastrado",
-                    plataforma="agendor", lead_id=deal_id,
-                    extra={"PersonId": str(person_id)},
-                )
                 continue
             conv = conversa_do_telefone(telefone)
             if not conv:
                 print(f"[novo_lead] Pulado — conversa não encontrada telefone={telefone} deal={deal_id}", flush=True)
-                splog.log_falha_silenciosa(
-                    etapa="primeiro_contato", motivo="nenhuma conversa encontrada no Chatwoot para este telefone",
-                    plataforma="agendorchat", lead_id=deal_id, telefone=telefone,
-                )
                 continue
             msgs = mensagens_da_conversa(conv["id"])
             # Aceita QUALQUER mensagem enviada (não só as com automation_id
@@ -3883,17 +3950,6 @@ def mover_novos_leads_para_1contato():
             if not saudacao_enviada:
                 print(f"[novo_lead] Pulado — saudação ainda não confirmada na conversa "
                       f"deal={deal_id}", flush=True)
-                # Cada varredura roda a cada 15 min; se este deal aparecer aqui
-                # de novo em varreduras seguintes, o Ocorrencias na lista do
-                # SharePoint sobe — Ocorrencias alto é o sinal de que a
-                # automação nativa do Agendor não disparou pra este lead
-                # (1 ocorrência isolada é normal, é só o deal ainda não ter
-                # sido processado pela automação).
-                splog.log_falha_silenciosa(
-                    etapa="primeiro_contato",
-                    motivo="saudação automática do Agendor ainda não confirmada na conversa",
-                    plataforma="agendorchat", lead_id=deal_id, telefone=telefone,
-                )
                 continue
 
             # Confere a etapa FRESCA antes de mover — o cache de negócios só
@@ -4383,7 +4439,7 @@ def marcar_perdido_sem_contato(deal_id: int) -> bool:
     return mover_etapa_funil_comercial(deal_id, ETAPA_PERDIDO_SEM_CONTATO)
 
 
-def enviar_followup_dia(conversation_id, deal_id, phone, tag, nome) -> bool:
+def enviar_followup_dia(conversation_id, deal_id, phone, tag, nome):
     """Envia o nudge de silêncio (D1/D3/D5). Por definição a janela de 24h
     do WhatsApp certamente está fechada (o lead está silencioso há 1+ dia),
     então isso SEMPRE usa template aprovado da Meta, nunca mensagem livre.
@@ -4402,7 +4458,14 @@ def enviar_followup_dia(conversation_id, deal_id, phone, tag, nome) -> bool:
     em vez do texto completo do template aprovado — confirmado no caso
     real do Ricardo Ribeiro (D3), que recebeu essa frase curta genérica
     em vez da mensagem de verdade que fechamos com o [gestor]. Agora
-    manda o texto completo, igual ao que está aprovado no Meta."""
+    manda o texto completo, igual ao que está aprovado no Meta.
+
+    Retorna (True, msg_id) se enviou de verdade (msg_id pode ser None se a
+    API não trouxer o id na resposta), ou (False, None) se não enviou.
+    Desde 08/09 ([gestor]): NÃO avança mais a etapa aqui — só envia e
+    marca como "aguardando confirmação". A etapa só avança depois que o
+    webhook confirmar entrega de verdade (ver verificar_followup_dias_
+    silencio), pra evitar negócio avançando sem a mensagem ter chegado."""
     nome_template = {"D1": "followup_silencio_d1_tech",
                       "D3": "followup_silencio_d3_tech",
                       "D5": "followup_silencio_d5_tech",
@@ -4410,25 +4473,15 @@ def enviar_followup_dia(conversation_id, deal_id, phone, tag, nome) -> bool:
                       "D10": "followup_silencio_d10_tech"}[tag]
 
     # Corrigido em 19/08 (bug real, confirmado em produção), estendido em
-    # 25/08 quando a régua ganhou D7 e D10: pra última tentativa (hoje
-    # D10, antes era D5), não existe próxima etapa "natural" pra saída
-    # automática — se a mudança de etapa (mover_etapa_funil_comercial)
-    # falhar por qualquer motivo depois do envio, o negócio fica preso e
-    # a régua bate de novo dias depois, reenviando a MESMA mensagem final
-    # (caso real: [lead], D5 enviado em 14/08 e de novo em
-    # 19/08 — 5 dias de diferença, na época em que D5 era a última). Um
-    # marcador único na própria conversa garante que a última tentativa
-    # NUNCA sai duas vezes, mesmo que a etapa não tenha mudado com sucesso.
-    if tag == "D10":
-        marcador_d10 = "[followup:d10_enviado]"
-        try:
-            msgs_existentes = mensagens_da_conversa(conversation_id)
-            if marcador_existe(msgs_existentes, marcador_d10):
-                print(f"[followup_dias] D10 já tinha sido enviado antes (marcador encontrado) "
-                      f"conv={conversation_id} deal={deal_id} — não reenvia", flush=True)
-                return False
-        except Exception as e:
-            print(f"[followup_dias] Erro ao checar marcador D10 conv={conversation_id}: {e}", flush=True)
+    # 25/08 quando a régua ganhou D7 e D10, e REMOVIDO em 09/09 ([gestor]):
+    # a trava original ("marcador d10_enviado" bloqueando qualquer reenvio)
+    # existia pra evitar reenviar a mensagem final quando a mudança de
+    # etapa falhava depois de um envio BEM-SUCEDIDO. Mas ela também
+    # bloqueava reenvio depois de uma falha real (ex: saldo insuficiente),
+    # entrando em conflito direto com o novo mecanismo de espera de
+    # confirmação de entrega (que já cobre os dois casos corretamente: só
+    # avança quando confirma "delivered", e tenta reenviar quando confirma
+    # "failed" por motivo temporário) — ver verificar_followup_dias_silencio.
 
     tpl = template_por_nome(nome_template)
     if not tpl:
@@ -4436,7 +4489,7 @@ def enviar_followup_dia(conversation_id, deal_id, phone, tag, nome) -> bool:
             f"🔁 Follow-up {tag} NÃO enviado — template '{nome_template}' não encontrado/aprovado "
             f"no Meta Business Suite."))
         print(f"[followup_dias] {tag} SEM TEMPLATE conv={conversation_id}", flush=True)
-        return False
+        return False, None
 
     nome_saudacao = nome or "tudo bem"
     texto_completo = {
@@ -4461,41 +4514,68 @@ def enviar_followup_dia(conversation_id, deal_id, phone, tag, nome) -> bool:
                 f"mensagem. Se fizer sentido economizar, responde só um \"sim\" que eu retomo "
                 f"com você."),
     }[tag]
-    enviar_template_conversa(conversation_id, tpl, {"1": nome_saudacao}, texto_completo)
-    marcador_nota = " [followup:d10_enviado]" if tag == "D10" else ""
-    send_private_note(conversation_id, f"🔁 Follow-up {tag} enviado ao lead via template.{marcador_nota}")
+    resp = enviar_template_conversa(conversation_id, tpl, {"1": nome_saudacao}, texto_completo)
+    msg_id_enviado = (resp or {}).get("id")
+    marcador_pendente = f" [followup:aguardando_confirmacao:{tag}:{msg_id_enviado}]" if msg_id_enviado else ""
+    send_private_note(conversation_id,
+        f"🔁 Follow-up {tag} enviado ao lead via template — aguardando confirmação de entrega antes "
+        f"de avançar a etapa.{marcador_pendente}")
     espelho_crm(deal_id, f"🤖 Follow-up automático ({tag}) enviado ao lead — silêncio de {tag[1:]} dia(s).")
-    print(f"[followup_dias] ✅ {tag} enviado conv={conversation_id} deal={deal_id}", flush=True)
-    return True
+    print(f"[followup_dias] ✅ {tag} enviado conv={conversation_id} deal={deal_id} msg_id={msg_id_enviado}", flush=True)
+    return True, msg_id_enviado
+
+
+def status_da_mensagem(conversation_id, msg_id):
+    """Consulta o status atual (delivered/failed/sent/etc.) de uma mensagem
+    específica na conversa, usado pra confirmar entrega antes de avançar
+    a etapa do follow-up (criado 08/09, [gestor]). Retorna None se não
+    encontrar a mensagem ou em erro de rede."""
+    if not msg_id:
+        return None
+    try:
+        msgs = mensagens_da_conversa(conversation_id)
+        msg = next((m for m in msgs if m.get("id") == msg_id), None)
+        return msg.get("status") if msg else None
+    except Exception as e:
+        print(f"[followup_dias] Erro ao checar status da mensagem {msg_id} conv={conversation_id}: {e}", flush=True)
+        return None
 
 
 def dias_desde_referencia(deal_fresco: dict, etapa_atual_id: int, conversation_id: int, deal_id: int):
-    """Retorna quantos dias completos se passaram desde a referência
-    correta pra contar a régua de silêncio nesta etapa.
+    """Retorna quantos dias completos se passaram desde a ENTRADA NA ETAPA
+    ATUAL — não desde a criação do negócio (mudança de 08/09, a pedido de
+    [gestor]: contar a partir da criação permitia que um negócio parado
+    por dias, ao ser corrigido, disparasse D1/D3/D5/D7 tudo de uma vez —
+    caso real confirmado em produção no mesmo dia, logo após o fix do
+    AGENDORCHAT_INBOX_ID).
 
-    Normalmente é a CRIAÇÃO do negócio (startTime) — decisão confirmada
-    com [gestor] em 05/08. Mas se a entrada na etapa atual NÃO veio da
-    progressão normal do próprio robô (marcador [followup:etapa_normal:
-    {id}] ausente na conversa), é sinal de que o negócio foi movido
-    manualmente de volta pra essa etapa (ex: respondeu depois de
-    'Contato Retornado', e [gestor] trouxe de volta pra '3° Contato' pra
-    reativar a régua) — criado 25/08, a pedido de [gestor]. Nesse caso, o
-    relógio reinicia a partir de AGORA (a primeira vez que o robô nota a
-    entrada manual), guardando um marcador
-    [followup:regua_reiniciada:{timestamp}] pra usar o mesmo ponto de
-    partida em passagens futuras, sem reiniciar de novo a cada varredura.
+    Duas fontes de referência, dependendo de como o negócio chegou nesta
+    etapa:
+    - Entrada AUTOMÁTICA (o próprio robo moveu, marcador
+      [followup:etapa_normal:{id}] presente): usa o horário exato desse
+      marcador como início da contagem desta etapa.
+    - Entrada MANUAL (alguém moveu o card, marcador ausente): decisão de
+      [gestor] em 08/09 — dispara o follow-up desta etapa IMEDIATAMENTE
+      (sem esperar o intervalo), e a partir daí reinicia a contagem
+      normalmente pra próxima etapa. Guarda um marcador
+      [followup:regua_reiniciada:{etapa_id}:{timestamp}] (agora com o id
+      da etapa embutido — antes era um marcador genérico por conversa,
+      que podia reaproveitar por engano o timestamp de um reset antigo de
+      outra etapa) pra não disparar de novo a cada varredura.
 
-    Retorna None se não for possível calcular (sem startTime, por ex.)."""
-    marcador_normal = f"[followup:etapa_normal:{etapa_atual_id}]"
+    ETAPA_1_CONTATO é a única exceção: como é a entrada natural no funil,
+    sempre usa a criação do negócio (startTime) — não existe "entrada
+    manual" conceitual nela, é sempre o ponto de partida.
+
+    Retorna None se não for possível calcular (sem startTime, por ex.).
+    """
     try:
         msgs = mensagens_da_conversa(conversation_id)
     except Exception as e:
         print(f"[followup_dias] Erro ao ler conversa pra checar reset deal={deal_id}: {e}", flush=True)
         msgs = None
 
-    entrada_normal = True if msgs is None else marcador_existe(msgs, marcador_normal)
-
-    if entrada_normal or etapa_atual_id == ETAPA_1_CONTATO:
+    if etapa_atual_id == ETAPA_1_CONTATO:
         start_time = deal_fresco.get("startTime")
         if not start_time:
             return None
@@ -4505,27 +4585,42 @@ def dias_desde_referencia(deal_fresco: dict, etapa_atual_id: int, conversation_i
             return None
         return (datetime.utcnow() - criado_em).days
 
-    # Entrada manual detectada — procura marcador de reset já existente
-    marcador_reset_prefix = "[followup:regua_reiniciada:"
+    marcador_normal = f"[followup:etapa_normal:{etapa_atual_id}]"
     if msgs:
+        msg_normal = next((m for m in msgs if marcador_normal in (m.get("content") or "")), None)
+        if msg_normal and msg_normal.get("created_at"):
+            entrada_em = datetime.utcfromtimestamp(msg_normal["created_at"])
+            return (datetime.utcnow() - entrada_em).days
+
+    # Entrada manual detectada nesta etapa — procura marcador de reset
+    # já existente ESPECÍFICO desta etapa (pega o mais recente, caso
+    # exista mais de um ao longo do tempo).
+    marcador_reset_prefix = f"[followup:regua_reiniciada:{etapa_atual_id}:"
+    if msgs:
+        resets_encontrados = []
         for m in msgs:
             content = m.get("content") or ""
             if marcador_reset_prefix in content:
                 try:
                     ts_str = content.split(marcador_reset_prefix)[1].split("]")[0]
-                    reset_em = datetime.utcfromtimestamp(float(ts_str))
-                    return (datetime.utcnow() - reset_em).days
+                    resets_encontrados.append(float(ts_str))
                 except Exception:
-                    continue  # marcador corrompido, tenta o próximo
+                    continue  # marcador corrompido, ignora
+        if resets_encontrados:
+            reset_em = datetime.utcfromtimestamp(max(resets_encontrados))
+            return (datetime.utcnow() - reset_em).days
 
-    # Nenhum marcador de reset ainda — cria um agora, dia 0
+    # Primeira vez notando essa entrada manual nesta etapa — marca agora
+    # e força o disparo IMEDIATO do follow-up desta etapa (retornando o
+    # próprio limite de dias dela, que sempre bate na checagem seguinte).
     try:
         send_private_note(conversation_id, (
-            f"🔁 Retorno manual detectado nesta etapa — reiniciando a contagem de dias "
-            f"da régua de silêncio a partir de agora. {marcador_reset_prefix}{time.time()}]"))
+            f"🔁 Movimentação manual detectada nesta etapa — disparando o follow-up "
+            f"correspondente agora, sem esperar. {marcador_reset_prefix}{time.time()}]"))
     except Exception as e:
         print(f"[followup_dias] Erro ao criar marcador de reset deal={deal_id}: {e}", flush=True)
-    return 0
+    regra_etapa = FOLLOWUP_REGRA_POR_ETAPA.get(etapa_atual_id)
+    return regra_etapa[1] if regra_etapa else 0
 
 
 def verificar_followup_dias_silencio():
@@ -4629,12 +4724,9 @@ def verificar_followup_dias_silencio():
                 continue
             conversation_id = conv.get("id")
 
-            # Relógio contado a partir da CRIAÇÃO do negócio (startTime), não
-            # do silêncio do lead — confirmado com [gestor] em 05/08. Ex.:
-            # criado segunda 03/08 -> D+1 dispara terça 04/08. EXCETO se a
-            # entrada na etapa atual foi um retorno manual ([gestor] movendo
-            # de volta), caso em que o relógio reinicia a partir de agora —
-            # ver dias_desde_referencia (25/08).
+            # Relógio contado a partir da ENTRADA NA ETAPA ATUAL (mudança de
+            # 08/09, [gestor] — ver docstring de dias_desde_referencia pro
+            # motivo), não mais da criação do negócio nem do silêncio do lead.
             dias_desde_criacao = dias_desde_referencia(deal_fresco, etapa_atual_id, conversation_id, deal_id)
             if dias_desde_criacao is None:
                 print(f"[followup_dias] Pulado — sem startTime deal={deal_id}", flush=True)
@@ -4658,9 +4750,70 @@ def verificar_followup_dias_silencio():
                       f"conv={conversation_id}", flush=True)
                 continue
 
-            enviado = enviar_followup_dia(conversation_id, deal_id, phone, tag, nome)
-            if not enviado:
+            # Corrigido 08/09 ([gestor]): antes a etapa avançava logo após o
+            # POST de envio, sem esperar confirmação de entrega de verdade —
+            # se a mensagem falhasse depois (ex: erro 131049, "número
+            # inválido/sem WhatsApp"), o negócio já tinha avançado sem o
+            # lead ter recebido nada. Agora: primeiro checa se já existe um
+            # envio pendente de confirmação PRA ESTA ETAPA; se sim, só avança
+            # quando a entrega for confirmada (nunca reenvia enquanto espera
+            # — só volta a tentar de novo na próxima varredura).
+            try:
+                msgs_pendencia = mensagens_da_conversa(conversation_id)
+            except Exception as e:
+                print(f"[followup_dias] Erro ao checar pendência conv={conversation_id}: {e}", flush=True)
+                msgs_pendencia = []
+
+            marcador_pendente_prefix = f"[followup:aguardando_confirmacao:{tag}:"
+            candidatos_pendentes = [m for m in msgs_pendencia
+                                     if marcador_pendente_prefix in (m.get("content") or "")]
+            # Corrigido 09/09 ([gestor]): depois de um reenvio, passam a
+            # existir DOIS marcadores desse tag na conversa (o antigo, já
+            # falho, e o novo) — pegar o primeiro por ordem de iteração
+            # arriscava travar pra sempre checando o antigo. Pega sempre o
+            # de MAIOR id de mensagem (o mais recente).
+            msg_pendente = max(candidatos_pendentes, key=lambda m: m.get("id", 0)) if candidatos_pendentes else None
+
+            if msg_pendente:
+                try:
+                    msg_id_pendente = msg_pendente["content"].split(marcador_pendente_prefix)[1].split("]")[0]
+                    msg_id_pendente = int(msg_id_pendente)
+                except Exception:
+                    msg_id_pendente = None
+                status_entrega = status_da_mensagem(conversation_id, msg_id_pendente)
+                if status_entrega == "delivered":
+                    print(f"[followup_dias] {tag} confirmado como entregue deal={deal_id} — avançando etapa", flush=True)
+                elif status_entrega == "failed":
+                    # Corrigido 09/09 ([gestor], caso real: saldo insuficiente
+                    # do WhatsApp/Gupshup em 09/09): antes, uma mensagem que
+                    # já tinha falhado de verdade ficava sendo checada pra
+                    # sempre, esperando um "delivered" que nunca ia chegar —
+                    # nunca reenviava. Falha temporária (131049, saldo) já
+                    # não move mais a etapa (ver webhook message_updated) —
+                    # aqui é onde a régua detecta isso e tenta de novo,
+                    # assim que essa mesma varredura rodar.
+                    print(f"[followup_dias] {tag} tinha falhado (mensagem anterior não entregue) "
+                          f"deal={deal_id} — tentando reenviar", flush=True)
+                    enviado, _msg_id = enviar_followup_dia(conversation_id, deal_id, phone, tag, nome)
+                    if not enviado:
+                        continue
+                    print(f"[followup_dias] {tag} reenviado deal={deal_id} — aguardando nova "
+                          f"confirmação de entrega antes de avançar etapa", flush=True)
+                    continue
+                else:
+                    print(f"[followup_dias] Aguardando confirmação de entrega do {tag} "
+                          f"(status={status_entrega}) deal={deal_id} — não reenvia, "
+                          f"tenta de novo na próxima varredura", flush=True)
+                    continue
+                print(f"[followup_dias] {tag} confirmado como entregue deal={deal_id} — avançando etapa", flush=True)
+            else:
+                enviado, _msg_id = enviar_followup_dia(conversation_id, deal_id, phone, tag, nome)
+                if not enviado:
+                    continue
+                print(f"[followup_dias] {tag} enviado deal={deal_id} — aguardando confirmação de "
+                      f"entrega antes de avançar etapa (verifica na próxima varredura)", flush=True)
                 continue
+
             enviados += 1
             resolver_conversa_agendorchat(conversation_id)
 
