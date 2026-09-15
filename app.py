@@ -395,6 +395,25 @@ def call_claude(messages: list, max_tokens: int = 300, system: str = SYSTEM_PROM
 # Histórico de conversas por conversa_id (em memória)
 conversation_histories = {}
 
+# Corrigido 15/09 ([gestor]): trava real contra a corrida entre threads
+# concorrentes tentando responder a MESMA conversa ao mesmo tempo (webhook
+# normal + retomada + conv_updated podem todos disparar _processar_resposta_
+# luca quase simultaneamente). As checagens existentes (latest_msg_token,
+# conta_respostas_apos) reduziam bastante o problema mas não eliminavam —
+# sempre existe uma pequena janela entre "checar" e "agir" onde duas threads
+# passam pela checagem antes de qualquer uma delas registrar que já
+# respondeu (61 ocorrências reais em 5 dias de produção, todas pegas pela
+# sorte do timing, não por garantia). Um Lock por conversa fecha essa
+# janela de vez: só uma thread por vez processa+envia pra cada conversa.
+_conv_response_locks = {}
+_conv_response_locks_guard = threading.Lock()
+
+def obter_lock_resposta(conv_key):
+    with _conv_response_locks_guard:
+        if conv_key not in _conv_response_locks:
+            _conv_response_locks[conv_key] = threading.Lock()
+        return _conv_response_locks[conv_key]
+
 # ── Azure AD (agendamento Teams) ─────────────────────────────────────────────
 AZURE_CLIENT_ID     = os.environ.get("AZURE_CLIENT_ID",     "")  # CONFIGURE via variável de ambiente
 AZURE_CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET", "")  # CONFIGURE via variável de ambiente
@@ -1228,7 +1247,15 @@ def status_reuniao_real(phone: str) -> str:
         tasks_do_deal.sort(key=lambda t: t.get("dueDate") or "", reverse=True)
         t = tasks_do_deal[0]
         due = _parse_dt(t.get("dueDate"))
-        due_fmt = due.strftime("%d/%m às %H:%M") if due else "data indefinida"
+        # Corrigido 15/09 ([gestor], bug real confirmado: Marcos,
+        # deal do MEI->CNPJ, reunião 16/09 13h — o Luca disse pro lead
+        # "está registrado às 16h" e insistiu nisso quando o lead corrigiu).
+        # O valor bruto do CRM está em UTC; sem essa conversão, uma reunião
+        # marcada pra 13h de Brasília aparecia como "16h" aqui (13h + 3h de
+        # UTC). processar_lembrete já fazia essa conversão certinho — só
+        # essa função esquecia.
+        due_brt = due.astimezone(timezone(timedelta(hours=-3))) if due else None
+        due_fmt = due_brt.strftime("%d/%m às %H:%M") if due_brt else "data indefinida"
         if t.get("finishedAt"):
             return (f"A última reunião registrada no CRM pra este lead (era pra {due_fmt}) "
                      f"JÁ FOI CONCLUÍDA/MARCADA COMO FINALIZADA. Se o histórico da conversa mencionar "
@@ -2240,257 +2267,259 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
             print(f"[luca-bg] Mensagem agrupada — outra mais recente chegou, conv={conversation_id}", flush=True)
             return
 
-        if is_first_message:
-            # Após o delay, busca histórico atualizado para incluir o template
-            remote_history = fetch_conversation_history(conversation_id)
-            if remote_history:
-                conv["messages"] = remote_history
-                print(f"[history] Histórico atualizado após delay: {len(remote_history)} msgs conv={conversation_id}", flush=True)
-            # Injeta instrução para não repetir o que o template já disse
-            # Se o template de boas-vindas ficou como ÚLTIMO turno (acontece
-            # quando o lead manda só 1 mensagem e não escreve de novo durante
-            # os 90s de espera), a Messages API interpreta isso como
-            # "continue esse turno do assistant" em vez de "responda de
-            # novo" — e como o template já é uma frase fechada, o resultado
-            # é resposta vazia, sempre (bug real confirmado: caso [lead],
-            # 12/08, 3 tentativas, todas vazias). O Claude não precisa "ver"
-            # o texto literal do template pra saber que já foi enviado, só
-            # precisa da instrução abaixo — então remove esse turno final
-            # antes de chamar, garantindo que a conversa sempre termine num
-            # turno "user" de verdade.
+        lock = obter_lock_resposta(conv_key)
+        with lock:
+            if is_first_message:
+                # Após o delay, busca histórico atualizado para incluir o template
+                remote_history = fetch_conversation_history(conversation_id)
+                if remote_history:
+                    conv["messages"] = remote_history
+                    print(f"[history] Histórico atualizado após delay: {len(remote_history)} msgs conv={conversation_id}", flush=True)
+                # Injeta instrução para não repetir o que o template já disse
+                # Se o template de boas-vindas ficou como ÚLTIMO turno (acontece
+                # quando o lead manda só 1 mensagem e não escreve de novo durante
+                # os 90s de espera), a Messages API interpreta isso como
+                # "continue esse turno do assistant" em vez de "responda de
+                # novo" — e como o template já é uma frase fechada, o resultado
+                # é resposta vazia, sempre (bug real confirmado: caso [lead],
+                # 12/08, 3 tentativas, todas vazias). O Claude não precisa "ver"
+                # o texto literal do template pra saber que já foi enviado, só
+                # precisa da instrução abaixo — então remove esse turno final
+                # antes de chamar, garantindo que a conversa sempre termine num
+                # turno "user" de verdade.
+                if conv["messages"] and conv["messages"][-1]["role"] == "assistant":
+                    conv["messages"].pop()
+                if conv["messages"] and conv["messages"][-1]["role"] == "user":
+                    conv["messages"][-1]["content"] = (
+                        "[ATENÇÃO: Um template de boas-vindas já foi enviado automaticamente pelo sistema antes desta resposta. "
+                        "NÃO repita a saudação nem se apresente novamente. "
+                        "Responda diretamente à mensagem do lead, continuando de onde o template parou.]\n\n"
+                        + conv["messages"][-1]["content"]
+                    )
+                # Reconfere agrupamento após o fetch remoto
+                if conv.get("latest_msg_token") != msg_token:
+                    print(f"[luca-bg] Mensagem agrupada após fetch conv={conversation_id}", flush=True)
+                    return
+
+            # Ativa "digitando..." enquanto o Claude processa
+            toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
+
+            # ── Checagem real de agenda antes de responder (11/08) ────────────
+            # Se a mensagem do lead parece conter um dia/horário, converte pra
+            # data real e checa a agenda de verdade do consultor (Outlook/
+            # Teams via Graph) — não só as tarefas do Agendor, que é o que a
+            # gente já checava antes só no fechamento do CRM (tarde demais pra
+            # sugerir troca). Se ocupado, injeta instrução pra ESTA resposta
+            # sugerir até 2 alternativas no mesmo dia, sem revelar que "checou
+            # a agenda" (mantém a regra do SYSTEM_PROMPT sobre isso). Filtro
+            # regex barato evita chamar o Claude (parse_preferencia_datetime)
+            # em mensagem que claramente não menciona horário.
+            extra_disponibilidade = ""
+            if parece_ter_horario(message_text):
+                try:
+                    dt_iso_tentativa = parse_preferencia_datetime(message_text, tipo="disponibilidade")
+                    if dt_iso_tentativa:
+                        dt_pedido = datetime.strptime(dt_iso_tentativa, "%Y-%m-%dT%H:%M")
+                        livre, alternativas = checar_e_sugerir_horario(dt_pedido)
+                        if not livre:
+                            if alternativas:
+                                opcoes = " ou ".join(a.strftime("%Hh%M") for a in alternativas)
+                                extra_disponibilidade = (
+                                    f"\n\nATENÇÃO (checagem real de agenda, não mencione isso ao lead): "
+                                    f"o horário {dt_pedido.strftime('%Hh%M')} que o lead acabou de pedir já "
+                                    f"está ocupado na agenda do consultor. Em vez de anotar esse horário, "
+                                    f"sugira estas duas opções no mesmo dia: {opcoes}. Se o lead disser que "
+                                    f"não pode em nenhuma das duas, aceite o horário original mesmo assim, "
+                                    f"sem insistir mais."
+                                )
+                            else:
+                                extra_disponibilidade = (
+                                    f"\n\nATENÇÃO (checagem real de agenda, não mencione isso ao lead): não "
+                                    f"achei horário livre nesse dia pra sugerir. Aceite a preferência do lead "
+                                    f"normalmente."
+                                )
+                            print(f"[disponibilidade] Horário {dt_pedido.strftime('%Y-%m-%d %H:%M')} ocupado, "
+                                  f"{len(alternativas)} alternativa(s) sugerida(s) conv={conversation_id}", flush=True)
+                except Exception as e:
+                    print(f"[disponibilidade] Erro ao checar/sugerir horário conv={conversation_id}: {e}", flush=True)
+
+            # Defesa final contra corrida entre threads (13/08): entre o momento
+            # em que uma thread foi disparada (checando "última msg é do lead")
+            # e o instante desta chamada, outra thread concorrente pode ter
+            # respondido primeiro e adicionado um turno "assistant" nesse mesmo
+            # histórico compartilhado — sem isso, a conversa termina no turno
+            # errado e a Messages API devolve resposta vazia sempre (mesmo
+            # sintoma do bug da Millela, 12/08, mas por concorrência entre
+            # threads, não por falta de segunda mensagem — caso real: [lead],
+            # conv=1753, 13/08, aconteceu 2x na mesma conversa). Roda sempre,
+            # não só no caminho de primeira mensagem, porque qualquer thread
+            # (retomada, conv_updated, mensagem normal) pode sofrer essa corrida.
             if conv["messages"] and conv["messages"][-1]["role"] == "assistant":
+                print(f"[luca-bg] Turno assistant sobrando no final (corrida entre threads) "
+                      f"conv={conversation_id} — removido antes de chamar o Claude", flush=True)
                 conv["messages"].pop()
-            if conv["messages"] and conv["messages"][-1]["role"] == "user":
-                conv["messages"][-1]["content"] = (
-                    "[ATENÇÃO: Um template de boas-vindas já foi enviado automaticamente pelo sistema antes desta resposta. "
-                    "NÃO repita a saudação nem se apresente novamente. "
-                    "Responda diretamente à mensagem do lead, continuando de onde o template parou.]\n\n"
-                    + conv["messages"][-1]["content"]
-                )
-            # Reconfere agrupamento após o fetch remoto
+            if not conv["messages"] or conv["messages"][-1]["role"] != "user":
+                print(f"[luca-bg] Abortado — sem turno 'user' pendente após limpeza conv={conversation_id}", flush=True)
+                return
+
+            # Corrigido 20/08: 300 tokens não deixava espaço pro raciocínio
+            # estendido do Sonnet 5 + a resposta de verdade — o modelo às vezes
+            # gastava tudo só "pensando" e nunca escrevia o texto (bug real,
+            # confirmado em produção: Leandro, Anderson, Giovanna e outros
+            # ficaram sem resposta nenhuma do Luca por causa disso). Sem custo
+            # extra: só paga pelo que realmente gera, max_tokens é só um teto.
+            reply = call_claude(conv["messages"], max_tokens=2000,
+                                 system=conv["system"] + extra_disponibilidade, tipo="chat")
+
+            # Corrigido 01/09 (achado real do gestor: respostas instantâneas,
+            # mesmo as longas, soam como IA — um humano não digita um parágrafo
+            # em poucos segundos). O "digitando..." fica ligado até aqui e só
+            # desliga mais abaixo, depois do atraso proporcional ao tamanho do
+            # texto, logo antes do envio de verdade.
+
+            # Salva no histórico sem o contexto de retomada (para não poluir)
+            if retomada_ctx and conv["messages"] and conv["messages"][-1]["role"] == "user":
+                conv["messages"][-1] = {"role": "user", "content": message_text}
+
+            conv["messages"].append({"role": "assistant", "content": reply})
+
+            # Limita histórico a 40 turnos para não explodir tokens
+            if len(conv["messages"]) > 40:
+                conv["messages"] = conv["messages"][-40:]
+
+            # Marca o message_id respondido — impede o conv_updated de responder de novo
+            if message_id:
+                conv["last_responded_msg_id"] = message_id
+
+            # Última checagem antes do envio: se durante o processamento chegou
+            # mensagem mais nova (ou outra thread assumiu), desiste sem enviar.
             if conv.get("latest_msg_token") != msg_token:
-                print(f"[luca-bg] Mensagem agrupada após fetch conv={conversation_id}", flush=True)
+                print(f"[luca-bg] Abortado antes do envio — thread mais recente assumiu conv={conversation_id}", flush=True)
                 return
 
-        # Ativa "digitando..." enquanto o Claude processa
-        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "on")
+            # Checagem cross-worker: consulta a API para ver se alguém (outro worker,
+            # outra instância ou um humano) já respondeu esta mensagem do lead.
+            # Em mensagens normais, 1 resposta existente já bloqueia o envio.
+            # Na primeira mensagem, tolera-se 1 outgoing (o template de boas-vindas
+            # é esperado antes do Luca); 2 ou mais indicam duplicata.
+            if message_id:
+                limite = 2 if is_first_message else 1
+                respostas = conta_respostas_apos(conversation_id, message_id)
+                if respostas >= limite:
+                    print(f"[luca-bg] Abortado — {respostas} resposta(s) já existem após msg={message_id} conv={conversation_id}", flush=True)
+                    return
 
-        # ── Checagem real de agenda antes de responder (11/08) ────────────
-        # Se a mensagem do lead parece conter um dia/horário, converte pra
-        # data real e checa a agenda de verdade do consultor (Outlook/
-        # Teams via Graph) — não só as tarefas do Agendor, que é o que a
-        # gente já checava antes só no fechamento do CRM (tarde demais pra
-        # sugerir troca). Se ocupado, injeta instrução pra ESTA resposta
-        # sugerir até 2 alternativas no mesmo dia, sem revelar que "checou
-        # a agenda" (mantém a regra do SYSTEM_PROMPT sobre isso). Filtro
-        # regex barato evita chamar o Claude (parse_preferencia_datetime)
-        # em mensagem que claramente não menciona horário.
-        extra_disponibilidade = ""
-        if parece_ter_horario(message_text):
+            # ── Envia resposta de volta ao AgendorChat ────────────────────────────
+            reply = remover_travessao(reply)
+
+            # Atraso proporcional ao tamanho, simulando tempo real de digitação —
+            # sem isso, mensagens longas saindo em poucos segundos soam como IA.
+            # ~45ms por caractere (~22 caracteres/s, digitação humana rápida no
+            # celular), limitado entre 1.5s e 12s pra não parecer trava nem demora
+            # exagerada.
+            atraso_digitacao = min(max(len(reply) * 0.045, 1.5), 12)
+            time.sleep(atraso_digitacao)
+
+            toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
+            send_agendorchat_message(conversation_id, reply)
+            # Marca o início da espera por resposta do lead — usado pelo follow-up de 1h
+            conv["luca_aguardando_desde"] = time.time()
+            conv["contact_name_cache"] = contact_name
+
+            # ── Nota interna — dados completos ou conversa encerrada ─────────────
+            # Gateado: só roda a extração enquanto o ciclo do CRM ainda não foi
+            # fechado. Antes rodava em TODA mensagem, mesmo depois de já ter
+            # tudo completo e registrado — puro desperdício de chamada à API.
             try:
-                dt_iso_tentativa = parse_preferencia_datetime(message_text, tipo="disponibilidade")
-                if dt_iso_tentativa:
-                    dt_pedido = datetime.strptime(dt_iso_tentativa, "%Y-%m-%dT%H:%M")
-                    livre, alternativas = checar_e_sugerir_horario(dt_pedido)
-                    if not livre:
-                        if alternativas:
-                            opcoes = " ou ".join(a.strftime("%Hh%M") for a in alternativas)
-                            extra_disponibilidade = (
-                                f"\n\nATENÇÃO (checagem real de agenda, não mencione isso ao lead): "
-                                f"o horário {dt_pedido.strftime('%Hh%M')} que o lead acabou de pedir já "
-                                f"está ocupado na agenda do consultor. Em vez de anotar esse horário, "
-                                f"sugira estas duas opções no mesmo dia: {opcoes}. Se o lead disser que "
-                                f"não pode em nenhuma das duas, aceite o horário original mesmo assim, "
-                                f"sem insistir mais."
-                            )
-                        else:
-                            extra_disponibilidade = (
-                                f"\n\nATENÇÃO (checagem real de agenda, não mencione isso ao lead): não "
-                                f"achei horário livre nesse dia pra sugerir. Aceite a preferência do lead "
-                                f"normalmente."
-                            )
-                        print(f"[disponibilidade] Horário {dt_pedido.strftime('%Y-%m-%d %H:%M')} ocupado, "
-                              f"{len(alternativas)} alternativa(s) sugerida(s) conv={conversation_id}", flush=True)
+                # Corrigido 08/09 ([gestor], caso real: Amanda, deal=45426505):
+                # antes, uma vez que "note_sent" virasse True (mesmo que por um
+                # encerramento prematuro/falso-positivo), a extração parava de
+                # rodar pra sempre e "registrar_no_crm" nunca mais era chamado
+                # de novo — mesmo que o lead completasse e-mail/horário depois.
+                # Agora só para de tentar quando o ciclo do CRM está DE FATO
+                # fechado (conv["crm_registrado"], que só vira True quando a
+                # nota E a reunião real — se havia preferência — já existem).
+                if conv.get("crm_registrado"):
+                    d = conv["lead_data"]
+                else:
+                    lead_data = extract_lead_data(conv["messages"], contact_name)
+                    if lead_data:
+                        conv["lead_data"].update({k: v for k, v in lead_data.items() if v})
+                    d = conv["lead_data"]
+
+                    dados_completos = (
+                        d.get("nome") and d.get("nome") != "Não informado"
+                        and d.get("segmento") and d.get("segmento") != "Não identificado"
+                        and d.get("necessidade") and d.get("necessidade") != "Não informada"
+                        and d.get("email") and d.get("email") != "Não informado"
+                        # Corrigido em 17/08: exigir só "preferencia" não-vazia
+                        # deixava respostas vagas ("Qualquer dia") fecharem o
+                        # ciclo cedo demais — como o fechamento só acontece UMA
+                        # vez (note_sent), quando o lead dizia o dia/horário
+                        # exato minutos depois, o sistema já tinha "carimbado"
+                        # a conversa como concluída e NUNCA criava a reunião real
+                        # no Teams (caso real: [lead], 17/08 — ficou só com
+                        # uma tarefa "HORÁRIO A CONFIRMAR", sem link nenhum).
+                        # Usa o filtro barato (parece_ter_horario, regex, sem
+                        # Claude) primeiro — só chama parse_preferencia_datetime
+                        # (que usa Claude) quando já parece ter chance real de
+                        # ser concreto, evitando gastar uma chamada em toda
+                        # mensagem enquanto o lead ainda está respondendo vago.
+                        and d.get("preferencia")
+                        and parece_ter_horario(d.get("preferencia"))
+                        and parse_preferencia_datetime(d.get("preferencia")) is not None
+                    )
+
+                    # Corrigido 08/09 ([gestor], mesmo caso da Amanda): removido
+                    # "acompanhamento" desta lista — é uma palavra comum demais
+                    # no nosso domínio (ex: "...cuida de todo o acompanhamento
+                    # contábil..."), aparecia no meio de frases sem NENHUMA
+                    # relação com o fim da conversa e fechava o ciclo cedo
+                    # demais, sem e-mail nem horário real ainda.
+                    termos_encerramento = ["sinal verde", "é só me avisar", "estou por aqui"]
+                    conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
+
+                    if not conv.get("note_sent") and (dados_completos or conversa_encerrada) and not conv.get("modo_demo"):
+                        d["telefone"] = conv.get("phone") or d.get("telefone", "Não informado")
+                        note_text = build_lead_note(d)
+                        send_private_note(conversation_id, note_text)
+                        conv["note_sent"] = True
+                        print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
+
+                    # Corrigido 08/09 ([gestor]): antes só tentava fechar o ciclo
+                    # no CRM UMA vez, junto com o envio da nota — se faltasse
+                    # e-mail/horário real nesse momento, a reunião de verdade
+                    # nunca mais era tentada. Agora tenta de novo a cada
+                    # mensagem (uma vez que já tenha e-mail e preferência),
+                    # até o ciclo fechar de verdade — registrar_no_crm é
+                    # idempotente (marcadores duráveis) e sabe sozinho o que
+                    # já foi feito.
+                    if (dados_completos or (conv.get("note_sent") and d.get("email") and d.get("preferencia"))) \
+                       and not conv.get("modo_demo"):
+                        registrar_no_crm(conv, conversation_id, contact_name)
+
+                        # Corrigido em 18/08 (bug real, confirmado em produção): o
+                        # campo "status" às vezes vem "Perdido para concorrente"
+                        # (a IA reconhece a perda pelo texto, ex: "já segui com
+                        # outra empresa"), mas isso ficava só escrito no
+                        # resumo/nota — nada movia a etapa de verdade no funil
+                        # (caso real: [lead], deal=44854914, 18/08, ficou
+                        # preso em "Novo Lead" mesmo marcado como perdido na
+                        # nota). Agora, se o status indicar perda, move pra
+                        # "Perdido" genérico de verdade.
+                        status_extraido = (d.get("status") or "").strip().lower()
+                        if status_extraido.startswith("perdido"):
+                            try:
+                                _, deal_perdido = buscar_pessoa_e_negocio(d["telefone"])
+                                if deal_perdido and deal_perdido.get("id"):
+                                    if mover_etapa_funil_comercial(deal_perdido["id"], ETAPA_PERDIDO_GENERICO):
+                                        print(f"[note] Status indica perda — negócio movido pra "
+                                              f"Perdido genérico deal={deal_perdido['id']}", flush=True)
+                            except Exception as e:
+                                print(f"[note] Erro ao mover negócio perdido conv={conversation_id}: {e}", flush=True)
+
             except Exception as e:
-                print(f"[disponibilidade] Erro ao checar/sugerir horário conv={conversation_id}: {e}", flush=True)
-
-        # Defesa final contra corrida entre threads (13/08): entre o momento
-        # em que uma thread foi disparada (checando "última msg é do lead")
-        # e o instante desta chamada, outra thread concorrente pode ter
-        # respondido primeiro e adicionado um turno "assistant" nesse mesmo
-        # histórico compartilhado — sem isso, a conversa termina no turno
-        # errado e a Messages API devolve resposta vazia sempre (mesmo
-        # sintoma do bug da Millela, 12/08, mas por concorrência entre
-        # threads, não por falta de segunda mensagem — caso real: [lead],
-        # conv=1753, 13/08, aconteceu 2x na mesma conversa). Roda sempre,
-        # não só no caminho de primeira mensagem, porque qualquer thread
-        # (retomada, conv_updated, mensagem normal) pode sofrer essa corrida.
-        if conv["messages"] and conv["messages"][-1]["role"] == "assistant":
-            print(f"[luca-bg] Turno assistant sobrando no final (corrida entre threads) "
-                  f"conv={conversation_id} — removido antes de chamar o Claude", flush=True)
-            conv["messages"].pop()
-        if not conv["messages"] or conv["messages"][-1]["role"] != "user":
-            print(f"[luca-bg] Abortado — sem turno 'user' pendente após limpeza conv={conversation_id}", flush=True)
-            return
-
-        # Corrigido 20/08: 300 tokens não deixava espaço pro raciocínio
-        # estendido do Sonnet 5 + a resposta de verdade — o modelo às vezes
-        # gastava tudo só "pensando" e nunca escrevia o texto (bug real,
-        # confirmado em produção: Leandro, Anderson, Giovanna e outros
-        # ficaram sem resposta nenhuma do Luca por causa disso). Sem custo
-        # extra: só paga pelo que realmente gera, max_tokens é só um teto.
-        reply = call_claude(conv["messages"], max_tokens=2000,
-                             system=conv["system"] + extra_disponibilidade, tipo="chat")
-
-        # Corrigido 01/09 (achado real do gestor: respostas instantâneas,
-        # mesmo as longas, soam como IA — um humano não digita um parágrafo
-        # em poucos segundos). O "digitando..." fica ligado até aqui e só
-        # desliga mais abaixo, depois do atraso proporcional ao tamanho do
-        # texto, logo antes do envio de verdade.
-
-        # Salva no histórico sem o contexto de retomada (para não poluir)
-        if retomada_ctx and conv["messages"] and conv["messages"][-1]["role"] == "user":
-            conv["messages"][-1] = {"role": "user", "content": message_text}
-
-        conv["messages"].append({"role": "assistant", "content": reply})
-
-        # Limita histórico a 40 turnos para não explodir tokens
-        if len(conv["messages"]) > 40:
-            conv["messages"] = conv["messages"][-40:]
-
-        # Marca o message_id respondido — impede o conv_updated de responder de novo
-        if message_id:
-            conv["last_responded_msg_id"] = message_id
-
-        # Última checagem antes do envio: se durante o processamento chegou
-        # mensagem mais nova (ou outra thread assumiu), desiste sem enviar.
-        if conv.get("latest_msg_token") != msg_token:
-            print(f"[luca-bg] Abortado antes do envio — thread mais recente assumiu conv={conversation_id}", flush=True)
-            return
-
-        # Checagem cross-worker: consulta a API para ver se alguém (outro worker,
-        # outra instância ou um humano) já respondeu esta mensagem do lead.
-        # Em mensagens normais, 1 resposta existente já bloqueia o envio.
-        # Na primeira mensagem, tolera-se 1 outgoing (o template de boas-vindas
-        # é esperado antes do Luca); 2 ou mais indicam duplicata.
-        if message_id:
-            limite = 2 if is_first_message else 1
-            respostas = conta_respostas_apos(conversation_id, message_id)
-            if respostas >= limite:
-                print(f"[luca-bg] Abortado — {respostas} resposta(s) já existem após msg={message_id} conv={conversation_id}", flush=True)
-                return
-
-        # ── Envia resposta de volta ao AgendorChat ────────────────────────────
-        reply = remover_travessao(reply)
-
-        # Atraso proporcional ao tamanho, simulando tempo real de digitação —
-        # sem isso, mensagens longas saindo em poucos segundos soam como IA.
-        # ~45ms por caractere (~22 caracteres/s, digitação humana rápida no
-        # celular), limitado entre 1.5s e 12s pra não parecer trava nem demora
-        # exagerada.
-        atraso_digitacao = min(max(len(reply) * 0.045, 1.5), 12)
-        time.sleep(atraso_digitacao)
-
-        toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
-        send_agendorchat_message(conversation_id, reply)
-        # Marca o início da espera por resposta do lead — usado pelo follow-up de 1h
-        conv["luca_aguardando_desde"] = time.time()
-        conv["contact_name_cache"] = contact_name
-
-        # ── Nota interna — dados completos ou conversa encerrada ─────────────
-        # Gateado: só roda a extração enquanto o ciclo do CRM ainda não foi
-        # fechado. Antes rodava em TODA mensagem, mesmo depois de já ter
-        # tudo completo e registrado — puro desperdício de chamada à API.
-        try:
-            # Corrigido 08/09 ([gestor], caso real: Amanda, deal=45426505):
-            # antes, uma vez que "note_sent" virasse True (mesmo que por um
-            # encerramento prematuro/falso-positivo), a extração parava de
-            # rodar pra sempre e "registrar_no_crm" nunca mais era chamado
-            # de novo — mesmo que o lead completasse e-mail/horário depois.
-            # Agora só para de tentar quando o ciclo do CRM está DE FATO
-            # fechado (conv["crm_registrado"], que só vira True quando a
-            # nota E a reunião real — se havia preferência — já existem).
-            if conv.get("crm_registrado"):
-                d = conv["lead_data"]
-            else:
-                lead_data = extract_lead_data(conv["messages"], contact_name)
-                if lead_data:
-                    conv["lead_data"].update({k: v for k, v in lead_data.items() if v})
-                d = conv["lead_data"]
-
-                dados_completos = (
-                    d.get("nome") and d.get("nome") != "Não informado"
-                    and d.get("segmento") and d.get("segmento") != "Não identificado"
-                    and d.get("necessidade") and d.get("necessidade") != "Não informada"
-                    and d.get("email") and d.get("email") != "Não informado"
-                    # Corrigido em 17/08: exigir só "preferencia" não-vazia
-                    # deixava respostas vagas ("Qualquer dia") fecharem o
-                    # ciclo cedo demais — como o fechamento só acontece UMA
-                    # vez (note_sent), quando o lead dizia o dia/horário
-                    # exato minutos depois, o sistema já tinha "carimbado"
-                    # a conversa como concluída e NUNCA criava a reunião real
-                    # no Teams (caso real: [lead], 17/08 — ficou só com
-                    # uma tarefa "HORÁRIO A CONFIRMAR", sem link nenhum).
-                    # Usa o filtro barato (parece_ter_horario, regex, sem
-                    # Claude) primeiro — só chama parse_preferencia_datetime
-                    # (que usa Claude) quando já parece ter chance real de
-                    # ser concreto, evitando gastar uma chamada em toda
-                    # mensagem enquanto o lead ainda está respondendo vago.
-                    and d.get("preferencia")
-                    and parece_ter_horario(d.get("preferencia"))
-                    and parse_preferencia_datetime(d.get("preferencia")) is not None
-                )
-
-                # Corrigido 08/09 ([gestor], mesmo caso da Amanda): removido
-                # "acompanhamento" desta lista — é uma palavra comum demais
-                # no nosso domínio (ex: "...cuida de todo o acompanhamento
-                # contábil..."), aparecia no meio de frases sem NENHUMA
-                # relação com o fim da conversa e fechava o ciclo cedo
-                # demais, sem e-mail nem horário real ainda.
-                termos_encerramento = ["sinal verde", "é só me avisar", "estou por aqui"]
-                conversa_encerrada = any(t in reply.lower() for t in termos_encerramento)
-
-                if not conv.get("note_sent") and (dados_completos or conversa_encerrada) and not conv.get("modo_demo"):
-                    d["telefone"] = conv.get("phone") or d.get("telefone", "Não informado")
-                    note_text = build_lead_note(d)
-                    send_private_note(conversation_id, note_text)
-                    conv["note_sent"] = True
-                    print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
-
-                # Corrigido 08/09 ([gestor]): antes só tentava fechar o ciclo
-                # no CRM UMA vez, junto com o envio da nota — se faltasse
-                # e-mail/horário real nesse momento, a reunião de verdade
-                # nunca mais era tentada. Agora tenta de novo a cada
-                # mensagem (uma vez que já tenha e-mail e preferência),
-                # até o ciclo fechar de verdade — registrar_no_crm é
-                # idempotente (marcadores duráveis) e sabe sozinho o que
-                # já foi feito.
-                if (dados_completos or (conv.get("note_sent") and d.get("email") and d.get("preferencia"))) \
-                   and not conv.get("modo_demo"):
-                    registrar_no_crm(conv, conversation_id, contact_name)
-
-                    # Corrigido em 18/08 (bug real, confirmado em produção): o
-                    # campo "status" às vezes vem "Perdido para concorrente"
-                    # (a IA reconhece a perda pelo texto, ex: "já segui com
-                    # outra empresa"), mas isso ficava só escrito no
-                    # resumo/nota — nada movia a etapa de verdade no funil
-                    # (caso real: [lead], deal=44854914, 18/08, ficou
-                    # preso em "Novo Lead" mesmo marcado como perdido na
-                    # nota). Agora, se o status indicar perda, move pra
-                    # "Perdido" genérico de verdade.
-                    status_extraido = (d.get("status") or "").strip().lower()
-                    if status_extraido.startswith("perdido"):
-                        try:
-                            _, deal_perdido = buscar_pessoa_e_negocio(d["telefone"])
-                            if deal_perdido and deal_perdido.get("id"):
-                                if mover_etapa_funil_comercial(deal_perdido["id"], ETAPA_PERDIDO_GENERICO):
-                                    print(f"[note] Status indica perda — negócio movido pra "
-                                          f"Perdido genérico deal={deal_perdido['id']}", flush=True)
-                        except Exception as e:
-                            print(f"[note] Erro ao mover negócio perdido conv={conversation_id}: {e}", flush=True)
-
-        except Exception as e:
-            print(f"[note] Erro ao processar nota: {e}", flush=True)
+                print(f"[note] Erro ao processar nota: {e}", flush=True)
 
     except Exception as e:
         print(f"[luca-bg] Erro conv={conversation_id}: {e}", flush=True)
