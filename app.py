@@ -3455,9 +3455,23 @@ def telefone_da_pessoa(person_id):
     completasse o dado depois. Agora só guarda em cache quando ENCONTRA um
     telefone de verdade (isso raramente muda, cache faz sentido). Quando
     não encontra nenhum, não guarda nada — reconfere na próxima varredura,
-    então assim que o dado for completado no CRM, a próxima rodada já pega."""
+    então assim que o dado for completado no CRM, a próxima rodada já pega.
+
+    Corrigido em 16/09 ([gestor], bug real, confirmado com a API ao vivo:
+    Adriana person=71376890, Rogério person=71418906, Jose Luis
+    person=71421245 — todos com o telefone preenchido SÓ no campo
+    "Telefone comercial" do Agendor, e nenhum outro): o campo que a API
+    devolve pra isso se chama "work", não "workPhone" nem "phone" (esses
+    dois nomes nunca existiram na resposta real — bug desde sempre, só não
+    tinha aparecido porque a maioria dos leads também tem o campo
+    "whatsapp" preenchido, que vem primeiro na lista e mascarava o
+    problema). Também ampliado o backoff entre tentativas de 3s pra 5s,
+    dobrando a cada nova tentativa: 3 tentativas em 3s cada não davam
+    tempo do limite de taxa do Agendor liberar de novo (caso real:
+    Beatriz person=71299871, mesma pessoa, 429 dois dias seguidos)."""
     if person_id in _phone_cache:
         return _phone_cache[person_id]
+    espera = 5
     for attempt in range(3):
         try:
             r = requests.get(f"{AGENDOR_BASE}/people/{person_id}", headers=HEADERS, timeout=15)
@@ -3466,7 +3480,7 @@ def telefone_da_pessoa(person_id):
             r.raise_for_status()
             data = r.json().get("data", {}) or {}
             contato = data.get("contact") or {}
-            for campo in ("whatsapp", "mobile", "phone", "workPhone"):
+            for campo in ("whatsapp", "mobile", "work"):
                 valor = (contato.get(campo) or "").strip()
                 if valor:
                     _phone_cache[person_id] = valor
@@ -3475,7 +3489,8 @@ def telefone_da_pessoa(person_id):
         except Exception as e:
             print(f"[lembrete] Tentativa {attempt+1}/3 falhou (telefone) person={person_id}: {e}", flush=True)
             if attempt < 2:
-                time.sleep(3)
+                time.sleep(espera)
+                espera *= 2
     return ""  # esgotou tentativas — NÃO guarda no cache, tenta de novo na próxima rodada
 
 
