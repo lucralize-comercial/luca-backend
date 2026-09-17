@@ -3482,9 +3482,27 @@ def telefone_da_pessoa(person_id):
             contato = data.get("contact") or {}
             for campo in ("whatsapp", "mobile", "work"):
                 valor = (contato.get(campo) or "").strip()
-                if valor:
-                    _phone_cache[person_id] = valor
-                    return valor
+                if not valor:
+                    continue
+                # Corrigido 17/09 ([gestor], bug real, confirmado com a API
+                # ao vivo: person=71577483 — RD Station mandou o WhatsApp
+                # incompleto na criação (sem o 9º dígito, sem +55), o CRM
+                # corrigiu isso ~3h30 depois, mas como o valor incompleto
+                # não era vazio, o cache (corrigido em 14/09 só pro caso
+                # vazio) guardou ele mesmo assim e nunca mais reconferiu —
+                # 15 chamadas idênticas confirmadas em produção. Diferente
+                # de "vazio", "incompleto" precisa de uma checagem de
+                # sanidade: campo "whatsapp" é sempre celular (nunca fixo),
+                # então sempre tem 9 dígitos locais (11 com DDD, 13 com
+                # +55) — se vier mais curto, é sinal de dado ainda
+                # incompleto (não confia nem cacheia, tenta de novo depois).
+                digitos = "".join(c for c in valor if c.isdigit())
+                if campo == "whatsapp" and len(digitos) not in (11, 13):
+                    print(f"[lembrete] WhatsApp incompleto ({valor}, {len(digitos)} dígitos) "
+                          f"person={person_id} — ignorando por ora, não cacheia", flush=True)
+                    continue
+                _phone_cache[person_id] = valor
+                return valor
             return ""  # resposta válida, mas sem telefone preenchido AINDA — não guarda, reconfere depois
         except Exception as e:
             print(f"[lembrete] Tentativa {attempt+1}/3 falhou (telefone) person={person_id}: {e}", flush=True)
