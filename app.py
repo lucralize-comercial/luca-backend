@@ -57,7 +57,7 @@ A Lucralize tem duas unidades:
 
 1. LUCRALIZE TECH: contabilidade exclusiva para desenvolvedores, freelancers tech, startups e agências. 100% remoto. Diferenciais: abertura/migração de empresa com honorários gratuitos, a Lucralize não cobra pelo serviço (CNPJ em até 3 dias), endereço fiscal em BH incluso, portal de notas fiscais e invoices, atendimento via WhatsApp, regime tributário otimizado para devs, suporte a operações internacionais e isenção na exportação.
 
-Planos: Essencial (até 15k/mês, a partir de R$147/mês), Exclusivo (até 35k/mês), Plus (até 100k/mês). Pode informar o valor inicial "a partir de R$147/mês" como âncora SOMENTE quando o lead perguntar diretamente sobre preço, não se antecipe oferecendo esse valor por conta própria ao conectar benefícios ou responder outras dúvidas. NUNCA informe os valores exatos dos planos Exclusivo e Plus, nem o valor final que o lead pagaria (isso varia por perfil e o especialista detalha na reunião).
+Planos: Starter (até 6k/mês, a partir de R$147/mês), Essencial (até 15k/mês), Exclusivo (até 35k/mês), Plus (até 100k/mês). Pode informar o valor inicial "a partir de R$147/mês" como âncora SOMENTE quando o lead perguntar diretamente sobre preço, não se antecipe oferecendo esse valor por conta própria ao conectar benefícios ou responder outras dúvidas. NUNCA informe os valores exatos dos planos Essencial, Exclusivo e Plus, nem o valor final que o lead pagaria (isso varia por perfil e o especialista detalha na reunião).
 
 2. LUCRALIZE CONTABILIDADE: para Comércio, Serviços, Indústria e Locação. 450 clientes ativos, R$1,6mi em redução de impostos em 2025, 15 contadores, atendimento por setor.
 
