@@ -2606,6 +2606,29 @@ def agendorchat_webhook():
             if phone:
                 _, deal = buscar_pessoa_e_negocio(phone)
                 if deal:
+                    # Corrigido 18/09 ([gestor], bug real: CCT Automação —
+                    # serviço separado que usa o MESMO inbox 2367 do
+                    # AgendorChat pra mandar templates. Quando um envio do
+                    # CCT falhava, esse handler aplicava o padrão do Luca
+                    # (mover pra "Perdido") só porque a pessoa/telefone
+                    # também tinha um negócio ativo no Funil Comercial —
+                    # mesmo a falha não tendo nada a ver com o Luca. Defesa
+                    # dupla: só atua se o negócio for mesmo do Funil
+                    # Comercial E a mensagem que falhou tiver sido enviada
+                    # pelo próprio fluxo de follow-up do Luca (identificado
+                    # pelo marcador [followup:aguardando_confirmacao:...]
+                    # que só o Luca cria).
+                    funil_atual_id_falha = ((deal.get("dealStage") or {}).get("funnel") or {}).get("id")
+                    veio_do_followup = any(
+                        "[followup:aguardando_confirmacao:" in (m.get("content") or "")
+                        and f":{msg_id}]" in (m.get("content") or "")
+                        for m in msgs
+                    )
+                    if funil_atual_id_falha != FUNIL_COMERCIAL_ID and not veio_do_followup:
+                        print(f"[msg_falhou] Ignorado — negócio fora do Funil Comercial "
+                              f"(funil={funil_atual_id_falha}) e mensagem não veio do follow-up "
+                              f"do Luca conv={conversation_id} msg={msg_id}", flush=True)
+                        return jsonify({}), 200
                     if eh_falha_temporaria:
                         # Provavelmente número válido, só uma falha temporária
                         # (limite de engajamento OU saldo insuficiente) — não
