@@ -1429,7 +1429,14 @@ def parse_preferencia_datetime(preferencia: str, tipo: str = "agendamento"):
             "ISO exato AAAA-MM-DDTHH:MM (ex: 2026-07-15T10:00), usando a data atual acima como "
             "referência. IMPORTANTE: o horário na preferência já está no horário local de "
             "Brasília (BRT) — responda no MESMO horário local, sem converter para UTC nem "
-            "aplicar nenhum deslocamento de fuso. Se a preferência não tiver informação "
+            "aplicar nenhum deslocamento de fuso. CRÍTICO: se a preferência mencionar só um "
+            "período vago do dia (ex: 'de manhã', 'à tarde', 'à noite') SEM uma hora exata "
+            "dentro desse período, isso NÃO é informação suficiente — responda INDEFINIDA. "
+            "NUNCA invente/chute uma hora específica dentro de um período vago (caso real "
+            "confirmado: lead disse só 'quarta de manhã', o modelo chutou 9h sem o lead ter "
+            "pedido isso, e uma reunião real foi criada e confirmada nesse horário inventado, "
+            "enquanto o lead ainda ia especificar a hora exata em seguida). Se a preferência "
+            "não tiver informação "
             "suficiente para determinar data e hora, responda apenas INDEFINIDA.\n"
             "Responda APENAS o ISO ou INDEFINIDA, nada mais.\n\n"
             f"Preferência: {preferencia}"
@@ -2346,8 +2353,18 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
             # a agenda" (mantém a regra do SYSTEM_PROMPT sobre isso). Filtro
             # regex barato evita chamar o Claude (parse_preferencia_datetime)
             # em mensagem que claramente não menciona horário.
+            #
+            # Corrigido 21/09 ([gestor], bug real: Jade, 21/09 16:46 — depois
+            # da reunião real já criada e do link mandado, ela respondeu "9h"
+            # de novo e o Luca checou a agenda outra vez, achou o PRÓPRIO
+            # evento que tinha acabado de criar pra ela e sugeriu horário
+            # alternativo pra ela mesma, como se o horário dela já estivesse
+            # ocupado por outra pessoa). Pula essa checagem inteira quando o
+            # ciclo do CRM já fechou de verdade pra esse negócio (a reunião
+            # real já foi criada) — nesse ponto o horário já está confirmado
+            # e definitivo, não faz sentido reconferir.
             extra_disponibilidade = ""
-            if parece_ter_horario(message_text):
+            if parece_ter_horario(message_text) and not conv.get("crm_registrado"):
                 try:
                     dt_iso_tentativa = parse_preferencia_datetime(message_text, tipo="disponibilidade")
                     if dt_iso_tentativa:
