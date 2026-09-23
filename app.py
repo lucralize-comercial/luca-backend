@@ -8,6 +8,8 @@ import os
 import time
 import threading
 import json
+import hmac
+import hashlib
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
@@ -24,6 +26,61 @@ AGENDOR_TOKEN = os.environ.get("AGENDOR_TOKEN", "")  # CONFIGURE via variável d
 # antes de processar qualquer coisa.
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 AGENDAR_API_KEY = os.environ.get("AGENDAR_API_KEY", "")
+
+# Adicionado 22/09 ([gestor]): o suporte do Agendor confirmou que agora
+# TODA notificação de webhook vem assinada de verdade (HMAC-SHA256), nos
+# headers X-Agendor-Signature e X-Agendor-Timestamp — substitui o esquema
+# de "chave na URL" acima, que era só um contorno nosso enquanto isso não
+# existia. Cada webhook tem sua PRÓPRIA chave (gerada em Configurações >
+# Integrações > Webhooks > editar > "Chave de assinatura") — por isso são
+# duas variáveis separadas, uma por rota.
+AGENDOR_SIGNING_KEY_WEBHOOK = os.environ.get("AGENDOR_SIGNING_KEY_WEBHOOK", "")
+AGENDOR_SIGNING_KEY_CONV_UPDATED = os.environ.get("AGENDOR_SIGNING_KEY_CONV_UPDATED", "")
+JANELA_TIMESTAMP_SEGUNDOS = 300  # 5 minutos, valor sugerido pelo suporte
+
+def validar_assinatura_webhook(chave_assinatura: str) -> bool:
+    """Valida a assinatura HMAC-SHA256 real do webhook, seguindo exatamente
+    o algoritmo confirmado pelo suporte do Agendor em 22/09:
+    mensagem = timestamp + "." + corpo_bruto
+    assinatura = "sha256=" + hex(HMAC_SHA256(chave, mensagem))
+
+    Usa o corpo BRUTO (request.get_data(), antes de qualquer parse pra
+    JSON) — reserializar o JSON pra calcular a assinatura é o erro mais
+    comum nesse tipo de validação (ordem de chaves/escape podem mudar o
+    byte a byte mesmo com o mesmo conteúdo lógico, e a assinatura bate
+    errado mesmo sendo uma notificação legítima).
+
+    Se a chave de assinatura ainda não estiver configurada (transição),
+    cai pro esquema antigo (chave na URL) — assim nada quebra enquanto a
+    chave nova não for cadastrada no Railway."""
+    if not chave_assinatura:
+        return validar_webhook_secret()  # esquema antigo, enquanto a chave nova não existe
+
+    assinatura_recebida = request.headers.get("X-Agendor-Signature", "")
+    timestamp_recebido = request.headers.get("X-Agendor-Timestamp", "")
+    if not assinatura_recebida or not timestamp_recebido:
+        print("[auth] Webhook sem headers de assinatura (X-Agendor-Signature/Timestamp)", flush=True)
+        return False
+
+    try:
+        timestamp_int = int(timestamp_recebido)
+    except ValueError:
+        print(f"[auth] X-Agendor-Timestamp inválido: {timestamp_recebido}", flush=True)
+        return False
+
+    agora = int(time.time())
+    if abs(agora - timestamp_int) > JANELA_TIMESTAMP_SEGUNDOS:
+        print(f"[auth] Timestamp fora da janela aceitável (recebido={timestamp_recebido}, "
+              f"agora={agora}, diferença={abs(agora - timestamp_int)}s)", flush=True)
+        return False
+
+    corpo_bruto = request.get_data()  # bytes crus, como o Agendor mandou de verdade
+    mensagem = f"{timestamp_recebido}.".encode() + corpo_bruto
+    esperado = "sha256=" + hmac.new(
+        chave_assinatura.encode(), mensagem, hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(esperado, assinatura_recebida)
 
 def validar_webhook_secret() -> bool:
     """Confere a chave compartilhada (?chave=... na URL) configurada no
@@ -2583,8 +2640,8 @@ def agendorchat_webhook():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp, 200
 
-    if not validar_webhook_secret():
-        print("[auth] Webhook rejeitado — chave ausente ou incorreta", flush=True)
+    if not validar_assinatura_webhook(AGENDOR_SIGNING_KEY_WEBHOOK):
+        print("[auth] Webhook rejeitado — assinatura ausente ou incorreta", flush=True)
         return jsonify({"error": "não autorizado"}), 401
 
     try:
@@ -3317,8 +3374,8 @@ def agendorchat_conversation_updated():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp, 200
 
-    if not validar_webhook_secret():
-        print("[auth] Webhook (conversation-updated) rejeitado — chave ausente ou incorreta", flush=True)
+    if not validar_assinatura_webhook(AGENDOR_SIGNING_KEY_CONV_UPDATED):
+        print("[auth] Webhook (conversation-updated) rejeitado — assinatura ausente ou incorreta", flush=True)
         return jsonify({"error": "não autorizado"}), 401
 
     try:
