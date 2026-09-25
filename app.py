@@ -2209,8 +2209,8 @@ Campos de DADOS DO LEAD (extração direta, factual):
 "contador_atual" = "Sim" ou "Não" se o lead mencionou ter contador atualmente; inclua o motivo de troca só se ele disse explicitamente (ex: "Sim, mas contador demora pra responder").
 
 Campos de INTELIGÊNCIA COMERCIAL (exigem mais cuidado — só preencha com evidência clara e literal na conversa):
-"objetivo" = o RESULTADO que o lead espera alcançar (ex: "Abrir um CNPJ", "Trocar de contabilidade", "Reduzir carga tributária", "Entender melhor enquadramento").
-"necessidade" = o MOTIVO/gatilho que levou o lead a procurar a Lucralize agora (ex: "Cliente passou a exigir nota fiscal", "Contador demora pra responder"). Diferente de "objetivo": motivo é a causa, objetivo é o resultado desejado.
+"objetivo" = o RESULTADO que o lead espera alcançar (ex: "Abrir um CNPJ", "Trocar de contabilidade", "Reduzir carga tributária", "Entender melhor enquadramento"). Se o lead deixar claro que o contato foi um ENGANO/mal-entendido (ex: confundiu a Lucralize com outro tipo de empresa, tipo "achei que fosse de empréstimo"), preencha com o que ele realmente queria, deixando claro que não tem relação com contabilidade (ex: "Conseguir um empréstimo (contatou a empresa errada por engano)") — não deixe em branco só porque o objetivo real não é relevante pro nosso negócio.
+"necessidade" = o MOTIVO/gatilho que levou o lead a procurar a Lucralize agora (ex: "Cliente passou a exigir nota fiscal", "Contador demora pra responder"). Diferente de "objetivo": motivo é a causa, objetivo é o resultado desejado. No mesmo caso de engano/mal-entendido acima, registre isso aqui também (ex: "Achou que a empresa fosse de empréstimo (mal-entendido, não tinha motivo real de contabilidade)"), em vez de deixar em branco.
 "duvida_principal" = a dúvida ou preocupação específica que o lead levantou (ex: "quanto vai pagar de imposto").
 "dor_identificada" = só preencha se o lead expressou uma insatisfação ou problema de forma EXPLÍCITA (ex: lead disse "meu contador nunca responde"). NUNCA infira dor a partir do tom geral da conversa — se não houver uma frase clara indicando isso, deixe em branco.
 "urgencia" = "Alta", "Média" ou "Baixa" — só preencha se houver sinal EXPLÍCITO de prazo/pressa (ex: lead disse "preciso disso essa semana" = Alta). Sem sinal claro de tempo, deixe em branco — não deduza urgência pelo tom.
@@ -5037,6 +5037,24 @@ def verificar_followup_dias_silencio():
                     # não move mais a etapa (ver webhook message_updated) —
                     # aqui é onde a régua detecta isso e tenta de novo,
                     # assim que essa mesma varredura rodar.
+                    #
+                    # Corrigido 25/09 ([gestor], bug real: deal=45765677,
+                    # mesmo número falhando com 131049 em 5 tentativas
+                    # seguidas ao longo de 24h, sem nenhum limite — o
+                    # sistema ia continuar tentando pra sempre, porque o
+                    # retry assume que 131049/saldo é sempre passageiro. Pra
+                    # ESSE número específico não estava sendo: teto de 3
+                    # tentativas — na 4ª falha seguida, para de reenviar
+                    # sozinho e sinaliza pra verificação manual, em vez de
+                    # insistir pra sempre sem sucesso.
+                    if len(candidatos_pendentes) >= 3:
+                        send_private_note(conversation_id,
+                            f"⚠️ Follow-up {tag} falhou 3 vezes seguidas (motivo temporário, "
+                            f"tipo limite de engajamento ou saldo) — parando de reenviar "
+                            f"automaticamente. Precisa de verificação manual.")
+                        print(f"[followup_dias] {tag} falhou 3x seguidas deal={deal_id} — "
+                              f"parou de reenviar, precisa de verificação manual", flush=True)
+                        continue
                     print(f"[followup_dias] {tag} tinha falhado (mensagem anterior não entregue) "
                           f"deal={deal_id} — tentando reenviar", flush=True)
                     enviado, _msg_id = enviar_followup_dia(conversation_id, deal_id, phone, tag, nome)
