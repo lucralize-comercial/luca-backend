@@ -577,6 +577,91 @@ def parece_ter_horario(texto: str) -> bool:
     return bool(PADRAO_HORARIO.search(texto or ""))
 
 
+# Corrigido 25/09 ([gestor], bug real: Matheus, cliente existente que
+# respondeu a um template de migração de cartão do CCT Automação — serviço
+# separado, mesmo inbox 2367 — e o Luca tratou como lead novo, perguntando
+# segmento e CNPJ, sem saber que a conversa tinha sido provocada por nós
+# mesmos numa campanha pra cliente).
+#
+# Lógica é uma LISTA FECHADA do que É do Luca (não uma lista do que É do
+# CCT) — de propósito: se listássemos os templates do CCT um por um, um
+# template novo que a equipe criar no futuro (convite, aviso, etc.) não
+# seria reconhecido e o bug voltaria a acontecer. Com a lista fechada dos
+# templates do PRÓPRIO Luca, qualquer template que não seja um desses é
+# tratado como campanha externa automaticamente, sem precisar saber o
+# nome dele de antemão.
+TEMPLATES_PROPRIOS_LUCA = (
+    "boas_vindas_primeiro_contato",
+    "followup_silencio_d1_tech", "followup_silencio_d3_tech", "followup_silencio_d5_tech",
+    "followup_silencio_d7_tech", "followup_silencio_d10_tech",
+    "lembrete_reuniao_amanha", "lembrete_reuniao_amanha_hora",
+)
+# Só os dois assuntos abaixo têm instrução ESPECÍFICA (mais precisa, porque
+# sabemos exatamente do que se trata). Qualquer outro template que não seja
+# do Luca cai no fallback genérico logo depois.
+TEMPLATES_CCT_MIGRACAO = ("lucralize_tech_migracao_cc",)
+TEMPLATES_CCT_INDICACAO = ("lucralize_tech_indicacao_premiada", "lucralize_tech_indicacao_premiada_v2")
+
+def contexto_campanha_cct(conversation_id) -> str:
+    """Se a mensagem de saída mais recente da conversa (antes da resposta
+    atual do lead) foi um template que NÃO é do Luca, retorna uma instrução
+    extra pra injetar no prompt desta resposta, fazendo o Luca acolher o
+    cliente NAQUELE assunto em vez de tratar como lead novo. Regra do
+    [gestor], 25/09: "sempre que nós provocamos um cliente a uma ação,
+    acolhemos ali mesmo" — só direciona pro canal oficial se o cliente
+    trouxer uma demanda diferente. Retorna "" se a mensagem de saída mais
+    recente for do próprio Luca (ou não houver nenhuma)."""
+    try:
+        msgs = mensagens_da_conversa(conversation_id)
+    except Exception as e:
+        print(f"[cct-contexto] Erro ao checar campanha externa conv={conversation_id}: {e}", flush=True)
+        return ""
+    for m in reversed(msgs or []):
+        if m.get("message_type") != 1:  # só olha mensagens de SAÍDA
+            continue
+        nome_template = ((m.get("additional_attributes") or {}).get("template_params") or {}).get("name", "")
+        if not nome_template or nome_template in TEMPLATES_PROPRIOS_LUCA:
+            return ""  # template do próprio Luca (ou mensagem livre) — segue o fluxo normal
+        if nome_template in TEMPLATES_CCT_MIGRACAO:
+            print(f"[cct-contexto] Template de migração detectado conv={conversation_id}", flush=True)
+            return (
+                "\n\n[CONTEXTO IMPORTANTE: Este é um CLIENTE JÁ EXISTENTE da Lucralize Tech. Ele está "
+                "respondendo a uma mensagem que NÓS enviamos (não você) sobre migrar a forma de "
+                "pagamento pra cartão de crédito recorrente. NÃO trate como lead novo — não pergunte "
+                "segmento, CNPJ, nem rode o roteiro de qualificação comercial. Acolha a resposta dele "
+                "NESSE ASSUNTO: confirme que vai ajudar com a migração, e diga que vai confirmar o link "
+                "certinho e retornar por aqui em breve (não prometa enviar o link agora — isso depende "
+                "de outra equipe). Só direcione pro canal oficial de atendimento se ele trouxer uma "
+                "demanda DIFERENTE, sem relação com a migração.]"
+            )
+        if nome_template in TEMPLATES_CCT_INDICACAO:
+            print(f"[cct-contexto] Template de indicação detectado conv={conversation_id}", flush=True)
+            return (
+                "\n\n[CONTEXTO IMPORTANTE: Este é um CLIENTE JÁ EXISTENTE da Lucralize Tech. Ele está "
+                "respondendo a uma mensagem que NÓS enviamos (não você) sobre o programa de Indicação "
+                "Premiada. NÃO trate como lead novo — não pergunte segmento, CNPJ, nem rode o roteiro "
+                "de qualificação comercial. Acolha a resposta dele NESSE ASSUNTO: pergunte se ele tem "
+                "alguém pra indicar, e explique o benefício se perguntado (quem indica e quem é "
+                "indicado ganham isenção da primeira mensalidade). Só direcione pro canal oficial de "
+                "atendimento se ele trouxer uma demanda DIFERENTE, sem relação com indicação.]"
+            )
+        # Template que não reconhecemos (nem do Luca, nem migração/indicação
+        # conhecidas) — fallback genérico, cobre qualquer campanha nova
+        # (convite, aviso, etc.) sem precisar saber o nome dela de antemão.
+        print(f"[cct-contexto] Template desconhecido tratado como campanha externa "
+              f"conv={conversation_id} nome={nome_template}", flush=True)
+        return (
+            "\n\n[CONTEXTO IMPORTANTE: Este é um CLIENTE JÁ EXISTENTE da Lucralize Tech. Ele está "
+            "respondendo a uma mensagem que NÓS enviamos (não você), de uma campanha cujo assunto "
+            "exato você não tem aqui. NÃO trate como lead novo — não pergunte segmento, CNPJ, nem "
+            "rode o roteiro de qualificação comercial. Pergunte educadamente sobre o que ele gostaria "
+            "de saber ou fazer em relação à mensagem que recebeu, e ajude com isso dentro do possível. "
+            "Só direcione pro canal oficial de atendimento se perceber que é uma demanda de suporte "
+            "totalmente distinta, sem relação com a mensagem que recebeu.]"
+        )
+    return ""
+
+
 def buscar_eventos_do_dia_organizador(dt_dia: datetime) -> list:
     """Busca os eventos reais do dia inteiro na agenda do organizador
     ([especialista]) via Microsoft Graph — 1 chamada só, depois os slots livres
@@ -2421,6 +2506,7 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
             # real já foi criada) — nesse ponto o horário já está confirmado
             # e definitivo, não faz sentido reconferir.
             extra_disponibilidade = ""
+            extra_disponibilidade += contexto_campanha_cct(conversation_id)
             if parece_ter_horario(message_text) and not conv.get("crm_registrado"):
                 try:
                     dt_iso_tentativa = parse_preferencia_datetime(message_text, tipo="disponibilidade")
