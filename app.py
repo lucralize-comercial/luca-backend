@@ -619,10 +619,25 @@ def contexto_campanha_cct(conversation_id) -> str:
     for m in reversed(msgs or []):
         if m.get("message_type") != 1:  # só olha mensagens de SAÍDA
             continue
-        nome_template = ((m.get("additional_attributes") or {}).get("template_params") or {}).get("name", "")
-        if not nome_template or nome_template in TEMPLATES_PROPRIOS_LUCA:
-            return ""  # template do próprio Luca (ou mensagem livre) — segue o fluxo normal
-        if nome_template in TEMPLATES_CCT_MIGRACAO:
+        template_params = (m.get("additional_attributes") or {}).get("template_params")
+        if not template_params:
+            return ""  # mensagem livre, sem template nenhum — segue o fluxo normal
+        # Corrigido 28/09 ([gestor], bug real: Igor, deal migração de cartão
+        # — o template do CCT vem SEM o campo "name" (só "id" e "meta"),
+        # diferente dos templates do próprio Luca (que sempre têm "name").
+        # Antes, template sem "name" caía junto com "mensagem livre" e o
+        # CCT passava despercebido. Agora: só é "mensagem livre" quando
+        # template_params nem existe — se existe mas não tem nome
+        # reconhecido, é tratado como campanha externa (cai no fallback
+        # genérico abaixo, já que não dá pra saber qual campanha por nome).
+        nome_template = template_params.get("name", "")
+        if nome_template in TEMPLATES_PROPRIOS_LUCA:
+            return ""  # template do próprio Luca — segue o fluxo normal
+        # O CCT não manda "name", mas manda o texto de exemplo do template
+        # em template_params.meta.example — usa como segundo critério pra
+        # identificar qual campanha é, mesmo sem o nome.
+        texto_exemplo = ((template_params.get("meta") or {}).get("example") or "").upper()
+        if nome_template in TEMPLATES_CCT_MIGRACAO or "AINDA NÃO MIGROU" in texto_exemplo:
             print(f"[cct-contexto] Template de migração detectado conv={conversation_id}", flush=True)
             return (
                 "\n\n[CONTEXTO IMPORTANTE: Este é um CLIENTE JÁ EXISTENTE da Lucralize Tech. Ele está "
@@ -634,7 +649,7 @@ def contexto_campanha_cct(conversation_id) -> str:
                 "de outra equipe). Só direcione pro canal oficial de atendimento se ele trouxer uma "
                 "demanda DIFERENTE, sem relação com a migração.]"
             )
-        if nome_template in TEMPLATES_CCT_INDICACAO:
+        if nome_template in TEMPLATES_CCT_INDICACAO or "INDICAÇÃO PREMIADA" in texto_exemplo:
             print(f"[cct-contexto] Template de indicação detectado conv={conversation_id}", flush=True)
             return (
                 "\n\n[CONTEXTO IMPORTANTE: Este é um CLIENTE JÁ EXISTENTE da Lucralize Tech. Ele está "
