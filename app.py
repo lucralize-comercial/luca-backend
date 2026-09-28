@@ -3302,6 +3302,22 @@ def tentar_retomar_conversa(conversation_id: int, origem: str = "conv_updated") 
 
         detalhe = get_conversation_details(conversation_id) or {}
         meta = detalhe.get("meta") or {}
+
+        # Corrigido 28/09 ([gestor], bug real: Daniela, conv=2371 — Ronaldo
+        # atribuiu a conversa explicitamente pro Everton Pereira, e 5
+        # segundos depois o Luca "assumiu de volta" sozinho e continuou o
+        # roteiro comercial, por cima da atribuição humana. A função nunca
+        # checava quem estava atribuído NO MOMENTO antes de assumir — só
+        # checava se a última mensagem do lead já tinha resposta do Luca.
+        # Reaproveita eh_assignee_bot (já existe, usada com outro propósito)
+        # pra não assumir quando o responsável atual é um humano de verdade
+        # (diferente do próprio Luca ou do dono padrão do CRM).
+        assignee_atual = meta.get("assignee")
+        if assignee_atual and not eh_assignee_bot(assignee_atual):
+            print(f"[retomada:{origem}] IGNORADO — conversa atribuída a humano "
+                  f"({assignee_atual.get('name')}) conv={conversation_id}", flush=True)
+            return False
+
         sender_info = meta.get("sender") or {}
         contact_name = sender_info.get("name", "")
         contact_phone = sender_info.get("phone_number", "")
