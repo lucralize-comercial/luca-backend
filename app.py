@@ -1557,6 +1557,27 @@ def resolver_campo_agendada_por():
     return _campo_agendada_por_cache
 
 
+PADRAO_HORA_EXPLICITA = re.compile(r"\b(\d{1,2})\s?[:h]\s?(\d{2})?\b", re.IGNORECASE)
+
+def extrair_hora_explicita(texto: str):
+    """Extrai (hora, minuto) de um horário EXPLÍCITO e inequívoco no texto
+    (ex: '11h30', '11:30', '14h') via regex determinística — sem depender
+    de IA pra esse pedaço específico. Usado em parse_preferencia_datetime
+    pra validar o resultado do modelo, já que ele pode errar a hora mesmo
+    com o texto claro e sem ambiguidade nenhuma (bug real confirmado:
+    Giseli, 28/09 — disse "hoje às 11h30", o Claude devolveu ISO com
+    "12:30", 1h de diferença, sem nenhum motivo no texto original pra
+    isso). Retorna None se não achar um padrão claro de horário no texto."""
+    m = PADRAO_HORA_EXPLICITA.search(texto or "")
+    if not m:
+        return None
+    hora = int(m.group(1))
+    minuto = int(m.group(2)) if m.group(2) else 0
+    if 0 <= hora <= 23 and 0 <= minuto <= 59:
+        return (hora, minuto)
+    return None
+
+
 def parse_preferencia_datetime(preferencia: str, tipo: str = "agendamento"):
     """Converte a preferência do lead ('terça às 12h10') em ISO usando o Claude.
     tipo: rótulo pro rastreamento de custo por hora (ver [usage-hora]) —
@@ -1602,8 +1623,28 @@ def parse_preferencia_datetime(preferencia: str, tipo: str = "agendamento"):
                            model="claude-haiku-4-5-20251001").strip()
         if "INDEFINIDA" in resp.upper():
             return None
-        datetime.strptime(resp[:16], "%Y-%m-%dT%H:%M")
-        return resp[:16]
+        dt_parseado = datetime.strptime(resp[:16], "%Y-%m-%dT%H:%M")
+
+        # Corrigido 29/09 ([gestor], bug real: Giseli, deal=45871451 — disse
+        # "hoje às 11h30", texto sem ambiguidade nenhuma, e o Claude devolveu
+        # "12:30" mesmo assim (1h de diferença, sem nenhum ajuste de conflito
+        # envolvido — confirmado nos logs, não foi ajustar_horario_reuniao).
+        # Já tínhamos corrigido um erro parecido em 26/08 (+3h, confusão
+        # BRT/UTC), mas esse é um erro DIFERENTE (+1h) — ou seja, não é mais
+        # o mesmo mecanismo sistemático, é uma falha isolada do modelo que
+        # pode voltar a acontecer de qualquer jeito. Em vez de confiar cegamente
+        # na hora que a IA devolveu, valida contra uma extração determinística
+        # (regex, sem IA) do horário explícito no texto original — se o texto
+        # tem uma hora clara e ela não bate com o que a IA devolveu, corrige
+        # pra hora do texto (mais confiável que a IA nesse pedaço específico).
+        hora_explicita = extrair_hora_explicita(preferencia)
+        if hora_explicita and (dt_parseado.hour, dt_parseado.minute) != hora_explicita:
+            print(f"[crm] ⚠️ Hora da IA ({dt_parseado.hour:02d}:{dt_parseado.minute:02d}) diverge do "
+                  f"texto original ('{preferencia}', hora explícita={hora_explicita[0]:02d}:"
+                  f"{hora_explicita[1]:02d}) — corrigindo pra hora do texto", flush=True)
+            dt_parseado = dt_parseado.replace(hour=hora_explicita[0], minute=hora_explicita[1])
+
+        return dt_parseado.strftime("%Y-%m-%dT%H:%M")
     except Exception as e:
         print(f"[crm] Preferência não convertida ('{preferencia}'): {e}", flush=True)
         return None
@@ -1961,6 +2002,22 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                         texto_reuniao += (f" (horário ajustado de {dt_pedido.strftime('%H:%M')} para "
                                            f"{dt_local.strftime('%H:%M')} para evitar conflito de agenda)")
 
+                    # Corrigido 29/09 ([gestor], bug real: Giseli, deal=45890422 —
+                    # confirmou 11h30, o Luca disse "anotei sua preferência
+                    # para... 11h30", mas o horário real ficou 12h30 por
+                    # conflito de agenda. O ajuste era registrado só numa
+                    # nota INTERNA do CRM, invisível pro lead — ela só
+                    # descobriu o horário certo ao entrar na sala e ver o
+                    # link. Agora a mensagem que manda o link pro lead avisa
+                    # explicitamente quando houve ajuste, em vez de ficar
+                    # calado sobre a mudança.
+                    aviso_ajuste = (
+                        f" Só um detalhe: o horário das {dt_pedido.strftime('%H:%M')} já estava "
+                        f"ocupado, então já deixei encaixado certinho pra {dt_local.strftime('%H:%M')} "
+                        f"— o link abaixo já está com esse horário correto."
+                        if ajustado else ""
+                    )
+
                     # ── Cria a reunião real no Teams e manda o link pro lead ─────
                     # Falha aqui NUNCA bloqueia o resto do registro no CRM (fica
                     # no mesmo fluxo manual de antes: consultor confirma e manda
@@ -1977,7 +2034,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                             print(f"[crm] ✅ Reunião Teams criada deal={deal_id} "
                                   f"linha={linha_negocio} join_url={teams_join_url}", flush=True)
                             mensagem_link = (
-                                f"Consegui deixar tudo pronto, {nome_reuniao.split(' ')[0]}! Aqui está o link "
+                                f"Consegui deixar tudo pronto, {nome_reuniao.split(' ')[0]}!{aviso_ajuste} Aqui está o link "
                                 f"da nossa videochamada:\n{teams_join_url}\n\nQualquer dúvida antes, estou por aqui."
                             )
                             send_agendorchat_message(conversation_id, remover_travessao(mensagem_link))
