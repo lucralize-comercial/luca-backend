@@ -172,6 +172,8 @@ A quantidade de perguntas deve ser sempre a menor possível. Sempre que o histó
 
 4. MOTIVO DO CONTATO: Antes de propor a reunião, faça UMA pergunta aberta para entender o que levou o lead a buscar a Lucralize agora, por exemplo: "O que fez você decidir abrir um CNPJ agora?" ou "O que motivou essa busca?". Não transforme isso em interrogatório: uma resposta já é suficiente para seguir.
 
+4.1 URGÊNCIA: Se ainda não estiver claro pelo que o lead já disse, pergunte de forma natural (pode ser na mesma mensagem do motivo do contato, emendada): "Como está sua urgência nisso? Tem algum motivo puxando isso agora, ou ainda está só pesquisando/se organizando?". O objetivo é entender duas coisas de uma vez: se há prazo real (ex: obrigação fiscal, início de contrato PJ) e se o lead já está decidido a agir ou ainda está só sondando opções — isso ajuda o consultor a calibrar como conduzir a reunião. Se o lead já tiver dado essa informação espontaneamente (ex: já mencionou um prazo ou disse que só está pesquisando), não pergunte de novo, use o que já sabe.
+
 5. PRINCIPAL DÚVIDA: Antes de iniciar o agendamento, caso a principal dúvida ou preocupação do lead ainda não esteja clara pelo que ele já disse, faça apenas UMA pergunta para identificá-la, de forma leve (como parte da conversa, não como formulário). Se já estiver clara, não pergunte de novo, use o que já sabe. Essa informação serve para contextualizar a conversa e preparar o especialista para a reunião.
 
 6. QUALIFICAÇÃO RÁPIDA (opcional): Se ainda fizer sentido, no máximo 1 pergunta adicional sobre a situação prática (empresa já aberta, faturamento aproximado, contador atual), só quando isso ajudar a personalizar o gancho. Não force se o motivo e a dúvida já deram contexto suficiente.
@@ -205,6 +207,7 @@ As respostas abaixo mostram a INTENÇÃO e o CONTEÚDO esperados para cada obje�
 - "Quanto custa?": informe que os planos começam a partir de R$147/mês, mas que o valor final depende do perfil e faturamento do lead, o especialista mostra na conversa qual plano e quais vantagens fazem mais sentido pra ele. Emende com o convite pra marcar.
 - "Me manda mais informações": ofereça o básico ali no chat, mas reforce que o que realmente faz diferença é a conversa com o especialista, que adapta tudo ao caso do lead, e convide para os 20 minutos.
 - "Vou pensar": acolha sem pressão, mas já proponha reservar um horário tentativo, deixando claro que pode remarcar se não der.
+- Lead sinaliza que tem mais perguntas antes de decidir (ex: "tenho umas dúvidas antes", "deixa eu perguntar mais uma coisa"): responda a pergunta dele direto, SEM repetir o convite pra reunião nessa resposta nem nas seguintes enquanto ele continuar perguntando — dá espaço de verdade pra ele tirar as dúvidas em sequência, sem parecer que você está sempre tentando empurrar o agendamento por cima da pergunta dele. Só volte a convidar pra reunião quando ele parar de perguntar, sinalizar que já entendeu, ou você perceber que já respondeu tudo que ele trouxe.
 - Lead em momento incerto (aguardando contrato, decisão, etc.): não force o agendamento. Use: "O que eu sugiro: vamos te deixar aqui em nosso acompanhamento. Assim que você tiver o sinal verde, é só me avisar que a gente resolve rápido." NUNCA diga "lista de espera". Após esse encerramento, NÃO faça mais nenhuma pergunta. Deixe a conversa terminar naturalmente.
 
 PEDIDO PRA FALAR COM ATENDENTE/HUMANO (regra crítica, NÃO é uma objeção a contornar):
@@ -2296,6 +2299,7 @@ def build_lead_note(conv_data: dict) -> str:
     urgencia   = g("urgencia")
     proxima_acao = g("proxima_acao_consultor")
     resumo_conversa = g("resumo_conversa")
+    estilo_comunicacao = g("estilo_comunicacao")
 
     status     = conv_data.get("status", "Em atendimento")
 
@@ -2311,13 +2315,14 @@ def build_lead_note(conv_data: dict) -> str:
         f"Agendamento: {agendamento}",
         "",
         "🧠 INTELIGÊNCIA COMERCIAL",
-        f"Objetivo: {objetivo}",
-        f"Motivo do contato: {motivo}",
-        f"Principal dúvida: {duvida}",
-        f"Dor identificada: {dor}",
-        f"Urgência: {urgencia}",
-        f"Próxima ação esperada: {proxima_acao}",
-        f"Resumo da conversa: {resumo_conversa}",
+        f"• Objetivo: {objetivo}",
+        f"• Motivo do contato: {motivo}",
+        f"• Principal dúvida: {duvida}",
+        f"• Dor identificada: {dor}",
+        f"• Urgência: {urgencia}",
+        f"• Próxima ação esperada: {proxima_acao}",
+        f"• Estilo de comunicação observado: {estilo_comunicacao}",
+        f"• Resumo da conversa: {resumo_conversa}",
     ]
     note = "\n".join(lines)
     note += f"\n\nStatus: {status}"
@@ -2356,6 +2361,7 @@ NUNCA invente, deduza ou chute um valor plausível; vazio é sempre melhor que u
   "dor_identificada": "",
   "urgencia": "",
   "proxima_acao_consultor": "",
+  "estilo_comunicacao": "",
   "resumo_conversa": "",
   "status": ""
 }}
@@ -2370,8 +2376,9 @@ Campos de INTELIGÊNCIA COMERCIAL (exigem mais cuidado — só preencha com evid
 "necessidade" = o MOTIVO/gatilho que levou o lead a procurar a Lucralize agora (ex: "Cliente passou a exigir nota fiscal", "Contador demora pra responder"). Diferente de "objetivo": motivo é a causa, objetivo é o resultado desejado. No mesmo caso de engano/mal-entendido acima, registre isso aqui também (ex: "Achou que a empresa fosse de empréstimo (mal-entendido, não tinha motivo real de contabilidade)"), em vez de deixar em branco.
 "duvida_principal" = a dúvida ou preocupação específica que o lead levantou (ex: "quanto vai pagar de imposto").
 "dor_identificada" = só preencha se o lead expressou uma insatisfação ou problema de forma EXPLÍCITA (ex: lead disse "meu contador nunca responde"). NUNCA infira dor a partir do tom geral da conversa — se não houver uma frase clara indicando isso, deixe em branco.
-"urgencia" = "Alta", "Média" ou "Baixa" — só preencha se houver sinal EXPLÍCITO de prazo/pressa (ex: lead disse "preciso disso essa semana" = Alta). Sem sinal claro de tempo, deixe em branco — não deduza urgência pelo tom.
+"urgencia" = "Alta", "Média" ou "Baixa" — combina duas coisas: se há um motivo/prazo real puxando a decisão (ex: obrigação fiscal, início de contrato PJ, contador atual sumiu) E se o lead sinaliza estar decidido a agir ou só pesquisando/sondando. "Alta" = tem motivo concreto e imediato (ex: "preciso disso até sexta", "contrato começa semana que vem"). "Baixa" = só está pesquisando/comparando, sem motivo puxando agora (ex: "só queria entender os preços", "ainda não é pra agora"). Inclua o motivo junto (ex: "Alta — contrato PJ começa semana que vem"). Só preencha com sinal EXPLÍCITO dito pelo lead — sem sinal claro, deixe em branco, não deduza pelo tom.
 "proxima_acao_consultor" = uma sugestão curta e concreta do que o consultor deveria fazer na reunião (ex: "Simular tributação com faturamento de 8k/mês", "Explicar processo de migração"), baseada só no que já foi discutido — não invente uma ação genérica se não houver base clara na conversa.
+"estilo_comunicacao" = uma descrição BREVE e FACTUAL de como o lead se comunicou NESSA conversa específica (ex: "Direto e objetivo, focou em prazo e preço", "Fez várias perguntas antes de decidir, parece querer entender tudo primeiro", "Respostas curtas, parece estar ocupado/com pressa"). Isso serve só pra ajudar o consultor a calibrar o TOM da reunião — NUNCA use termos de personalidade, traços psicológicos ou classificações (nada de "introvertido", "ansioso", "Big Five", "perfil DISC" ou parecido) — descreva só o comportamento OBSERVÁVEL nas mensagens em si, não um traço permanente da pessoa. Se a conversa for curta demais pra perceber um padrão (poucas mensagens trocadas), deixe em branco.
 "resumo_conversa" = 1 a 2 frases resumindo o essencial da conversa até agora, em tom neutro e factual.
 
 Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-mail" | "Preferência informada: [dia] às [horário]" | "Agendamento confirmado" | "Perdido: [motivo breve]"
