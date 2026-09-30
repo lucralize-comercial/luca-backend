@@ -4853,20 +4853,15 @@ def marcar_perdido_sem_contato(deal_id: int, end_time: str = None) -> bool:
 def _data_gt_para_tasks_d10(deal: dict) -> str:
     """Define um limite inferior seguro para consultar as tasks do negócio.
 
-    A API /deals/{id}/tasks exige pelo menos um filtro de data. Como a task
-    D10 necessariamente é criada depois do início do negócio, usamos o dia
-    anterior ao startTime. Se startTime estiver ausente/inválido, usamos 90
-    dias atrás apenas como fallback de consulta; a rotina ainda exige achar
-    a task D10 exata antes de alterar qualquer coisa.
-    """
-    start_time = deal.get("startTime") or deal.get("createdAt")
-    if start_time:
-        try:
-            dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            return (dt - timedelta(days=1)).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    return (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+    A API /deals/{id}/tasks exige pelo menos um filtro de data, e esse
+    filtro aceita no máximo ~30 dias no passado (confirmado em produção,
+    ver fetch_tasks_job — com 60 dias a API já rejeitou a chamada). Usar
+    o startTime do negócio como referência (como antes) arrisca ultrapassar
+    esse limite pra negócios mais antigos, entre os que estamos corrigindo
+    agora — por isso usa sempre "hoje menos 30 dias", o mesmo padrão já
+    testado e funcionando em fetch_tasks_job, independente de quando o
+    negócio foi criado."""
+    return (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
 
 
 def data_historica_d10_da_task(deal: dict) -> str:
