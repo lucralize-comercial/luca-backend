@@ -1173,12 +1173,158 @@ def reset_fetch():
 
 
 
-# ── RD Station: webhook de diagnóstico de conversões ────────────────────────
-# Adicionado 01/10: primeira etapa da integração RD -> Agendor.
-# Nesta fase a rota SOMENTE recebe e registra o payload real enviado pelo RD.
-# Não cria, não localiza e não altera nenhum negócio no Agendor.
-# Isso permite validar com segurança os nomes reais dos campos (identificador,
-# e-mail, telefone e data/hora) antes de ativar o DE/PARA de origem.
+# ── RD Station: webhook V2 — correlação em modo simulação ──────────────────
+# Recebe a conversão, extrai os campos reais do RD e tenta localizar o negócio
+# correspondente no Agendor. IMPORTANTE: esta versão NÃO faz PUT e NÃO altera
+# o CRM. Ela apenas registra no log qual negócio seria escolhido.
+
+def _rd_parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _rd_normalizar_telefone(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _rd_extrair_lead(lead):
+    """Extrai os campos confirmados no payload real do webhook do RD."""
+    last_conversion = lead.get("last_conversion") or {}
+    content = last_conversion.get("content") or {}
+    original = content.get("__cdp__original_event") or {}
+    original_payload = original.get("payload") or {}
+
+    identificador = (
+        content.get("event_identifier")
+        or content.get("conversion_identifier")
+        or content.get("identificador")
+        or last_conversion.get("source")
+    )
+    email = lead.get("email") or content.get("email_lead") or original_payload.get("email")
+    telefone = (
+        lead.get("mobile_phone") or lead.get("phone")
+        or content.get("Celular") or content.get("phone_lead")
+        or original_payload.get("mobile_phone")
+    )
+    data_conversao = (
+        content.get("event_timestamp") or content.get("created_at")
+        or last_conversion.get("created_at") or lead.get("created_at")
+    )
+    return {
+        "rd_id": lead.get("id"),
+        "nome": lead.get("name") or content.get("Nome"),
+        "email": (email or "").strip().lower(),
+        "telefone": telefone,
+        "telefone_norm": _rd_normalizar_telefone(telefone),
+        "identificador": identificador,
+        "data_conversao": data_conversao,
+    }
+
+
+def _rd_buscar_pessoas(email, telefone_norm):
+    """Busca pessoas por e-mail e telefone e elimina duplicatas por ID."""
+    encontradas = {}
+    buscas = []
+    if email:
+        buscas.append(("email", email))
+    if telefone_norm:
+        buscas.append(("phone", telefone_norm))
+
+    for campo, valor in buscas:
+        try:
+            r = requests.get(f"{AGENDOR_BASE}/people", headers=HEADERS,
+                             params={campo: valor}, timeout=15)
+            r.raise_for_status()
+            for pessoa in r.json().get("data", []):
+                if pessoa.get("id"):
+                    encontradas[pessoa["id"]] = pessoa
+        except Exception as e:
+            print(f"[rd-match] Falha buscando pessoa por {campo}={valor!r}: {e}", flush=True)
+    return list(encontradas.values())
+
+
+def _rd_simular_correlacao(dados):
+    """Localiza candidato inequívoco no Agendor, mas nunca altera o CRM."""
+    # Pequena espera: a integração RD -> Agendor pode criar o negócio depois
+    # que o webhook do RD chegar ao Luca.
+    for tentativa, espera in enumerate((10, 30, 60), start=1):
+        time.sleep(espera)
+        pessoas = _rd_buscar_pessoas(dados["email"], dados["telefone_norm"])
+        print(f"[rd-match] tentativa={tentativa}/3 pessoas_encontradas={len(pessoas)}", flush=True)
+
+        candidatos = []
+        dt_rd = _rd_parse_iso(dados["data_conversao"])
+        for pessoa in pessoas:
+            person_id = pessoa.get("id")
+            try:
+                r = requests.get(f"{AGENDOR_BASE}/people/{person_id}/deals",
+                                 headers=HEADERS, timeout=15)
+                r.raise_for_status()
+                deals = r.json().get("data", [])
+            except Exception as e:
+                print(f"[rd-match] Falha buscando deals person={person_id}: {e}", flush=True)
+                continue
+
+            for deal in deals:
+                stage = deal.get("dealStage") or {}
+                funnel_id = (stage.get("funnel") or {}).get("id")
+                if funnel_id != FUNIL_COMERCIAL_ID:
+                    continue
+
+                descricao = (deal.get("description") or "").strip()
+                if "RD Station" not in descricao:
+                    continue
+
+                dt_deal = _rd_parse_iso(deal.get("startTime"))
+                diferenca = None
+                if dt_rd and dt_deal:
+                    if dt_rd.tzinfo is None:
+                        dt_rd = dt_rd.replace(tzinfo=timezone.utc)
+                    if dt_deal.tzinfo is None:
+                        dt_deal = dt_deal.replace(tzinfo=timezone.utc)
+                    diferenca = abs((dt_deal.astimezone(timezone.utc) - dt_rd.astimezone(timezone.utc)).total_seconds())
+                    # Conversões muito distantes não são candidatas ao mesmo evento.
+                    if diferenca > 20 * 60:
+                        continue
+
+                candidatos.append({
+                    "deal_id": deal.get("id"),
+                    "person_id": person_id,
+                    "nome": deal.get("title") or deal.get("name"),
+                    "startTime": deal.get("startTime"),
+                    "diferenca_seg": diferenca,
+                    "descricao": descricao[:100],
+                })
+
+        # Remove duplicatas caso e-mail e telefone tenham retornado a mesma pessoa.
+        unicos = {c["deal_id"]: c for c in candidatos if c.get("deal_id")}
+        candidatos = list(unicos.values())
+        candidatos.sort(key=lambda c: c["diferenca_seg"] if c["diferenca_seg"] is not None else 10**12)
+
+        print(f"[rd-match] identificador={dados['identificador']!r} candidatos={json.dumps(candidatos, ensure_ascii=False, default=str)}", flush=True)
+
+        if len(candidatos) == 1:
+            escolhido = candidatos[0]
+            print(
+                f"[rd-match] SIMULACAO_OK — preencheria origem_do_negocio={dados['identificador']!r} "
+                f"no deal={escolhido['deal_id']} person={escolhido['person_id']} "
+                f"diferenca_seg={escolhido['diferenca_seg']} | NENHUMA ALTERACAO FOI FEITA",
+                flush=True
+            )
+            return
+        if len(candidatos) > 1:
+            print(f"[rd-match] AMBIGUO — {len(candidatos)} negócios plausíveis; nada será alterado", flush=True)
+            return
+
+        print(f"[rd-match] Nenhum candidato na tentativa {tentativa}; aguardando nova busca", flush=True)
+
+    print("[rd-match] SEM_CORRESPONDENCIA — nenhuma alteração foi feita", flush=True)
+
+
 @app.route("/rd/webhook", methods=["POST", "OPTIONS"])
 def rd_webhook():
     if request.method == "OPTIONS":
@@ -1191,8 +1337,6 @@ def rd_webhook():
     try:
         body = request.get_json(silent=True)
         if body is None:
-            # Alguns emissores podem mandar form-urlencoded; preserva o que
-            # chegar para diagnóstico em vez de rejeitar o webhook.
             body = request.form.to_dict(flat=False) if request.form else {}
 
         print("[rd-webhook] ========================================", flush=True)
@@ -1200,45 +1344,32 @@ def rd_webhook():
         print(f"[rd-webhook] content_type={request.content_type}", flush=True)
         print(f"[rd-webhook] payload={json.dumps(body, ensure_ascii=False, default=str)[:12000]}", flush=True)
 
-        # Extração apenas para facilitar a leitura dos logs. NÃO é usada para
-        # alterar o CRM nesta etapa, porque o formato real do RD ainda será
-        # confirmado a partir de um webhook de produção/teste.
-        eventos = body if isinstance(body, list) else [body]
-        for i, evento in enumerate(eventos, start=1):
-            if not isinstance(evento, dict):
+        leads = body.get("leads") if isinstance(body, dict) else None
+        if not isinstance(leads, list):
+            leads = []
+
+        for lead in leads:
+            if not isinstance(lead, dict):
                 continue
-            payload = evento.get("payload") if isinstance(evento.get("payload"), dict) else evento
-            conversion = (payload.get("conversion") if isinstance(payload.get("conversion"), dict) else {})
-            leads = payload.get("leads") if isinstance(payload.get("leads"), list) else []
-            lead = leads[0] if leads and isinstance(leads[0], dict) else {}
-
-            identificador = (
-                conversion.get("identifier")
-                or payload.get("conversion_identifier")
-                or payload.get("identifier")
-                or lead.get("conversion_identifier")
-                or lead.get("identifier")
-            )
-            email = payload.get("email") or lead.get("email")
-            telefone = (payload.get("phone") or payload.get("mobile_phone")
-                        or lead.get("phone") or lead.get("mobile_phone"))
-            data_conversao = (conversion.get("created_at") or conversion.get("conversion_date")
-                              or payload.get("conversion_date") or payload.get("created_at")
-                              or lead.get("conversion_date") or lead.get("created_at"))
-
+            dados = _rd_extrair_lead(lead)
             print(
-                f"[rd-webhook] evento={i} identificador={identificador!r} "
-                f"email={email!r} telefone={telefone!r} data_conversao={data_conversao!r}",
+                f"[rd-webhook] identificador={dados['identificador']!r} email={dados['email']!r} "
+                f"telefone={dados['telefone']!r} data_conversao={dados['data_conversao']!r}",
                 flush=True
             )
+            if not dados["identificador"] or (not dados["email"] and not dados["telefone_norm"]):
+                print("[rd-match] IGNORADO — faltam identificador e/ou dados para localizar a pessoa", flush=True)
+                continue
+            t = threading.Thread(target=_rd_simular_correlacao, args=(dados,))
+            t.daemon = True
+            t.start()
 
-        return jsonify({"status": "ok", "modo": "diagnostico", "alterou_agendor": False}), 200
+        # Responde imediatamente ao RD; a correlação roda em background.
+        return jsonify({"status": "ok", "modo": "simulacao", "alterou_agendor": False}), 200
 
     except Exception as e:
-        # Retorna 200 para evitar reentregas em cascata durante a fase de
-        # diagnóstico; o erro completo continua visível no Railway.
         print(f"[rd-webhook] Erro ao processar payload: {e}", flush=True)
-        return jsonify({"status": "error", "modo": "diagnostico", "alterou_agendor": False}), 200
+        return jsonify({"status": "error", "modo": "simulacao", "alterou_agendor": False}), 200
 
 
 @app.route("/agendor/deal-created", methods=["POST"])
