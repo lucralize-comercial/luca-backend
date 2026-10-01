@@ -1127,10 +1127,9 @@ def fetch_deals():
         if total_count is None:
             total_count = data.get("meta", {}).get("totalCount", 0)
         all_deals.extend(page_deals)
-        if page % 10 == 0:
-            cache["deals"] = list(all_deals)
-            cache["total"] = total_count or len(all_deals)
-            cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # Não publica cópias parciais do cache durante a paginação.
+        # O cache anterior continua disponível até a nova carga terminar; isso
+        # evita manter listas duplicadas em RAM e reduz picos de memória.
         if not data.get("links", {}).get("next") or len(page_deals) == 0:
             break
         page += 1
@@ -5835,6 +5834,36 @@ def verificar_followup_dias_silencio_safe():
         print(f"[followup_dias] Erro geral na varredura: {e}", flush=True)
 
 
+def limpar_memoria_conversas_inativas():
+    """Remove da RAM conversas sem atividade há 48h e locks órfãos.
+
+    Não apaga histórico no AgendorChat. Se o contato voltar depois, o fluxo
+    normal recupera o histórico remoto. A janela de 48h preserva com folga
+    todas as varreduras/follow-ups de curto prazo que dependem da memória.
+    """
+    agora = time.time()
+    limite = 48 * 3600
+    removidas = 0
+    for conv_key in list(conversation_histories.keys()):
+        conv = conversation_histories.get(conv_key) or {}
+        last_msg_at = conv.get("last_msg_at") or 0
+        if last_msg_at and agora - last_msg_at > limite:
+            conversation_histories.pop(conv_key, None)
+            with _conv_response_locks_guard:
+                _conv_response_locks.pop(conv_key, None)
+            removidas += 1
+    if removidas:
+        print(f"[memoria] conversas_inativas_removidas={removidas} "
+              f"ativas_em_ram={len(conversation_histories)} locks={len(_conv_response_locks)}", flush=True)
+
+
+def limpar_memoria_conversas_inativas_safe():
+    try:
+        limpar_memoria_conversas_inativas()
+    except Exception as e:
+        print(f"[memoria] erro na limpeza: {e}", flush=True)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SCHEDULER + MAIN
 # ═════════════════════════════════════════════════════════════════════════════
@@ -5884,6 +5913,7 @@ def log_resumo_usage():
 
 scheduler.add_job(mover_novos_leads_para_1contato_safe, "interval", minutes=15, id="mover_novos_leads")
 scheduler.add_job(log_resumo_usage, "interval", hours=1, id="usage_resumo_horario")
+scheduler.add_job(limpar_memoria_conversas_inativas_safe, "interval", hours=6, id="limpeza_memoria_conversas")
 scheduler.add_job(verificar_followup_1h_silencio_safe, "interval", minutes=15, id="followup_1h_silencio")
 scheduler.add_job(verificar_followup_4h_silencio_humano_safe, "interval", minutes=15, id="followup_4h_silencio_humano")
 scheduler.add_job(verificar_retomada_apos_silencio_humano_safe, "interval", minutes=15, id="retomada_apos_silencio_humano")
