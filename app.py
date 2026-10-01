@@ -1381,23 +1381,18 @@ def _rd_enriquecer_deal(deal_id, dados):
         print(f"[rd-write] ERRO_GET deal={deal_id}: {e}", flush=True)
         return False
 
-    # Escrita controlada: neste momento só o slug origem_do_negocio está
-    # comprovado por teste real na API do Agendor. O GET omite campos vazios
-    # (customFields pode vir {}), portanto ausência do slug NÃO significa
-    # que o campo não exista. Os demais campos de marketing ficam somente
-    # em log até seus slugs/tipos serem validados individualmente.
+    # Slugs validados por teste real na API/UI do Agendor em 01/10/2026.
+    # O GET omite campos personalizados vazios (customFields pode vir {}),
+    # portanto ausência do slug NÃO significa que o campo não exista.
+    # Só envia valores que vieram do RD e nunca sobrescreve campo já preenchido.
     desejados = {
         "origem_do_negocio": origem_negocio,
-    }
-
-    marketing_pendente = {
         "origem": dados.get("utm_source"),
         "campanha": dados.get("utm_campaign"),
         "grupo_de_anuncio": dados.get("utm_term"),
         "anuncio": dados.get("utm_content"),
         "meta_ads_source_id": dados.get("utm_id"),
     }
-    print(f"[rd-write] marketing_pendente_validacao={json.dumps(marketing_pendente, ensure_ascii=False)}", flush=True)
 
     atualizar = {}
     pulados = {}
