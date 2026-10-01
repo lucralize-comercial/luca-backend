@@ -1173,6 +1173,74 @@ def reset_fetch():
 
 
 
+# ── RD Station: webhook de diagnóstico de conversões ────────────────────────
+# Adicionado 01/10: primeira etapa da integração RD -> Agendor.
+# Nesta fase a rota SOMENTE recebe e registra o payload real enviado pelo RD.
+# Não cria, não localiza e não altera nenhum negócio no Agendor.
+# Isso permite validar com segurança os nomes reais dos campos (identificador,
+# e-mail, telefone e data/hora) antes de ativar o DE/PARA de origem.
+@app.route("/rd/webhook", methods=["POST", "OPTIONS"])
+def rd_webhook():
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp, 200
+
+    try:
+        body = request.get_json(silent=True)
+        if body is None:
+            # Alguns emissores podem mandar form-urlencoded; preserva o que
+            # chegar para diagnóstico em vez de rejeitar o webhook.
+            body = request.form.to_dict(flat=False) if request.form else {}
+
+        print("[rd-webhook] ========================================", flush=True)
+        print(f"[rd-webhook] recebido_em_brt={datetime.utcnow() - timedelta(hours=3)}", flush=True)
+        print(f"[rd-webhook] content_type={request.content_type}", flush=True)
+        print(f"[rd-webhook] payload={json.dumps(body, ensure_ascii=False, default=str)[:12000]}", flush=True)
+
+        # Extração apenas para facilitar a leitura dos logs. NÃO é usada para
+        # alterar o CRM nesta etapa, porque o formato real do RD ainda será
+        # confirmado a partir de um webhook de produção/teste.
+        eventos = body if isinstance(body, list) else [body]
+        for i, evento in enumerate(eventos, start=1):
+            if not isinstance(evento, dict):
+                continue
+            payload = evento.get("payload") if isinstance(evento.get("payload"), dict) else evento
+            conversion = (payload.get("conversion") if isinstance(payload.get("conversion"), dict) else {})
+            leads = payload.get("leads") if isinstance(payload.get("leads"), list) else []
+            lead = leads[0] if leads and isinstance(leads[0], dict) else {}
+
+            identificador = (
+                conversion.get("identifier")
+                or payload.get("conversion_identifier")
+                or payload.get("identifier")
+                or lead.get("conversion_identifier")
+                or lead.get("identifier")
+            )
+            email = payload.get("email") or lead.get("email")
+            telefone = (payload.get("phone") or payload.get("mobile_phone")
+                        or lead.get("phone") or lead.get("mobile_phone"))
+            data_conversao = (conversion.get("created_at") or conversion.get("conversion_date")
+                              or payload.get("conversion_date") or payload.get("created_at")
+                              or lead.get("conversion_date") or lead.get("created_at"))
+
+            print(
+                f"[rd-webhook] evento={i} identificador={identificador!r} "
+                f"email={email!r} telefone={telefone!r} data_conversao={data_conversao!r}",
+                flush=True
+            )
+
+        return jsonify({"status": "ok", "modo": "diagnostico", "alterou_agendor": False}), 200
+
+    except Exception as e:
+        # Retorna 200 para evitar reentregas em cascata durante a fase de
+        # diagnóstico; o erro completo continua visível no Railway.
+        print(f"[rd-webhook] Erro ao processar payload: {e}", flush=True)
+        return jsonify({"status": "error", "modo": "diagnostico", "alterou_agendor": False}), 200
+
+
 @app.route("/agendor/deal-created", methods=["POST"])
 def agendor_deal_created():
     try:
