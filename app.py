@@ -10,6 +10,7 @@ import threading
 import json
 import hmac
 import hashlib
+from urllib.parse import parse_qs
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
@@ -1173,10 +1174,30 @@ def reset_fetch():
 
 
 
-# ── RD Station: webhook V2 — correlação em modo simulação ──────────────────
-# Recebe a conversão, extrai os campos reais do RD e tenta localizar o negócio
-# correspondente no Agendor. IMPORTANTE: esta versão NÃO faz PUT e NÃO altera
-# o CRM. Ela apenas registra no log qual negócio seria escolhido.
+# ── RD Station: webhook V3 — correlação + enriquecimento seguro ─────────────
+# Recebe a conversão, localiza de forma conservadora o negócio correspondente
+# e preenche SOMENTE campos vazios. Identificadores desconhecidos são ignorados.
+
+# DE/PARA fechado: só estes identificadores podem escrever Origem do Negócio.
+# Novos identificadores devem ser validados antes de entrar aqui.
+RD_ORIGEM_DE_PARA = {
+    "calculadora-impostos-desenvolvedores": "calculadora-impostos-desenvolvedores",
+    "Transformação do MEI": "Transformação do MEI",
+    "whatsapp_pagina": "whatsapp_pagina",
+    "leo-marconi": "leo-marconi",
+    "calculadora-lucralize": "calculadora-de-impostos-e-ir-sobre-dividendos",
+    "Formulário Meta Afiliados - Alexia": "Formulário Meta Afiliados - Alexia",
+}
+
+# Slugs esperados dos campos personalizados do negócio no Agendor.
+RD_CAMPOS_AGENDOR = {
+    "origem": "origem",
+    "campanha": "campanha",
+    "grupo_anuncio": "grupo_de_anuncio",
+    "anuncio": "anuncio",
+    "meta_ads_source_id": "meta_ads_source_id",
+}
+
 
 def _rd_parse_iso(value):
     if not value:
@@ -1191,12 +1212,31 @@ def _rd_normalizar_telefone(value):
     return re.sub(r"\D", "", str(value or ""))
 
 
+def _rd_parse_conversion_payload(content):
+    """Extrai UTMs do conversion_payload real do RD, sem inventar valores."""
+    raw = content.get("conversion_payload")
+    if not raw:
+        original = content.get("__cdp__original_event") or {}
+        raw = (original.get("payload") or {}).get("conversion_payload")
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw) if isinstance(raw, str) else raw
+        query_string = (obj or {}).get("query_params") or ""
+        qs = parse_qs(query_string, keep_blank_values=False)
+        return {k: (v[0] if isinstance(v, list) and v else v) for k, v in qs.items()}
+    except Exception as e:
+        print(f"[rd-webhook] Falha lendo conversion_payload/UTMs: {e}", flush=True)
+        return {}
+
+
 def _rd_extrair_lead(lead):
     """Extrai os campos confirmados no payload real do webhook do RD."""
     last_conversion = lead.get("last_conversion") or {}
     content = last_conversion.get("content") or {}
     original = content.get("__cdp__original_event") or {}
     original_payload = original.get("payload") or {}
+    utms = _rd_parse_conversion_payload(content)
 
     identificador = (
         content.get("event_identifier")
@@ -1222,6 +1262,12 @@ def _rd_extrair_lead(lead):
         "telefone_norm": _rd_normalizar_telefone(telefone),
         "identificador": identificador,
         "data_conversao": data_conversao,
+        "utm_source": utms.get("utm_source"),
+        "utm_medium": utms.get("utm_medium"),
+        "utm_campaign": utms.get("utm_campaign"),
+        "utm_content": utms.get("utm_content"),
+        "utm_id": utms.get("utm_id"),
+        "utm_term": utms.get("utm_term"),
     }
 
 
@@ -1247,10 +1293,87 @@ def _rd_buscar_pessoas(email, telefone_norm):
     return list(encontradas.values())
 
 
-def _rd_simular_correlacao(dados):
-    """Localiza candidato inequívoco no Agendor, mas nunca altera o CRM."""
-    # Pequena espera: a integração RD -> Agendor pode criar o negócio depois
-    # que o webhook do RD chegar ao Luca.
+def _rd_valor_atual(custom, slug):
+    """Normaliza retorno do Agendor: campo pode vir simples ou {id,value}."""
+    atual = custom.get(slug)
+    if isinstance(atual, dict):
+        return atual.get("value")
+    return atual
+
+
+def _rd_enriquecer_deal(deal_id, dados):
+    """Preenche apenas campos existentes e vazios; nunca sobrescreve."""
+    origem_negocio = RD_ORIGEM_DE_PARA.get(dados.get("identificador"))
+    if not origem_negocio:
+        print(f"[rd-write] IGNORADO_IDENTIFICADOR — {dados.get('identificador')!r} não está no DE/PARA", flush=True)
+        return False
+
+    try:
+        r = requests.get(
+            f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+            params={"withCustomFields": "true"}, timeout=15
+        )
+        r.raise_for_status()
+        deal_completo = r.json().get("data") or r.json()
+        custom = deal_completo.get("customFields") or {}
+    except Exception as e:
+        print(f"[rd-write] ERRO_GET deal={deal_id}: {e}", flush=True)
+        return False
+
+    desejados = {
+        "origem_do_negocio": origem_negocio,
+        RD_CAMPOS_AGENDOR["origem"]: dados.get("utm_source"),
+        RD_CAMPOS_AGENDOR["campanha"]: dados.get("utm_campaign"),
+        RD_CAMPOS_AGENDOR["grupo_anuncio"]: dados.get("utm_term"),
+        RD_CAMPOS_AGENDOR["anuncio"]: dados.get("utm_content"),
+        RD_CAMPOS_AGENDOR["meta_ads_source_id"]: dados.get("utm_id"),
+    }
+
+    atualizar = {}
+    pulados = {}
+    for slug, valor in desejados.items():
+        if valor is None or str(valor).strip() == "":
+            pulados[slug] = "sem_valor_no_RD"
+            continue
+        # Segurança: só tenta slugs que o próprio GET confirmou no negócio.
+        if slug not in custom:
+            pulados[slug] = "slug_nao_confirmado_no_Agendor"
+            continue
+        atual = _rd_valor_atual(custom, slug)
+        if atual not in (None, "", [], {}):
+            pulados[slug] = f"ja_preenchido:{atual}"
+            continue
+        atualizar[slug] = str(valor).strip()
+
+    print(f"[rd-write] deal={deal_id} atualizar={json.dumps(atualizar, ensure_ascii=False)} pulados={json.dumps(pulados, ensure_ascii=False, default=str)}", flush=True)
+    if not atualizar:
+        print(f"[rd-write] NADA_A_ATUALIZAR deal={deal_id}", flush=True)
+        return True
+
+    try:
+        r = requests.put(
+            f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+            json={"customFields": atualizar}, timeout=20
+        )
+        r.raise_for_status()
+        print(f"[rd-write] ATUALIZADO_OK deal={deal_id} campos={list(atualizar.keys())}", flush=True)
+        return True
+    except Exception as e:
+        corpo = ""
+        try:
+            corpo = r.text[:1000]
+        except Exception:
+            pass
+        print(f"[rd-write] ERRO_PUT deal={deal_id}: {e} resposta={corpo}", flush=True)
+        return False
+
+
+def _rd_correlacionar_e_enriquecer(dados):
+    """Localiza candidato inequívoco e, somente então, enriquece o negócio."""
+    if dados.get("identificador") not in RD_ORIGEM_DE_PARA:
+        print(f"[rd-match] IGNORADO_IDENTIFICADOR — {dados.get('identificador')!r} fora do DE/PARA; nada será alterado", flush=True)
+        return
+
     for tentativa, espera in enumerate((10, 30, 60), start=1):
         time.sleep(espera)
         pessoas = _rd_buscar_pessoas(dados["email"], dados["telefone_norm"])
@@ -1274,7 +1397,6 @@ def _rd_simular_correlacao(dados):
                 funnel_id = (stage.get("funnel") or {}).get("id")
                 if funnel_id != FUNIL_COMERCIAL_ID:
                     continue
-
                 descricao = (deal.get("description") or "").strip()
                 if "RD Station" not in descricao:
                     continue
@@ -1287,39 +1409,28 @@ def _rd_simular_correlacao(dados):
                     if dt_deal.tzinfo is None:
                         dt_deal = dt_deal.replace(tzinfo=timezone.utc)
                     diferenca = abs((dt_deal.astimezone(timezone.utc) - dt_rd.astimezone(timezone.utc)).total_seconds())
-                    # Conversões muito distantes não são candidatas ao mesmo evento.
                     if diferenca > 20 * 60:
                         continue
 
                 candidatos.append({
-                    "deal_id": deal.get("id"),
-                    "person_id": person_id,
+                    "deal_id": deal.get("id"), "person_id": person_id,
                     "nome": deal.get("title") or deal.get("name"),
-                    "startTime": deal.get("startTime"),
-                    "diferenca_seg": diferenca,
+                    "startTime": deal.get("startTime"), "diferenca_seg": diferenca,
                     "descricao": descricao[:100],
                 })
 
-        # Remove duplicatas caso e-mail e telefone tenham retornado a mesma pessoa.
-        unicos = {c["deal_id"]: c for c in candidatos if c.get("deal_id")}
-        candidatos = list(unicos.values())
+        candidatos = list({c["deal_id"]: c for c in candidatos if c.get("deal_id")}.values())
         candidatos.sort(key=lambda c: c["diferenca_seg"] if c["diferenca_seg"] is not None else 10**12)
-
         print(f"[rd-match] identificador={dados['identificador']!r} candidatos={json.dumps(candidatos, ensure_ascii=False, default=str)}", flush=True)
 
         if len(candidatos) == 1:
             escolhido = candidatos[0]
-            print(
-                f"[rd-match] SIMULACAO_OK — preencheria origem_do_negocio={dados['identificador']!r} "
-                f"no deal={escolhido['deal_id']} person={escolhido['person_id']} "
-                f"diferenca_seg={escolhido['diferenca_seg']} | NENHUMA ALTERACAO FOI FEITA",
-                flush=True
-            )
+            print(f"[rd-match] MATCH_OK deal={escolhido['deal_id']} person={escolhido['person_id']} diferenca_seg={escolhido['diferenca_seg']}", flush=True)
+            _rd_enriquecer_deal(escolhido["deal_id"], dados)
             return
         if len(candidatos) > 1:
             print(f"[rd-match] AMBIGUO — {len(candidatos)} negócios plausíveis; nada será alterado", flush=True)
             return
-
         print(f"[rd-match] Nenhum candidato na tentativa {tentativa}; aguardando nova busca", flush=True)
 
     print("[rd-match] SEM_CORRESPONDENCIA — nenhuma alteração foi feita", flush=True)
@@ -1354,23 +1465,23 @@ def rd_webhook():
             dados = _rd_extrair_lead(lead)
             print(
                 f"[rd-webhook] identificador={dados['identificador']!r} email={dados['email']!r} "
-                f"telefone={dados['telefone']!r} data_conversao={dados['data_conversao']!r}",
+                f"telefone={dados['telefone']!r} data_conversao={dados['data_conversao']!r} "
+                f"utms={{source:{dados['utm_source']!r}, campaign:{dados['utm_campaign']!r}, "
+                f"term:{dados['utm_term']!r}, content:{dados['utm_content']!r}, id:{dados['utm_id']!r}}}",
                 flush=True
             )
             if not dados["identificador"] or (not dados["email"] and not dados["telefone_norm"]):
                 print("[rd-match] IGNORADO — faltam identificador e/ou dados para localizar a pessoa", flush=True)
                 continue
-            t = threading.Thread(target=_rd_simular_correlacao, args=(dados,))
+            t = threading.Thread(target=_rd_correlacionar_e_enriquecer, args=(dados,))
             t.daemon = True
             t.start()
 
-        # Responde imediatamente ao RD; a correlação roda em background.
-        return jsonify({"status": "ok", "modo": "simulacao", "alterou_agendor": False}), 200
+        return jsonify({"status": "ok", "modo": "enriquecimento_seguro"}), 200
 
     except Exception as e:
         print(f"[rd-webhook] Erro ao processar payload: {e}", flush=True)
-        return jsonify({"status": "error", "modo": "simulacao", "alterou_agendor": False}), 200
-
+        return jsonify({"status": "error", "modo": "enriquecimento_seguro"}), 200
 
 @app.route("/agendor/deal-created", methods=["POST"])
 def agendor_deal_created():
