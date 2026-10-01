@@ -1381,24 +1381,29 @@ def _rd_enriquecer_deal(deal_id, dados):
         print(f"[rd-write] ERRO_GET deal={deal_id}: {e}", flush=True)
         return False
 
+    # Escrita controlada: neste momento só o slug origem_do_negocio está
+    # comprovado por teste real na API do Agendor. O GET omite campos vazios
+    # (customFields pode vir {}), portanto ausência do slug NÃO significa
+    # que o campo não exista. Os demais campos de marketing ficam somente
+    # em log até seus slugs/tipos serem validados individualmente.
     desejados = {
         "origem_do_negocio": origem_negocio,
-        RD_CAMPOS_AGENDOR["origem"]: dados.get("utm_source"),
-        RD_CAMPOS_AGENDOR["campanha"]: dados.get("utm_campaign"),
-        RD_CAMPOS_AGENDOR["grupo_anuncio"]: dados.get("utm_term"),
-        RD_CAMPOS_AGENDOR["anuncio"]: dados.get("utm_content"),
-        RD_CAMPOS_AGENDOR["meta_ads_source_id"]: dados.get("utm_id"),
     }
+
+    marketing_pendente = {
+        "origem": dados.get("utm_source"),
+        "campanha": dados.get("utm_campaign"),
+        "grupo_de_anuncio": dados.get("utm_term"),
+        "anuncio": dados.get("utm_content"),
+        "meta_ads_source_id": dados.get("utm_id"),
+    }
+    print(f"[rd-write] marketing_pendente_validacao={json.dumps(marketing_pendente, ensure_ascii=False)}", flush=True)
 
     atualizar = {}
     pulados = {}
     for slug, valor in desejados.items():
         if valor is None or str(valor).strip() == "":
             pulados[slug] = "sem_valor_no_RD"
-            continue
-        # Segurança: só tenta slugs que o próprio GET confirmou no negócio.
-        if slug not in custom:
-            pulados[slug] = "slug_nao_confirmado_no_Agendor"
             continue
         atual = _rd_valor_atual(custom, slug)
         if atual not in (None, "", [], {}):
