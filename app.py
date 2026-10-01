@@ -105,6 +105,67 @@ def validar_agendar_api_key() -> bool:
     return request.headers.get("X-API-Key", "") == AGENDAR_API_KEY
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
+
+# Adicionado 01/10/2026: limitador CENTRAL para a API do Agendor.
+# O limite documentado é 4 req/s. Usamos ~2,8 req/s (intervalo de 0,36s)
+# para manter margem e impedir que jobs, webhooks e rotinas concorrentes
+# estourem o limite quando rodam ao mesmo tempo. Todas as chamadas feitas
+# por requests.get/post/put/patch/delete para AGENDOR_BASE passam por aqui.
+_AGENDOR_MIN_INTERVAL = 0.36
+_AGENDOR_RATE_LOCK = threading.Lock()
+_AGENDOR_LAST_REQUEST_AT = 0.0
+_AGENDOR_429_RETRIES = 4
+
+_REQUESTS_ORIGINAL = {
+    "get": requests.get,
+    "post": requests.post,
+    "put": requests.put,
+    "patch": requests.patch,
+    "delete": requests.delete,
+}
+
+def _agendor_esperar_slot():
+    global _AGENDOR_LAST_REQUEST_AT
+    with _AGENDOR_RATE_LOCK:
+        agora = time.monotonic()
+        espera = _AGENDOR_MIN_INTERVAL - (agora - _AGENDOR_LAST_REQUEST_AT)
+        if espera > 0:
+            time.sleep(espera)
+        _AGENDOR_LAST_REQUEST_AT = time.monotonic()
+
+def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
+    # Não interfere em RD, Teams, Graph, AgendorChat, Autentique etc.
+    if not isinstance(url, str) or not url.startswith(AGENDOR_BASE):
+        return original(url, *args, **kwargs)
+
+    for tentativa in range(_AGENDOR_429_RETRIES + 1):
+        _agendor_esperar_slot()
+        resp = original(url, *args, **kwargs)
+        if resp.status_code != 429:
+            return resp
+
+        if tentativa >= _AGENDOR_429_RETRIES:
+            print(f"[agendor-rate] 429 persistente após {_AGENDOR_429_RETRIES + 1} tentativas: {metodo.upper()} {url}", flush=True)
+            return resp
+
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            espera_429 = float(retry_after) if retry_after else min(2 ** tentativa, 8)
+        except (TypeError, ValueError):
+            espera_429 = min(2 ** tentativa, 8)
+        espera_429 = max(1.0, espera_429)
+        print(f"[agendor-rate] 429 em {metodo.upper()} {url} — aguardando {espera_429:.1f}s antes da tentativa {tentativa + 2}/{_AGENDOR_429_RETRIES + 1}", flush=True)
+        time.sleep(espera_429)
+
+    return resp
+
+def _instalar_agendor_rate_limit():
+    for metodo, original in _REQUESTS_ORIGINAL.items():
+        def wrapper(url, *args, _metodo=metodo, _original=original, **kwargs):
+            return _agendor_request_controlado(_metodo, _original, url, *args, **kwargs)
+        setattr(requests, metodo, wrapper)
+
+_instalar_agendor_rate_limit()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AUTENTIQUE_TOKEN = os.environ.get("AUTENTIQUE_TOKEN", "")  # CONFIGURE via variável de ambiente
 AUTENTIQUE_TOKEN_USUARIO1 = os.environ.get("AUTENTIQUE_TOKEN_USUARIO1", "")  # CONFIGURE via variável de ambiente
