@@ -581,6 +581,10 @@ TEAMS_COPIA = [
 
 _azure_token_cache = {"token": None, "expira_em": 0}
 
+# Protege a janela crítica "checagem final da agenda -> criação do Teams".
+# Com um único worker, impede duas threads de reservarem o mesmo slot ao mesmo tempo.
+_TEAMS_AGENDAMENTO_LOCK = threading.Lock()
+
 
 def obter_token_azure() -> str:
     """Token de acesso app-only (client credentials) pra Microsoft Graph.
@@ -2332,6 +2336,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
 
         # ── 3. Reunião [Luca] — somente se há preferência de horário ─────────
         preferencia = (d.get("preferencia") or "").strip()
+        requer_validacao_time = False
         if preferencia:
             owner_id = (deal.get("owner") or {}).get("id")
             owner_id_int = int(owner_id) if owner_id else None
@@ -2344,60 +2349,92 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                 email_lead = (d.get("email") or "").strip()
                 if dt_iso and email_lead:
                     dt_pedido = datetime.strptime(dt_iso, "%Y-%m-%dT%H:%M")
-                    dt_local, ajustado = ajustar_horario_reuniao(dt_pedido, owner_id_int)
+                    # A preferência extraída é apenas a preferência do lead.
+                    # A confirmação REAL acontece abaixo, imediatamente antes da criação.
+                    # Nunca troca silenciosamente o horário por outro: se o slot pedido não
+                    # puder ser confirmado, o caso vai para validação humana.
+                    dt_local = dt_pedido
+                    requer_validacao_time = False
+                    motivo_validacao = ""
                     texto_reuniao = ("[Luca] Reunião com especialista — pré-agendada pelo Luca via WhatsApp, "
                                      f"aguardando confirmação do consultor. Preferência do lead: {preferencia}")
-                    if ajustado:
-                        texto_reuniao += (f" (horário ajustado de {dt_pedido.strftime('%H:%M')} para "
-                                           f"{dt_local.strftime('%H:%M')} para evitar conflito de agenda)")
 
-                    # Se houve ajuste por conflito, a mensagem que manda o
-                    # link pro lead avisa explicitamente — o ajuste antes
-                    # ficava só numa nota INTERNA do CRM, invisível pro
-                    # lead, que só descobria o horário certo ao entrar na
-                    # sala e ver o link.
-                    aviso_ajuste = (
-                        f" Só um detalhe: o horário das {dt_pedido.strftime('%H:%M')} já estava "
-                        f"ocupado, então já deixei encaixado certinho pra {dt_local.strftime('%H:%M')} "
-                        f"— o link abaixo já está com esse horário correto."
-                        if ajustado else ""
-                    )
-
-                    # ── Cria a reunião real no Teams e manda o link pro lead ─────
-                    # Falha aqui NUNCA bloqueia o resto do registro no CRM (fica
-                    # no mesmo fluxo manual de antes: consultor confirma e manda
-                    # o link depois) — e não marca reuniao_real_marcador, então
-                    # uma passada futura tenta de novo.
+                    # Checagem final fail-closed + lock contra corrida entre duas conversas.
+                    # Se a Graph falhar ou o horário já estiver ocupado, NÃO cria Teams.
                     try:
-                        linha_negocio = detectar_linha_negocio(d.get("segmento", ""))
-                        nome_reuniao = d.get("nome") or contact_name or "Lead"
-                        start_teams = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
-                        resultado_teams = create_teams_meeting(nome_reuniao, email_lead, start_teams, linha_negocio)
-                        teams_join_url = resultado_teams.get("join_url")
-                        if teams_join_url:
-                            texto_reuniao += f"\nLink da reunião (Teams): {teams_join_url}\n{reuniao_real_marcador}"
-                            print(f"[crm] ✅ Reunião Teams criada deal={deal_id} "
-                                  f"linha={linha_negocio} join_url={teams_join_url}", flush=True)
-                            mensagem_link = (
-                                f"Consegui deixar tudo pronto, {nome_reuniao.split(' ')[0]}!{aviso_ajuste} Aqui está o link "
-                                f"da nossa videochamada:\n{teams_join_url}\n\nQualquer dúvida antes, estou por aqui."
-                            )
-                            send_agendorchat_message(conversation_id, remover_travessao(mensagem_link))
-                        else:
-                            print(f"[crm] Reunião Teams criada mas sem join_url deal={deal_id}", flush=True)
-                    except Exception as e:
-                        print(f"[crm] Erro ao criar reunião no Teams deal={deal_id}: {e} — "
-                              f"seguindo sem o link automático (consultor confirma manualmente)", flush=True)
+                        with _TEAMS_AGENDAMENTO_LOCK:
+                            try:
+                                eventos_finais = buscar_eventos_do_dia_organizador(dt_local)
+                                fim_local = dt_local + timedelta(minutes=30)
+                                ocupado = any(dt_local < ev_fim and fim_local > ev_ini
+                                              for ev_ini, ev_fim in eventos_finais)
+                            except Exception as e:
+                                requer_validacao_time = True
+                                motivo_validacao = f"não foi possível validar a agenda automaticamente: {e}"
+                                ocupado = False
 
-                    due = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
-                    payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
-                    if owner_id:
-                        payload_reuniao["assigned_users"] = [int(owner_id)]
-                    r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
-                                       headers={**HEADERS, "Content-Type": "application/json"},
-                                       json=payload_reuniao, timeout=15)
-                    print(f"[crm] Reunião [Luca] deal={deal_id} due={due} status={r3.status_code} body={r3.text[:200]}", flush=True)
-                    ja_tem_reuniao_real = bool(teams_join_url)
+                            if ocupado:
+                                requer_validacao_time = True
+                                motivo_validacao = "horário solicitado já está ocupado na agenda do consultor"
+
+                            if not requer_validacao_time:
+                                linha_negocio = detectar_linha_negocio(d.get("segmento", ""))
+                                nome_reuniao = d.get("nome") or contact_name or "Lead"
+                                start_teams = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
+                                resultado_teams = create_teams_meeting(nome_reuniao, email_lead, start_teams, linha_negocio)
+                                teams_join_url = resultado_teams.get("join_url")
+                                if teams_join_url:
+                                    texto_reuniao += f"\nLink da reunião (Teams): {teams_join_url}\n{reuniao_real_marcador}"
+                                    print(f"[crm] ✅ Reunião Teams criada deal={deal_id} "
+                                          f"linha={linha_negocio} join_url={teams_join_url}", flush=True)
+                                    mensagem_link = (
+                                        f"Consegui deixar tudo pronto, {nome_reuniao.split(' ')[0]}! Aqui está o link "
+                                        f"da nossa videochamada:\n{teams_join_url}\n\nQualquer dúvida antes, estou por aqui."
+                                    )
+                                    send_agendorchat_message(conversation_id, remover_travessao(mensagem_link))
+                                else:
+                                    requer_validacao_time = True
+                                    motivo_validacao = "Teams criou a reunião sem retornar o link de acesso"
+                    except Exception as e:
+                        requer_validacao_time = True
+                        motivo_validacao = f"erro ao criar/validar reunião no Teams: {e}"
+
+                    if requer_validacao_time:
+                        print(f"[crm] ⚠️ Reunião NÃO criada automaticamente deal={deal_id}: {motivo_validacao}", flush=True)
+                        validacao_marcador = f"[luca:validar_horario:{conversation_id}]"
+                        if not deal_tem_marca(deal_id, validacao_marcador):
+                            texto_validacao = (
+                                "[Luca] VALIDAR HORÁRIO COM O TIME — não foi criada reunião automática. "
+                                f"Preferência do lead: {preferencia}. Motivo: {motivo_validacao}. "
+                                f"{validacao_marcador}"
+                            )
+                            payload_validacao = {
+                                "text": texto_validacao,
+                                "type": "tarefa",
+                                "due_date": dt_local.strftime("%Y-%m-%dT%H:%M:%S"),
+                            }
+                            if owner_id:
+                                payload_validacao["assigned_users"] = [int(owner_id)]
+                            rv = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                                               headers={**HEADERS, "Content-Type": "application/json"},
+                                               json=payload_validacao, timeout=15)
+                            print(f"[crm] Validação humana de horário criada deal={deal_id} "
+                                  f"status={rv.status_code}", flush=True)
+                            mensagem_validacao = (
+                                "Entendi! Nesse horário eu não consigo confirmar automaticamente. "
+                                "Vou validar essa possibilidade com o nosso time e eles te retornam por aqui, combinado?"
+                            )
+                            send_agendorchat_message(conversation_id, remover_travessao(mensagem_validacao))
+                    else:
+                        due = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
+                        payload_reuniao = {"text": texto_reuniao, "type": "reuniao", "due_date": due}
+                        if owner_id:
+                            payload_reuniao["assigned_users"] = [int(owner_id)]
+                        r3 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                                           headers={**HEADERS, "Content-Type": "application/json"},
+                                           json=payload_reuniao, timeout=15)
+                        print(f"[crm] Reunião [Luca] deal={deal_id} due={due} status={r3.status_code} body={r3.text[:200]}", flush=True)
+                        ja_tem_reuniao_real = bool(teams_join_url)
                 else:
                     # Sem data real confirmada ainda, ou sem e-mail ainda —
                     # cria só a tarefa de fallback "HORÁRIO A CONFIRMAR", com
@@ -2428,8 +2465,14 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                             print(f"[crm] Sem e-mail do lead — não foi possível criar reunião automática "
                                   f"no Teams deal={deal_id} (consultor confirma manualmente)", flush=True)
 
+            # Só marca como reunião agendada quando houve reunião real ou quando
+            # seguimos o fluxo legado sem pendência explícita de validação humana.
+            if requer_validacao_time:
+                print(f"[crm] Campo/etapa de reunião NÃO atualizados — aguardando validação humana deal={deal_id}", flush=True)
+                campo = {}
+            else:
+                campo = resolver_campo_agendada_por()
             # ── 4. Campo personalizado 'Reunião agendada por' = Luca ─────────
-            campo = resolver_campo_agendada_por()
             if campo.get("key") and campo.get("luca_id"):
                 r4 = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}",
                                   headers={**HEADERS, "Content-Type": "application/json"},
@@ -2453,7 +2496,9 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             funil_atual_id = (deal_stage.get("funnel") or {}).get("id")
             etapa_atual_id = deal_stage.get("id")
 
-            if funil_atual_id == FUNIL_COMERCIAL_ID:
+            if requer_validacao_time:
+                print(f"[crm] Etapa não movida — horário aguardando validação humana deal={deal_id}", flush=True)
+            elif funil_atual_id == FUNIL_COMERCIAL_ID:
                 idx_atual = (ORDEM_ETAPAS_FUNIL_COMERCIAL.index(etapa_atual_id)
                              if etapa_atual_id in ORDEM_ETAPAS_FUNIL_COMERCIAL else None)
                 idx_alvo = ORDEM_ETAPAS_FUNIL_COMERCIAL.index(ETAPA_REUNIAO_AGENDADA_ID)
@@ -2957,14 +3002,14 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                                     f"o horário {dt_pedido.strftime('%Hh%M')} que o lead acabou de pedir já "
                                     f"está ocupado na agenda do consultor. Em vez de anotar esse horário, "
                                     f"sugira estas duas opções no mesmo dia: {opcoes}. Se o lead disser que "
-                                    f"não pode em nenhuma das duas, aceite o horário original mesmo assim, "
-                                    f"sem insistir mais."
+                                    f"não pode em nenhuma das duas, NÃO confirme nem agende o horário ocupado. "
+                                    f"Diga que vai validar essa possibilidade com o time e que eles retornam por aqui."
                                 )
                             else:
                                 extra_disponibilidade = (
                                     f"\n\nATENÇÃO (checagem real de agenda, não mencione isso ao lead): não "
-                                    f"achei horário livre nesse dia pra sugerir. Aceite a preferência do lead "
-                                    f"normalmente."
+                                    f"achei horário livre nesse dia pra sugerir. NÃO confirme o horário pedido. "
+                                    f"Diga que vai validar a possibilidade com o time e que eles retornam por aqui."
                                 )
                             print(f"[disponibilidade] Horário {dt_pedido.strftime('%Y-%m-%d %H:%M')} ocupado, "
                                   f"{len(alternativas)} alternativa(s) sugerida(s) conv={conversation_id}", flush=True)
@@ -3991,7 +4036,24 @@ def agendar():
         if not lead_email or not start:
             return jsonify({"error": "lead_email e start são obrigatórios"}), 400
 
-        result = create_teams_meeting(lead_name, lead_email, start, linha_negocio)
+        # A rota manual também passa pela mesma trava final anti-conflito.
+        # Assim não existe um segundo caminho capaz de criar reunião por cima
+        # de um evento já existente na agenda do organizador.
+        dt_start = datetime.strptime(start[:19], "%Y-%m-%dT%H:%M:%S")
+        with _TEAMS_AGENDAMENTO_LOCK:
+            try:
+                eventos = buscar_eventos_do_dia_organizador(dt_start)
+            except Exception as e:
+                print(f"[agendar] Não foi possível validar agenda: {e}", flush=True)
+                return jsonify({
+                    "error": "Não foi possível validar a disponibilidade. Validar com o time antes de agendar."
+                }), 503
+            fim_start = dt_start + timedelta(minutes=30)
+            if any(dt_start < ev_fim and fim_start > ev_ini for ev_ini, ev_fim in eventos):
+                return jsonify({
+                    "error": "Horário ocupado. Validar outra disponibilidade com o time."
+                }), 409
+            result = create_teams_meeting(lead_name, lead_email, start, linha_negocio)
         return jsonify(result), 200
 
     except requests.HTTPError as e:
