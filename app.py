@@ -1239,6 +1239,53 @@ def reset_fetch():
 
 
 
+# ── RD Station Marketing: OAuth2 ─────────────────────────────────────────────
+# Credenciais ficam exclusivamente no Railway. Nunca gravar client_secret ou
+# tokens no código/logs. A callback recebe o code de autorização do RD.
+RD_CLIENT_ID = os.environ.get("RD_CLIENT_ID", "")
+RD_CLIENT_SECRET = os.environ.get("RD_CLIENT_SECRET", "")
+RD_OAUTH_CALLBACK = os.environ.get(
+    "RD_OAUTH_CALLBACK",
+    "https://agendo-proxy-production.up.railway.app/rd/oauth/callback",
+)
+
+
+@app.route("/rd/oauth/callback", methods=["GET"])
+def rd_oauth_callback():
+    """Callback OAuth2 do RD Station Marketing.
+
+    Nesta primeira etapa, recebe e valida a presença do code sem expô-lo em
+    logs ou na resposta. A troca por access_token/refresh_token será habilitada
+    somente depois que RD_CLIENT_ID e RD_CLIENT_SECRET estiverem configurados
+    com segurança no Railway.
+    """
+    erro = (request.args.get("error") or "").strip()
+    erro_descricao = (request.args.get("error_description") or "").strip()
+    code = (request.args.get("code") or "").strip()
+
+    if erro:
+        print(f"[rd-oauth] autorização recusada/erro: {erro}", flush=True)
+        return jsonify({
+            "status": "erro",
+            "mensagem": erro_descricao or "O RD Station não autorizou a integração.",
+        }), 400
+
+    if not code:
+        print("[rd-oauth] callback recebido sem code", flush=True)
+        return jsonify({
+            "status": "erro",
+            "mensagem": "Callback recebido sem código de autorização.",
+        }), 400
+
+    # Nunca registrar o code: ele é uma credencial temporária de uso único.
+    print("[rd-oauth] code recebido com sucesso (valor omitido do log)", flush=True)
+    return jsonify({
+        "status": "ok",
+        "mensagem": "Autorização recebida pelo Luca. O código não foi exposto nem registrado em log.",
+        "credenciais_configuradas": bool(RD_CLIENT_ID and RD_CLIENT_SECRET),
+    }), 200
+
+
 # ── RD Station: webhook V3 — correlação + enriquecimento seguro ─────────────
 # Recebe a conversão, localiza de forma conservadora o negócio correspondente
 # e preenche SOMENTE campos vazios. Identificadores desconhecidos são ignorados.
