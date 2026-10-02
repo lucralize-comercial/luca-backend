@@ -779,13 +779,14 @@ def checar_e_sugerir_horario(dt_pedido: datetime, duracao_min: int = 30):
     15 min, alternando pra frente e pra trás a partir do pedido, dentro do
     horário comercial 9h-17h) e retorna (False, [alternativas]).
     Fail-safe: se a chamada à agenda falhar por qualquer motivo (API fora,
-    permissão, etc.), assume disponível — nunca bloqueia o agendamento por
-    causa de um erro técnico aqui."""
+    permissão, timeout etc.), considera o horário NÃO confirmado. Isso evita
+    dizer ao lead que um slot está disponível sem conseguir validar a agenda;
+    o fluxo segue para validação com o time em vez de correr risco de conflito."""
     try:
         eventos = buscar_eventos_do_dia_organizador(dt_pedido)
     except Exception as e:
-        print(f"[disponibilidade] Erro ao buscar agenda real, assumindo disponível: {e}", flush=True)
-        return True, []
+        print(f"[disponibilidade] Erro ao buscar agenda real — horário NÃO confirmado: {e}", flush=True)
+        return False, []
 
     fim_pedido = dt_pedido + timedelta(minutes=duracao_min)
 
