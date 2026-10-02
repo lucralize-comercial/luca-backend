@@ -1240,25 +1240,83 @@ def reset_fetch():
 
 
 # ── RD Station Marketing: OAuth2 ─────────────────────────────────────────────
-# Credenciais ficam exclusivamente no Railway. Nunca gravar client_secret ou
-# tokens no código/logs. A callback recebe o code de autorização do RD.
+# Credenciais ficam exclusivamente no Railway. Nunca gravar client_secret, code
+# ou tokens em logs/respostas. Tokens ficam em memória nesta etapa; depois da
+# validação da API histórica, definiremos persistência durável separadamente.
 RD_CLIENT_ID = os.environ.get("RD_CLIENT_ID", "")
 RD_CLIENT_SECRET = os.environ.get("RD_CLIENT_SECRET", "")
 RD_OAUTH_CALLBACK = os.environ.get(
     "RD_OAUTH_CALLBACK",
     "https://agendo-proxy-production.up.railway.app/rd/oauth/callback",
 )
+RD_TOKEN_URL = "https://api.rd.services/auth/token"
 
+_rd_token_lock = threading.Lock()
+_rd_tokens = {
+    "access_token": os.environ.get("RD_ACCESS_TOKEN", ""),
+    "refresh_token": os.environ.get("RD_REFRESH_TOKEN", ""),
+    "expires_at": 0.0,
+}
+
+def _rd_salvar_tokens_em_memoria(data):
+    access = (data or {}).get("access_token") or ""
+    refresh = (data or {}).get("refresh_token") or ""
+    if not access or not refresh:
+        raise ValueError("Resposta do RD não trouxe access_token e refresh_token")
+    expires_in = int((data or {}).get("expires_in") or 86400)
+    with _rd_token_lock:
+        _rd_tokens["access_token"] = access
+        _rd_tokens["refresh_token"] = refresh
+        _rd_tokens["expires_at"] = time.time() + expires_in
+
+def _rd_trocar_code_por_tokens(code):
+    r = requests.post(
+        f"{RD_TOKEN_URL}?token_by=code",
+        json={
+            "client_id": RD_CLIENT_ID,
+            "client_secret": RD_CLIENT_SECRET,
+            "code": code,
+        },
+        timeout=20,
+    )
+    if r.status_code != 200:
+        print(f"[rd-oauth] falha na troca do code: status={r.status_code}", flush=True)
+        raise RuntimeError(f"RD token exchange falhou com HTTP {r.status_code}")
+    _rd_salvar_tokens_em_memoria(r.json())
+
+def _rd_renovar_access_token():
+    with _rd_token_lock:
+        refresh = _rd_tokens.get("refresh_token") or ""
+    if not refresh:
+        raise RuntimeError("RD refresh_token ainda não está disponível")
+    r = requests.post(
+        RD_TOKEN_URL,
+        json={
+            "client_id": RD_CLIENT_ID,
+            "client_secret": RD_CLIENT_SECRET,
+            "refresh_token": refresh,
+        },
+        timeout=20,
+    )
+    if r.status_code != 200:
+        print(f"[rd-oauth] falha ao renovar access_token: status={r.status_code}", flush=True)
+        raise RuntimeError(f"RD refresh falhou com HTTP {r.status_code}")
+    _rd_salvar_tokens_em_memoria(r.json())
+
+def _rd_obter_access_token():
+    with _rd_token_lock:
+        token = _rd_tokens.get("access_token") or ""
+        expira = float(_rd_tokens.get("expires_at") or 0)
+    # Tokens carregados do ambiente não têm expires_at conhecido; usa até 401.
+    if token and (not expira or time.time() < expira - 300):
+        return token
+    _rd_renovar_access_token()
+    with _rd_token_lock:
+        return _rd_tokens["access_token"]
 
 @app.route("/rd/oauth/callback", methods=["GET"])
 def rd_oauth_callback():
-    """Callback OAuth2 do RD Station Marketing.
-
-    Nesta primeira etapa, recebe e valida a presença do code sem expô-lo em
-    logs ou na resposta. A troca por access_token/refresh_token será habilitada
-    somente depois que RD_CLIENT_ID e RD_CLIENT_SECRET estiverem configurados
-    com segurança no Railway.
-    """
+    """Recebe o code OAuth do RD Marketing e o troca pelos tokens sem expô-los."""
     erro = (request.args.get("error") or "").strip()
     erro_descricao = (request.args.get("error_description") or "").strip()
     code = (request.args.get("code") or "").strip()
@@ -1277,14 +1335,28 @@ def rd_oauth_callback():
             "mensagem": "Callback recebido sem código de autorização.",
         }), 400
 
-    # Nunca registrar o code: ele é uma credencial temporária de uso único.
-    print("[rd-oauth] code recebido com sucesso (valor omitido do log)", flush=True)
-    return jsonify({
-        "status": "ok",
-        "mensagem": "Autorização recebida pelo Luca. O código não foi exposto nem registrado em log.",
-        "credenciais_configuradas": bool(RD_CLIENT_ID and RD_CLIENT_SECRET),
-    }), 200
+    if not RD_CLIENT_ID or not RD_CLIENT_SECRET:
+        print("[rd-oauth] credenciais RD ausentes no ambiente", flush=True)
+        return jsonify({
+            "status": "erro",
+            "mensagem": "Credenciais do RD Station não estão configuradas no servidor.",
+        }), 500
 
+    try:
+        # Nunca registrar o code: credencial temporária de uso único.
+        _rd_trocar_code_por_tokens(code)
+        print("[rd-oauth] autorização concluída; tokens recebidos e valores omitidos do log", flush=True)
+        return jsonify({
+            "status": "ok",
+            "mensagem": "RD Station conectado ao Luca com sucesso.",
+            "tokens_recebidos": True,
+        }), 200
+    except Exception as e:
+        print(f"[rd-oauth] erro concluindo autorização: {type(e).__name__}: {e}", flush=True)
+        return jsonify({
+            "status": "erro",
+            "mensagem": "O RD autorizou a conexão, mas houve erro ao gerar os tokens.",
+        }), 502
 
 # ── RD Station: webhook V3 — correlação + enriquecimento seguro ─────────────
 # Recebe a conversão, localiza de forma conservadora o negócio correspondente
@@ -1297,11 +1369,21 @@ RD_ORIGEM_DE_PARA = {
     "Transformação do MEI": "Transformação do MEI",
     "whatsapp_pagina": "whatsapp_pagina",
     "leo-marconi": "leo-marconi",
-    "calculadora-lucralize": "calculadora-de-impostos-e-ir-sobre-dividendos",
     "Formulário Meta Afiliados - Alexia": "Formulário Meta Afiliados - Alexia",
 }
 
 # Slugs esperados dos campos personalizados do negócio no Agendor.
+def _rd_mapear_origem_negocio(identificador):
+    """Regra validada: qualquer calculadora sem 'dividendos' é a calculadora dev."""
+    valor = (identificador or "").strip()
+    normalizado = valor.lower()
+    if "calculadora" in normalizado:
+        if "dividendos" in normalizado:
+            return "calculadora-de-impostos-e-ir-sobre-dividendos"
+        return "calculadora-impostos-desenvolvedores"
+    return RD_ORIGEM_DE_PARA.get(valor)
+
+
 RD_CAMPOS_AGENDOR = {
     "origem": "origem",
     "campanha": "campanha",
@@ -1349,6 +1431,21 @@ def _rd_extrair_lead(lead):
     original = content.get("__cdp__original_event") or {}
     original_payload = original.get("payload") or {}
     utms = _rd_parse_conversion_payload(content)
+
+    # Alguns formulários do RD entregam atribuição em traffic_source como
+    # query string. conversion_payload continua tendo prioridade; só completa
+    # chaves ausentes, sem substituir o que já veio na fonte principal.
+    traffic_source = content.get("traffic_source") or ""
+    if traffic_source:
+        try:
+            qs_traffic = parse_qs(str(traffic_source).lstrip("?"), keep_blank_values=False)
+            for chave in ("utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_id", "utm_term"):
+                if not utms.get(chave):
+                    valores = qs_traffic.get(chave) or []
+                    if valores:
+                        utms[chave] = valores[0]
+        except Exception as e:
+            print(f"[rd-webhook] Falha lendo traffic_source/UTMs: {e}", flush=True)
 
     identificador = (
         content.get("event_identifier")
@@ -1415,7 +1512,7 @@ def _rd_valor_atual(custom, slug):
 
 def _rd_enriquecer_deal(deal_id, dados):
     """Preenche apenas campos existentes e vazios; nunca sobrescreve."""
-    origem_negocio = RD_ORIGEM_DE_PARA.get(dados.get("identificador"))
+    origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
     if not origem_negocio:
         print(f"[rd-write] IGNORADO_IDENTIFICADOR — {dados.get('identificador')!r} não está no DE/PARA", flush=True)
         return False
@@ -1482,14 +1579,14 @@ def _rd_enriquecer_deal(deal_id, dados):
 
 def _rd_correlacionar_e_enriquecer(dados):
     """Localiza candidato inequívoco e, somente então, enriquece o negócio."""
-    if dados.get("identificador") not in RD_ORIGEM_DE_PARA:
+    if not _rd_mapear_origem_negocio(dados.get("identificador")):
         print(f"[rd-match] IGNORADO_IDENTIFICADOR — {dados.get('identificador')!r} fora do DE/PARA; nada será alterado", flush=True)
         return
 
-    for tentativa, espera in enumerate((10, 30, 60), start=1):
+    for tentativa, espera in enumerate((10, 20, 30, 60, 90, 90), start=1):
         time.sleep(espera)
         pessoas = _rd_buscar_pessoas(dados["email"], dados["telefone_norm"])
-        print(f"[rd-match] tentativa={tentativa}/3 pessoas_encontradas={len(pessoas)}", flush=True)
+        print(f"[rd-match] tentativa={tentativa}/6 pessoas_encontradas={len(pessoas)}", flush=True)
 
         candidatos = []
         dt_rd = _rd_parse_iso(dados["data_conversao"])
