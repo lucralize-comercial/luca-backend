@@ -10,7 +10,7 @@ import threading
 import json
 import hmac
 import hashlib
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
@@ -1314,6 +1314,52 @@ def _rd_obter_access_token():
     with _rd_token_lock:
         return _rd_tokens["access_token"]
 
+def _rd_diagnostico_historico_leitura():
+    """Teste estritamente GET da API histórica do RD; não expõe token nem PII."""
+    try:
+        token = _rd_obter_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        email_teste = "xevovol377@deertees.com"
+        contato_url = "https://api.rd.services/platform/contacts/email:" + quote(email_teste, safe="@")
+        r_contato = requests.get(contato_url, headers=headers, timeout=20)
+        print(f"[rd-read-test] contato HTTP={r_contato.status_code}", flush=True)
+        if r_contato.status_code != 200:
+            return
+        contato = r_contato.json() if r_contato.content else {}
+        uuid = (contato or {}).get("uuid") or ""
+        print(f"[rd-read-test] contato_ok uuid_presente={bool(uuid)} campos={sorted((contato or {}).keys())}", flush=True)
+        if not uuid:
+            return
+        eventos_url = f"https://api.rd.services/platform/contacts/{quote(uuid, safe='')}/events"
+        r_eventos = requests.get(eventos_url, headers=headers, params={"event_type": "CONVERSION"}, timeout=20)
+        print(f"[rd-read-test] eventos CONVERSION HTTP={r_eventos.status_code}", flush=True)
+        if r_eventos.status_code != 200:
+            return
+        payload = r_eventos.json() if r_eventos.content else {}
+        if isinstance(payload, dict):
+            eventos = payload.get("events") or payload.get("data") or payload.get("items") or []
+            print(f"[rd-read-test] resposta_eventos campos={sorted(payload.keys())} qtd_detectada={len(eventos) if isinstance(eventos, list) else 'n/d'}", flush=True)
+        elif isinstance(payload, list):
+            eventos = payload
+            print(f"[rd-read-test] resposta_eventos lista qtd={len(eventos)}", flush=True)
+        else:
+            eventos = []
+            print("[rd-read-test] formato_eventos_nao_reconhecido", flush=True)
+        if isinstance(eventos, list) and eventos:
+            amostra = eventos[0] if isinstance(eventos[0], dict) else {}
+            conteudo = amostra.get("payload") or amostra.get("content") or amostra.get("conversion") or {}
+            print(f"[rd-read-test] amostra campos={sorted(amostra.keys())} campos_conteudo={sorted(conteudo.keys()) if isinstance(conteudo, dict) else []}", flush=True)
+            if isinstance(conteudo, dict):
+                marketing = {}
+                for chave in ("conversion_identifier", "event_identifier", "traffic_source", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id"):
+                    valor = conteudo.get(chave)
+                    if valor not in (None, "", [], {}):
+                        marketing[chave] = valor
+                print(f"[rd-read-test] marketing={marketing}", flush=True)
+        print("[rd-read-test] concluido_sem_escrita", flush=True)
+    except Exception as e:
+        print(f"[rd-read-test] erro={type(e).__name__}: {str(e)[:180]}", flush=True)
+
 @app.route("/rd/oauth/callback", methods=["GET"])
 def rd_oauth_callback():
     """Recebe o code OAuth do RD Marketing e o troca pelos tokens sem expô-los."""
@@ -1346,6 +1392,8 @@ def rd_oauth_callback():
         # Nunca registrar o code: credencial temporária de uso único.
         _rd_trocar_code_por_tokens(code)
         print("[rd-oauth] autorização concluída; tokens recebidos e valores omitidos do log", flush=True)
+        t_diag = threading.Thread(target=_rd_diagnostico_historico_leitura, daemon=True)
+        t_diag.start()
         return jsonify({
             "status": "ok",
             "mensagem": "RD Station conectado ao Luca com sucesso.",
