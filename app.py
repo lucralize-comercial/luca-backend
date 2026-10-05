@@ -1678,25 +1678,39 @@ def _rd_deal_person_id(deal):
 
 
 def _rd_dryrun_deals_candidatos(dias, limite):
-    """Seleciona, sem escrever, negócios do funil comercial originados do RD."""
+    """Seleciona negócios recentes do funil comercial, sem escrever.
+
+    A origem RD NÃO é inferida nesta seleção. Ela só é confirmada depois,
+    usando contato RD + evento CONVERSION + janela temporal + DE/PARA.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=dias)
     candidatos = []
-    for deal in list(cache.get("deals") or []):
+    deals_cache = list(cache.get("deals") or [])
+    no_funil = 0
+    com_data = 0
+    no_periodo = 0
+    for deal in deals_cache:
         stage = deal.get("dealStage") or {}
         funnel_id = (stage.get("funnel") or {}).get("id")
         if funnel_id != FUNIL_COMERCIAL_ID:
             continue
-        if "RD Station" not in (deal.get("description") or ""):
-            continue
+        no_funil += 1
         dt = _rd_parse_iso(deal.get("startTime"))
         if not dt:
             continue
+        com_data += 1
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         if dt.astimezone(timezone.utc) < cutoff:
             continue
+        no_periodo += 1
         candidatos.append(deal)
     candidatos.sort(key=lambda d: _rd_parse_iso(d.get("startTime")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    print(
+        f"[rd-dryrun] selecao cache_total={len(deals_cache)} funil_comercial={no_funil} "
+        f"com_startTime={com_data} ultimos_{dias}d={no_periodo} selecionados={min(len(candidatos), limite)}",
+        flush=True,
+    )
     return candidatos[:limite]
 
 
