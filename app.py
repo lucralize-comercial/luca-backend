@@ -1608,6 +1608,286 @@ def _rd_valor_atual(custom, slug):
     return atual
 
 
+# ── RD Station: retroativo em DRY-RUN (somente leitura) ─────────────────────
+# Esta rotina NÃO possui nenhum requests.put/post/patch/delete. Ela parte dos
+# negócios RD Station já existentes no Agendor nos últimos N dias, localiza o
+# contato correspondente no RD por e-mail e lê as conversões históricas. O
+# resultado é apenas uma simulação dos campos que poderiam ser preenchidos.
+RD_DRYRUN_MAX_DIAS = 30
+RD_DRYRUN_MAX_ITENS = 250
+_rd_dryrun_lock = threading.Lock()
+_rd_dryrun_state = {
+    "status": "nunca_executado",
+    "started_at": None,
+    "finished_at": None,
+    "resultado": None,
+    "erro": None,
+}
+
+
+def _rd_eventos_lista(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for chave in ("events", "data", "items"):
+            valor = payload.get(chave)
+            if isinstance(valor, list):
+                return valor
+    return []
+
+
+def _rd_evento_para_dados(evento, contato, fallback_email=""):
+    """Converte um evento histórico CONVERSION para o mesmo formato do webhook."""
+    if not isinstance(evento, dict):
+        return {}
+    conteudo = evento.get("payload") or evento.get("content") or evento.get("conversion") or {}
+    if not isinstance(conteudo, dict):
+        conteudo = {}
+
+    # Reaproveita exatamente o parser de UTMs já validado no webhook.
+    pseudo_lead = {
+        "id": (contato or {}).get("uuid") or (contato or {}).get("id"),
+        "name": (contato or {}).get("name"),
+        "email": (contato or {}).get("email") or fallback_email,
+        "mobile_phone": (contato or {}).get("mobile_phone"),
+        "phone": (contato or {}).get("phone"),
+        "last_conversion": {
+            "source": evento.get("source"),
+            "created_at": evento.get("created_at") or evento.get("event_timestamp"),
+            "content": conteudo,
+        },
+    }
+    dados = _rd_extrair_lead(pseudo_lead)
+    if not dados.get("data_conversao"):
+        dados["data_conversao"] = (
+            evento.get("event_timestamp") or evento.get("created_at")
+            or evento.get("timestamp") or evento.get("date")
+        )
+    return dados
+
+
+def _rd_deal_person_id(deal):
+    for chave in ("person", "personEntity"):
+        obj = deal.get(chave)
+        if isinstance(obj, dict) and obj.get("id"):
+            return obj.get("id")
+    for chave in ("personId", "person_id"):
+        if deal.get(chave):
+            return deal.get(chave)
+    return None
+
+
+def _rd_dryrun_deals_candidatos(dias, limite):
+    """Seleciona, sem escrever, negócios do funil comercial originados do RD."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=dias)
+    candidatos = []
+    for deal in list(cache.get("deals") or []):
+        stage = deal.get("dealStage") or {}
+        funnel_id = (stage.get("funnel") or {}).get("id")
+        if funnel_id != FUNIL_COMERCIAL_ID:
+            continue
+        if "RD Station" not in (deal.get("description") or ""):
+            continue
+        dt = _rd_parse_iso(deal.get("startTime"))
+        if not dt:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.astimezone(timezone.utc) < cutoff:
+            continue
+        candidatos.append(deal)
+    candidatos.sort(key=lambda d: _rd_parse_iso(d.get("startTime")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return candidatos[:limite]
+
+
+def _rd_dryrun_executar(dias=30, limite=250):
+    """Executa o retroativo em modo estritamente GET e guarda apenas o relatório."""
+    if not _rd_dryrun_lock.acquire(blocking=False):
+        return False
+    try:
+        _rd_dryrun_state.update({
+            "status": "executando", "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None, "resultado": None, "erro": None,
+        })
+        token = _rd_obter_access_token()
+        rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        deals = _rd_dryrun_deals_candidatos(dias, limite)
+        resumo = {
+            "modo": "DRY_RUN_SOMENTE_GET",
+            "dias": dias,
+            "limite": limite,
+            "candidatos_agendor": len(deals),
+            "analisados": 0,
+            "contatos_rd_encontrados": 0,
+            "eventos_conversao_lidos": 0,
+            "match_seguro": 0,
+            "sem_match_temporal": 0,
+            "sem_contato_rd": 0,
+            "sem_email": 0,
+            "identificador_fora_depara": 0,
+            "ja_totalmente_preenchido": 0,
+            "erros": 0,
+            "would_fill_por_campo": {
+                "origem_do_negocio": 0, "origem": 0, "campanha": 0,
+                "grupo_de_anuncio": 0, "anuncio": 0, "meta_ads_source_id": 0,
+            },
+            "amostras": [],
+        }
+
+        for deal_base in deals:
+            resumo["analisados"] += 1
+            deal_id = deal_base.get("id")
+            try:
+                # GET fresco: precisamos dos customFields atuais e do person id.
+                r_deal = requests.get(
+                    f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+                    params={"withCustomFields": "true"}, timeout=20,
+                )
+                r_deal.raise_for_status()
+                deal = r_deal.json().get("data") or r_deal.json()
+                custom = deal.get("customFields") or {}
+                person_id = _rd_deal_person_id(deal) or _rd_deal_person_id(deal_base)
+                email = ""
+                if person_id:
+                    r_pessoa = requests.get(f"{AGENDOR_BASE}/people/{person_id}", headers=HEADERS, timeout=20)
+                    if r_pessoa.status_code == 200:
+                        pessoa = r_pessoa.json().get("data") or r_pessoa.json()
+                        email = (pessoa.get("email") or "").strip().lower()
+                        if not email:
+                            emails = pessoa.get("emails") or []
+                            if isinstance(emails, list) and emails:
+                                primeiro = emails[0]
+                                email = ((primeiro.get("email") if isinstance(primeiro, dict) else primeiro) or "").strip().lower()
+                if not email:
+                    resumo["sem_email"] += 1
+                    continue
+
+                r_contato = requests.get(
+                    "https://api.rd.services/platform/contacts/email:" + quote(email, safe="@"),
+                    headers=rd_headers, timeout=20,
+                )
+                if r_contato.status_code == 404:
+                    resumo["sem_contato_rd"] += 1
+                    continue
+                r_contato.raise_for_status()
+                contato = r_contato.json() if r_contato.content else {}
+                uuid = (contato or {}).get("uuid") or ""
+                if not uuid:
+                    resumo["sem_contato_rd"] += 1
+                    continue
+                resumo["contatos_rd_encontrados"] += 1
+
+                r_eventos = requests.get(
+                    f"https://api.rd.services/platform/contacts/{quote(uuid, safe='')}/events",
+                    headers=rd_headers, params={"event_type": "CONVERSION"}, timeout=20,
+                )
+                r_eventos.raise_for_status()
+                eventos = _rd_eventos_lista(r_eventos.json() if r_eventos.content else {})
+                resumo["eventos_conversao_lidos"] += len(eventos)
+
+                dt_deal = _rd_parse_iso(deal.get("startTime") or deal_base.get("startTime"))
+                if dt_deal and dt_deal.tzinfo is None:
+                    dt_deal = dt_deal.replace(tzinfo=timezone.utc)
+                plausiveis = []
+                for evento in eventos:
+                    dados = _rd_evento_para_dados(evento, contato, email)
+                    dt_rd = _rd_parse_iso(dados.get("data_conversao"))
+                    if dt_rd and dt_rd.tzinfo is None:
+                        dt_rd = dt_rd.replace(tzinfo=timezone.utc)
+                    if not dt_rd or not dt_deal:
+                        continue
+                    diff = abs((dt_deal.astimezone(timezone.utc) - dt_rd.astimezone(timezone.utc)).total_seconds())
+                    if diff <= 20 * 60:
+                        plausiveis.append((diff, dados))
+
+                plausiveis.sort(key=lambda x: x[0])
+                if not plausiveis:
+                    resumo["sem_match_temporal"] += 1
+                    continue
+                # Mais de um evento na mesma janela pode indicar atribuição ambígua.
+                if len(plausiveis) > 1 and abs(plausiveis[1][0] - plausiveis[0][0]) < 1:
+                    resumo["sem_match_temporal"] += 1
+                    continue
+                diff, dados = plausiveis[0]
+                origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
+                if not origem_negocio:
+                    resumo["identificador_fora_depara"] += 1
+                    continue
+                resumo["match_seguro"] += 1
+
+                desejados = {
+                    "origem_do_negocio": origem_negocio,
+                    "origem": dados.get("utm_source"),
+                    "campanha": dados.get("utm_campaign"),
+                    "grupo_de_anuncio": dados.get("utm_term"),
+                    "anuncio": dados.get("utm_content"),
+                    "meta_ads_source_id": dados.get("utm_id"),
+                }
+                would_fill = {}
+                ja_preenchidos = []
+                for slug, valor in desejados.items():
+                    if valor is None or str(valor).strip() == "":
+                        continue
+                    atual = _rd_valor_atual(custom, slug)
+                    if atual not in (None, "", [], {}):
+                        ja_preenchidos.append(slug)
+                        continue
+                    would_fill[slug] = str(valor).strip()
+                    resumo["would_fill_por_campo"][slug] += 1
+                if not would_fill:
+                    resumo["ja_totalmente_preenchido"] += 1
+                if len(resumo["amostras"]) < 25:
+                    resumo["amostras"].append({
+                        "deal_id": deal_id,
+                        "identificador": dados.get("identificador"),
+                        "diferenca_seg": round(diff, 1),
+                        "would_fill": would_fill,
+                        "ja_preenchidos": ja_preenchidos,
+                    })
+            except Exception as e:
+                resumo["erros"] += 1
+                print(f"[rd-dryrun] erro deal={deal_id}: {type(e).__name__}: {str(e)[:180]}", flush=True)
+
+        _rd_dryrun_state.update({
+            "status": "concluido", "finished_at": datetime.now(timezone.utc).isoformat(),
+            "resultado": resumo, "erro": None,
+        })
+        print(f"[rd-dryrun] concluido resumo={json.dumps(resumo, ensure_ascii=False, default=str)}", flush=True)
+        return True
+    except Exception as e:
+        _rd_dryrun_state.update({
+            "status": "erro", "finished_at": datetime.now(timezone.utc).isoformat(),
+            "erro": f"{type(e).__name__}: {str(e)[:300]}",
+        })
+        print(f"[rd-dryrun] erro_geral={type(e).__name__}: {str(e)[:180]}", flush=True)
+        return False
+    finally:
+        _rd_dryrun_lock.release()
+
+
+@app.route("/rd/retroativo/dry-run", methods=["POST", "GET"])
+def rd_retroativo_dry_run():
+    """Dispara/consulta o dry-run. Exige a mesma chave privada da rota /agendar."""
+    # Ao contrário da rota /agendar antiga, aqui NÃO existe fail-open: se a
+    # chave não estiver configurada, a rota fica indisponível por segurança.
+    if not AGENDAR_API_KEY:
+        return jsonify({"status": "indisponivel", "mensagem": "AGENDAR_API_KEY não configurada"}), 503
+    if request.headers.get("X-API-Key", "") != AGENDAR_API_KEY:
+        return jsonify({"status": "nao_autorizado"}), 401
+
+    if request.method == "GET":
+        return jsonify(_rd_dryrun_state), 200
+
+    if _rd_dryrun_state.get("status") == "executando":
+        return jsonify(_rd_dryrun_state), 202
+    t = threading.Thread(target=_rd_dryrun_executar, args=(RD_DRYRUN_MAX_DIAS, RD_DRYRUN_MAX_ITENS), daemon=True)
+    t.start()
+    return jsonify({
+        "status": "iniciado", "modo": "DRY_RUN_SOMENTE_GET",
+        "dias": RD_DRYRUN_MAX_DIAS, "limite": RD_DRYRUN_MAX_ITENS,
+    }), 202
+
+
 def _rd_enriquecer_deal(deal_id, dados):
     """Preenche apenas campos existentes e vazios; nunca sobrescreve."""
     origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
