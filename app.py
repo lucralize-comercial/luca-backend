@@ -1708,6 +1708,7 @@ def _rd_dryrun_executar(dias=30, limite=250):
         _rd_dryrun_state.update({
             "status": "executando", "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None, "resultado": None, "erro": None,
+            "progresso": {"atual": 0, "total": 0, "deal_id": None},
         })
         token = _rd_obter_access_token()
         rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -1734,9 +1735,16 @@ def _rd_dryrun_executar(dias=30, limite=250):
             "amostras": [],
         }
 
-        for deal_base in deals:
+        total_deals = len(deals)
+        _rd_dryrun_state["progresso"] = {"atual": 0, "total": total_deals, "deal_id": None}
+        print(f"[rd-dryrun] inicio dias={dias} limite={limite} candidatos={total_deals}", flush=True)
+
+        for indice, deal_base in enumerate(deals, start=1):
             resumo["analisados"] += 1
             deal_id = deal_base.get("id")
+            _rd_dryrun_state["progresso"] = {"atual": indice, "total": total_deals, "deal_id": deal_id}
+            if indice == 1 or indice % 10 == 0 or indice == total_deals:
+                print(f"[rd-dryrun] progresso {indice}/{total_deals} deal={deal_id}", flush=True)
             try:
                 # GET fresco: precisamos dos customFields atuais e do person id.
                 r_deal = requests.get(
@@ -1851,6 +1859,7 @@ def _rd_dryrun_executar(dias=30, limite=250):
         _rd_dryrun_state.update({
             "status": "concluido", "finished_at": datetime.now(timezone.utc).isoformat(),
             "resultado": resumo, "erro": None,
+            "progresso": {"atual": resumo.get("analisados", 0), "total": len(deals), "deal_id": None},
         })
         print(f"[rd-dryrun] concluido resumo={json.dumps(resumo, ensure_ascii=False, default=str)}", flush=True)
         return True
