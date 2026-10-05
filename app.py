@@ -1740,6 +1740,7 @@ def _rd_dryrun_executar(dias=30, limite=250):
             "sem_contato_rd": 0,
             "sem_email": 0,
             "identificador_fora_depara": 0,
+            "identificadores_fora_depara": {},
             "ja_totalmente_preenchido": 0,
             "erros": 0,
             "would_fill_por_campo": {
@@ -1819,7 +1820,7 @@ def _rd_dryrun_executar(dias=30, limite=250):
                     if not dt_rd or not dt_deal:
                         continue
                     diff = abs((dt_deal.astimezone(timezone.utc) - dt_rd.astimezone(timezone.utc)).total_seconds())
-                    if diff <= 20 * 60:
+                    if diff <= 20:
                         plausiveis.append((diff, dados))
 
                 plausiveis.sort(key=lambda x: x[0])
@@ -1834,6 +1835,9 @@ def _rd_dryrun_executar(dias=30, limite=250):
                 origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
                 if not origem_negocio:
                     resumo["identificador_fora_depara"] += 1
+                    identificador = str(dados.get("identificador") or "(vazio)").strip() or "(vazio)"
+                    fora = resumo["identificadores_fora_depara"]
+                    fora[identificador] = fora.get(identificador, 0) + 1
                     continue
                 resumo["match_seguro"] += 1
 
@@ -1869,6 +1873,10 @@ def _rd_dryrun_executar(dias=30, limite=250):
             except Exception as e:
                 resumo["erros"] += 1
                 print(f"[rd-dryrun] erro deal={deal_id}: {type(e).__name__}: {str(e)[:180]}", flush=True)
+
+        resumo["identificadores_fora_depara"] = dict(
+            sorted(resumo["identificadores_fora_depara"].items(), key=lambda item: (-item[1], item[0]))
+        )
 
         _rd_dryrun_state.update({
             "status": "concluido", "finished_at": datetime.now(timezone.utc).isoformat(),
