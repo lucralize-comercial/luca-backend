@@ -1240,9 +1240,9 @@ def reset_fetch():
 
 
 # ── RD Station Marketing: OAuth2 ─────────────────────────────────────────────
-# Credenciais ficam exclusivamente no Railway. Nunca gravar client_secret, code
-# ou tokens em logs/respostas. Tokens ficam em memória nesta etapa; depois da
-# validação da API histórica, definiremos persistência durável separadamente.
+# Credenciais do app ficam exclusivamente no Railway. Tokens OAuth ficam em
+# arquivo no volume persistente /data para sobreviver a restart/deploy.
+# Nunca registrar client_secret, code, access_token ou refresh_token em logs.
 RD_CLIENT_ID = os.environ.get("RD_CLIENT_ID", "")
 RD_CLIENT_SECRET = os.environ.get("RD_CLIENT_SECRET", "")
 RD_OAUTH_CALLBACK = os.environ.get(
@@ -1250,6 +1250,7 @@ RD_OAUTH_CALLBACK = os.environ.get(
     "https://agendo-proxy-production.up.railway.app/rd/oauth/callback",
 )
 RD_TOKEN_URL = "https://api.rd.services/auth/token"
+RD_TOKEN_FILE = os.environ.get("RD_TOKEN_FILE", "/data/rd_oauth.json")
 
 _rd_token_lock = threading.Lock()
 _rd_tokens = {
@@ -1258,7 +1259,50 @@ _rd_tokens = {
     "expires_at": 0.0,
 }
 
-def _rd_salvar_tokens_em_memoria(data):
+def _rd_carregar_tokens_persistidos():
+    """Carrega tokens do volume. Falha de leitura não derruba o Luca."""
+    if not os.path.isfile(RD_TOKEN_FILE):
+        return
+    try:
+        with open(RD_TOKEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        access = (data or {}).get("access_token") or ""
+        refresh = (data or {}).get("refresh_token") or ""
+        expires_at = float((data or {}).get("expires_at") or 0)
+        if not access or not refresh:
+            raise ValueError("arquivo OAuth incompleto")
+        with _rd_token_lock:
+            _rd_tokens.update({
+                "access_token": access,
+                "refresh_token": refresh,
+                "expires_at": expires_at,
+            })
+        print("[rd-oauth] tokens persistidos carregados; valores omitidos", flush=True)
+    except Exception as e:
+        print(f"[rd-oauth] não foi possível carregar tokens persistidos: {type(e).__name__}", flush=True)
+
+def _rd_persistir_tokens_locked():
+    """Persiste atomicamente o estado OAuth. Deve ser chamada com o lock adquirido."""
+    diretorio = os.path.dirname(RD_TOKEN_FILE) or "."
+    os.makedirs(diretorio, exist_ok=True)
+    temporario = RD_TOKEN_FILE + ".tmp"
+    payload = {
+        "access_token": _rd_tokens["access_token"],
+        "refresh_token": _rd_tokens["refresh_token"],
+        "expires_at": _rd_tokens["expires_at"],
+        "updated_at": time.time(),
+    }
+    with open(temporario, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporario, RD_TOKEN_FILE)
+    try:
+        os.chmod(RD_TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+
+def _rd_salvar_tokens(data):
     access = (data or {}).get("access_token") or ""
     refresh = (data or {}).get("refresh_token") or ""
     if not access or not refresh:
@@ -1268,6 +1312,12 @@ def _rd_salvar_tokens_em_memoria(data):
         _rd_tokens["access_token"] = access
         _rd_tokens["refresh_token"] = refresh
         _rd_tokens["expires_at"] = time.time() + expires_in
+        _rd_persistir_tokens_locked()
+    print("[rd-oauth] tokens atualizados e persistidos; valores omitidos", flush=True)
+
+# Prioriza o volume persistente; variáveis RD_ACCESS_TOKEN/RD_REFRESH_TOKEN
+# permanecem apenas como fallback de migração/recuperação.
+_rd_carregar_tokens_persistidos()
 
 def _rd_trocar_code_por_tokens(code):
     r = requests.post(
@@ -1282,7 +1332,7 @@ def _rd_trocar_code_por_tokens(code):
     if r.status_code != 200:
         print(f"[rd-oauth] falha na troca do code: status={r.status_code}", flush=True)
         raise RuntimeError(f"RD token exchange falhou com HTTP {r.status_code}")
-    _rd_salvar_tokens_em_memoria(r.json())
+    _rd_salvar_tokens(r.json())
 
 def _rd_renovar_access_token():
     with _rd_token_lock:
@@ -1301,7 +1351,7 @@ def _rd_renovar_access_token():
     if r.status_code != 200:
         print(f"[rd-oauth] falha ao renovar access_token: status={r.status_code}", flush=True)
         raise RuntimeError(f"RD refresh falhou com HTTP {r.status_code}")
-    _rd_salvar_tokens_em_memoria(r.json())
+    _rd_salvar_tokens(r.json())
 
 def _rd_obter_access_token():
     with _rd_token_lock:
