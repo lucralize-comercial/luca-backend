@@ -1,6 +1,6 @@
 from datetime import date
 
-from .metrics import comparison_pct, daily_metrics, month_metrics
+from .metrics import comparison_pct
 
 
 def _line(label: str, current: int, previous: int, icon: str) -> str:
@@ -8,11 +8,7 @@ def _line(label: str, current: int, previous: int, icon: str) -> str:
     return f"{icon} **{label}:** {current} | {previous} {arrow} {pct}"
 
 
-def build_gestao(deals: list[dict], yesterday: date, before: date) -> tuple[str, dict]:
-    y = daily_metrics(deals, yesterday)
-    b = daily_metrics(deals, before)
-    month = month_metrics(deals, yesterday)
-
+def build_gestao(y: dict, b: dict, month: dict, yesterday: date, before: date) -> tuple[str, dict]:
     text = (
         "📈 **REPORT DE GESTÃO — COMERCIAL**\n\n"
         f"**Ontem ({yesterday.strftime('%d/%m')}) | Antes de ontem ({before.strftime('%d/%m')})**\n\n"

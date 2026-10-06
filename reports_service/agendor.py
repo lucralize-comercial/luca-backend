@@ -1,6 +1,8 @@
 import threading
 import time
+from datetime import date, datetime, time as dt_time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -9,6 +11,8 @@ from .config import AGENDOR_BASE, AGENDOR_TOKEN, FUNIL_COMERCIAL_ID
 _MIN_INTERVAL = 0.36
 _LOCK = threading.Lock()
 _LAST_REQUEST_AT = 0.0
+BRT = ZoneInfo("America/Sao_Paulo")
+UTC = ZoneInfo("UTC")
 
 
 def _headers():
@@ -51,41 +55,108 @@ def _get(path: str, *, params=None, timeout=60):
     raise RuntimeError(f"Falha consultando Agendor {path}: {last_error}")
 
 
-def listar_deals_funil_comercial() -> list[dict[str, Any]]:
-    """Busca todos os negócios e mantém apenas o Funil Comercial.
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
-    Replica somente a paginação necessária ao report. Não depende do app.py do Luca.
-    """
-    deals = []
+
+def _bounds(day: date) -> tuple[str, str]:
+    start = datetime.combine(day, dt_time.min, tzinfo=BRT)
+    end = datetime.combine(day, dt_time.max, tzinfo=BRT)
+    return _iso(start), _iso(end)
+
+
+def _month_bounds(day: date) -> tuple[str, str]:
+    start = datetime.combine(day.replace(day=1), dt_time.min, tzinfo=BRT)
+    end = datetime.combine(day, dt_time.max, tzinfo=BRT)
+    return _iso(start), _iso(end)
+
+
+def _base_params(**extra) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "funnels": FUNIL_COMERCIAL_ID,
+        "per_page": 1,
+        "page": 1,
+    }
+    params.update({k: v for k, v in extra.items() if v is not None})
+    return params
+
+
+def contar_deals(**filters) -> int:
+    payload = _get("/deals", params=_base_params(**filters))
+    meta = payload.get("meta") or {}
+    total = meta.get("totalCount")
+    if total is not None:
+        return int(total)
+    return len(payload.get("data") or [])
+
+
+def listar_deals(**filters) -> list[dict[str, Any]]:
+    """Lista apenas o recorte necessário ao report, nunca o funil inteiro."""
+    deals: list[dict[str, Any]] = []
     page = 1
     while True:
-        payload = _get(
-            "/deals",
-            params={
-                "per_page": 100,
-                "page": page,
-                "withCustomFields": "true",
-                "order_by": "updatedAt",
-                "order_dir": "desc",
-            },
-        )
+        params = {
+            "funnels": FUNIL_COMERCIAL_ID,
+            "per_page": 100,
+            "page": page,
+            **filters,
+        }
+        payload = _get("/deals", params=params)
         page_deals = payload.get("data") or []
-        for deal in page_deals:
-            funnel_id = (((deal.get("dealStage") or {}).get("funnel") or {}).get("id"))
-            if funnel_id == FUNIL_COMERCIAL_ID:
-                deals.append(deal)
+        deals.extend(page_deals)
         if not (payload.get("links") or {}).get("next") or not page_deals:
             break
         page += 1
     return deals
 
 
-def buscar_mapa_campos_personalizados() -> dict[str, dict[Any, str]]:
-    """Retorna {slug_do_campo: {id_da_opcao: nome}} quando disponível.
+def _snapshot_open(day: date) -> int:
+    """Estoque no fim do dia sem baixar os 6.789 negócios do funil.
 
-    É tolerante às variações de schema do endpoint e serve somente para traduzir
-    opções como Origem do Negócio em nomes legíveis para o classificador.
+    Mantém a mesma lógica conceitual do cálculo anterior para negócios que hoje
+    pertencem ao Funil Comercial: entrou até o corte e ainda não havia encerrado.
     """
+    _, cutoff = _bounds(day)
+
+    # Negócios que continuam abertos hoje e já existiam no corte.
+    ongoing = contar_deals(dealStatus=1, startAtLt=cutoff)
+
+    # Negócios que hoje estão fechados, mas só foram encerrados depois do corte.
+    # Portanto, no fim daquele dia ainda estavam em andamento.
+    won_after = contar_deals(dealStatus=2, startAtLt=cutoff, endAtGt=cutoff)
+    lost_after = contar_deals(dealStatus=3, startAtLt=cutoff, endAtGt=cutoff)
+    return ongoing + won_after + lost_after
+
+
+def _period_metrics(start_iso: str, end_iso: str, snapshot_day: date) -> dict[str, int]:
+    return {
+        "leads": contar_deals(startAtGt=start_iso, startAtLt=end_iso),
+        "ganhos": contar_deals(dealStatus=2, endAtGt=start_iso, endAtLt=end_iso),
+        "perdidos": contar_deals(dealStatus=3, endAtGt=start_iso, endAtLt=end_iso),
+        "em_andamento": _snapshot_open(snapshot_day),
+    }
+
+
+def metricas_dia(day: date) -> dict[str, int]:
+    start_iso, end_iso = _bounds(day)
+    return _period_metrics(start_iso, end_iso, day)
+
+
+def metricas_mes(through_day: date) -> dict[str, int]:
+    start_iso, end_iso = _month_bounds(through_day)
+    return _period_metrics(start_iso, end_iso, through_day)
+
+
+def listar_leads_dia(day: date) -> list[dict[str, Any]]:
+    start_iso, end_iso = _bounds(day)
+    return listar_deals(
+        startAtGt=start_iso,
+        startAtLt=end_iso,
+        withCustomFields="true",
+    )
+
+
+def buscar_mapa_campos_personalizados() -> dict[str, dict[Any, str]]:
     try:
         payload = _get("/custom_fields/deals", timeout=20)
     except Exception:

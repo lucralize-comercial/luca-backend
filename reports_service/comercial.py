@@ -1,20 +1,19 @@
 from datetime import date
 
-from .metrics import daily_metrics, origins_for_day
+from .metrics import origins_for_day
 
 
-def build_comercial(deals: list[dict], day: date, fields_map=None) -> tuple[str, dict]:
-    m = daily_metrics(deals, day)
-    origins = origins_for_day(deals, day, fields_map)
+def build_comercial(metrics: dict, leads_do_dia: list[dict], day: date, fields_map=None) -> tuple[str, dict]:
+    origins = origins_for_day(leads_do_dia, day, fields_map)
     dd = day.strftime("%d/%m/%Y")
 
     text = (
         "📊 **REPORT COMERCIAL — LUCRALIZE**\n\n"
         f"**Fechamento de ontem — {dd}**\n\n"
-        f"👤 **Leads recebidos:** {m['leads']}\n"
-        f"🟢 **Negócios ganhos:** {m['ganhos']}\n"
-        f"🔴 **Negócios perdidos:** {m['perdidos']}\n"
-        f"🟡 **Em andamento:** {m['em_andamento']}\n\n"
+        f"👤 **Leads recebidos:** {metrics['leads']}\n"
+        f"🟢 **Negócios ganhos:** {metrics['ganhos']}\n"
+        f"🔴 **Negócios perdidos:** {metrics['perdidos']}\n"
+        f"🟡 **Em andamento:** {metrics['em_andamento']}\n\n"
         "\u200e\n\n"
         "**📍 Origem dos leads**\n\n"
         f"• Google Ads: **{origins['Google Ads']}**\n"
@@ -24,8 +23,8 @@ def build_comercial(deals: list[dict], day: date, fields_map=None) -> tuple[str,
         f"• Outros: **{origins['Outros']}**\n\n"
         "\u200e\n\n"
         "**📝 Resumo do dia**\n\n"
-        f"Entraram **{m['leads']} novos leads** no Funil Comercial.\n"
-        f"**{m['ganhos']} negócios foram ganhos** e **{m['perdidos']} foram encerrados como perdidos**.\n\n"
+        f"Entraram **{metrics['leads']} novos leads** no Funil Comercial.\n"
+        f"**{metrics['ganhos']} negócios foram ganhos** e **{metrics['perdidos']} foram encerrados como perdidos**.\n\n"
         "*Relatório automático — Luca*"
     )
-    return text, {"data": day.isoformat(), **m, "origens": origins}
+    return text, {"data": day.isoformat(), **metrics, "origens": origins}
