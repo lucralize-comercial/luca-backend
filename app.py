@@ -2177,6 +2177,154 @@ def rd_retroativo_aplicar():
     }), 202
 
 
+# ── RD Station: reprocessamento isolado de 1 negócio ──────────────────────────
+RD_RETRO_SINGLE_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
+
+def _rd_retro_single_processar(deal_id):
+    """Revalida e, se seguro, preenche somente origem_do_negocio de um deal."""
+    token = _rd_obter_access_token()
+    rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    resultado = {
+        "modo": "RETROATIVO_RD_ORIGEM_ISOLADO", "deal_id": deal_id,
+        "status": "nao_atualizado", "origem_do_negocio": None,
+        "identificador_rd": None, "diferenca_seg": None, "motivo": None,
+    }
+
+    r_deal = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+                          params={"withCustomFields": "true"}, timeout=20)
+    r_deal.raise_for_status()
+    deal = r_deal.json().get("data") or r_deal.json()
+
+    stage = deal.get("dealStage") or {}
+    if ((stage.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
+        resultado["motivo"] = "fora_funil_comercial"
+        return resultado
+
+    custom = deal.get("customFields") or {}
+    atual = _rd_valor_atual(custom, "origem_do_negocio")
+    if atual not in (None, "", [], {}):
+        resultado.update(status="ja_preenchido", origem_do_negocio=atual,
+                         motivo="origem_ja_preenchida")
+        return resultado
+
+    dt_deal = _rd_parse_iso(deal.get("startTime"))
+    if not dt_deal:
+        resultado["motivo"] = "sem_startTime"
+        return resultado
+    if dt_deal.tzinfo is None:
+        dt_deal = dt_deal.replace(tzinfo=timezone.utc)
+
+    idade_dias = (datetime.now(timezone.utc) - dt_deal.astimezone(timezone.utc)).total_seconds() / 86400
+    if idade_dias < 0 or idade_dias > RD_RETRO_WRITE_MAX_DIAS:
+        resultado["motivo"] = "fora_janela_30_dias"
+        return resultado
+
+    person_id = _rd_deal_person_id(deal)
+    email = ""
+    if person_id:
+        r_pessoa = requests.get(f"{AGENDOR_BASE}/people/{person_id}", headers=HEADERS, timeout=20)
+        r_pessoa.raise_for_status()
+        pessoa = r_pessoa.json().get("data") or r_pessoa.json()
+        email = (pessoa.get("email") or "").strip().lower()
+        if not email:
+            emails = pessoa.get("emails") or []
+            if isinstance(emails, list) and emails:
+                primeiro = emails[0]
+                email = ((primeiro.get("email") if isinstance(primeiro, dict) else primeiro) or "").strip().lower()
+    if not email:
+        resultado["motivo"] = "sem_email"
+        return resultado
+
+    r_contato = requests.get(
+        "https://api.rd.services/platform/contacts/email:" + quote(email, safe="@"),
+        headers=rd_headers, timeout=20)
+    if r_contato.status_code == 404:
+        resultado["motivo"] = "sem_contato_rd"
+        return resultado
+    r_contato.raise_for_status()
+    contato = r_contato.json() if r_contato.content else {}
+    uuid = (contato or {}).get("uuid") or ""
+    if not uuid:
+        resultado["motivo"] = "sem_contato_rd"
+        return resultado
+
+    r_eventos = requests.get(
+        f"https://api.rd.services/platform/contacts/{quote(uuid, safe='')}/events",
+        headers=rd_headers, params={"event_type": "CONVERSION"}, timeout=20)
+    r_eventos.raise_for_status()
+    eventos = _rd_eventos_lista(r_eventos.json() if r_eventos.content else {})
+
+    plausiveis = []
+    for evento in eventos:
+        dados = _rd_evento_para_dados(evento, contato, email)
+        dt_rd = _rd_parse_iso(dados.get("data_conversao"))
+        if not dt_rd:
+            continue
+        if dt_rd.tzinfo is None:
+            dt_rd = dt_rd.replace(tzinfo=timezone.utc)
+        diff = abs((dt_deal.astimezone(timezone.utc) - dt_rd.astimezone(timezone.utc)).total_seconds())
+        if diff <= 20:
+            plausiveis.append((diff, dados))
+
+    plausiveis.sort(key=lambda x: x[0])
+    if not plausiveis:
+        resultado["motivo"] = "sem_match_temporal_ate_20s"
+        return resultado
+    if len(plausiveis) > 1 and abs(plausiveis[1][0] - plausiveis[0][0]) < 1:
+        resultado["motivo"] = "match_ambiguo"
+        return resultado
+
+    diff, dados = plausiveis[0]
+    origem = _rd_mapear_origem_negocio(dados.get("identificador"))
+    resultado["identificador_rd"] = dados.get("identificador")
+    resultado["diferenca_seg"] = round(diff, 1)
+    if not origem:
+        resultado["motivo"] = "identificador_fora_depara"
+        return resultado
+
+    r_final = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+                           params={"withCustomFields": "true"}, timeout=20)
+    r_final.raise_for_status()
+    deal_final = r_final.json().get("data") or r_final.json()
+    stage_final = deal_final.get("dealStage") or {}
+    if ((stage_final.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
+        resultado["motivo"] = "saiu_funil_antes_escrita"
+        return resultado
+
+    custom_final = deal_final.get("customFields") or {}
+    atual_final = _rd_valor_atual(custom_final, "origem_do_negocio")
+    if atual_final not in (None, "", [], {}):
+        resultado.update(status="ja_preenchido", origem_do_negocio=atual_final,
+                         motivo="origem_preenchida_antes_escrita")
+        return resultado
+
+    r_put = requests.put(
+        f"{AGENDOR_BASE}/deals/{deal_id}",
+        headers={**HEADERS, "Content-Type": "application/json"},
+        json={"customFields": {"origem_do_negocio": origem}}, timeout=20)
+    r_put.raise_for_status()
+
+    resultado.update(status="atualizado", origem_do_negocio=origem, motivo="match_seguro")
+    print(f"[rd-retro-single] ATUALIZADO {json.dumps(resultado, ensure_ascii=False)}", flush=True)
+    return resultado
+
+
+@app.route("/rd/retroativo/aplicar/<int:deal_id>", methods=["POST"])
+def rd_retroativo_aplicar_deal(deal_id):
+    if not AGENDAR_API_KEY:
+        return jsonify({"status": "indisponivel", "mensagem": "AGENDAR_API_KEY não configurada"}), 503
+    if request.headers.get("X-API-Key", "") != AGENDAR_API_KEY:
+        return jsonify({"status": "nao_autorizado"}), 401
+    if request.headers.get("X-Confirm-Write", "") != RD_RETRO_SINGLE_CONFIRM:
+        return jsonify({"status": "confirmacao_necessaria"}), 409
+    try:
+        return jsonify(_rd_retro_single_processar(deal_id)), 200
+    except Exception as e:
+        print(f"[rd-retro-single] ERRO deal={deal_id}: {type(e).__name__}: {str(e)[:180]}", flush=True)
+        return jsonify({"status": "erro", "deal_id": deal_id,
+                        "erro": f"{type(e).__name__}: {str(e)[:300]}"}), 502
+
+
 def _rd_enriquecer_deal(deal_id, dados):
     """Preenche apenas campos existentes e vazios; nunca sobrescreve."""
     origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
