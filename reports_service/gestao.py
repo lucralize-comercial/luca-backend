@@ -3,25 +3,27 @@ from datetime import date
 from .metrics import comparison_pct
 
 
-def _line(label: str, current: int, previous: int, icon: str) -> str:
+def _line(label: str, previous: int, current: int) -> str:
     arrow, pct = comparison_pct(current, previous)
-    return f"{icon} **{label}:** {current} | {previous} {arrow} {pct}"
+    return f"{label}: **{previous} | {current} {arrow} {pct}**"
 
 
 def build_gestao(y: dict, b: dict, month: dict, yesterday: date, before: date) -> tuple[str, dict]:
     text = (
-        "📈 **REPORT DE GESTÃO — COMERCIAL**\n\n"
-        f"**Ontem ({yesterday.strftime('%d/%m')}) | Antes de ontem ({before.strftime('%d/%m')})**\n\n"
-        f"{_line('Leads recebidos', y['leads'], b['leads'], '👤')}\n"
-        f"{_line('Ganhos', y['ganhos'], b['ganhos'], '🟢')}\n"
-        f"{_line('Perdidos', y['perdidos'], b['perdidos'], '🔴')}\n"
-        f"{_line('Em andamento', y['em_andamento'], b['em_andamento'], '🟡')}\n\n"
+        "**ACOMPANHAMENTO COMERCIAL**\n\n"
+        f"**Antes de ontem ({before.strftime('%d/%m')}) | Ontem ({yesterday.strftime('%d/%m')})**\n\n"
+        f"{_line('Leads recebidos', b['leads'], y['leads'])}\n"
+        f"{_line('Reuniões', b['reunioes'], y['reunioes'])}\n"
+        f"{_line('Ganhos', b['ganhos'], y['ganhos'])}\n"
+        f"{_line('Perdidos', b['perdidos'], y['perdidos'])}\n"
+        f"{_line('Em andamento', b['em_andamento'], y['em_andamento'])}\n\n"
         "\u200e\n\n"
-        "**📅 Acumulado do mês**\n\n"
-        f"👤 Leads recebidos: **{month['leads']}**\n"
-        f"🟢 Ganhos: **{month['ganhos']}**\n"
-        f"🔴 Perdidos: **{month['perdidos']}**\n"
-        f"🟡 Em andamento: **{month['em_andamento']}**\n\n"
+        "**Acumulado do mês**\n\n"
+        f"Leads recebidos: **{month['leads']}**\n"
+        f"Reuniões: **{month['reunioes']}**\n"
+        f"Ganhos: **{month['ganhos']}**\n"
+        f"Perdidos: **{month['perdidos']}**\n"
+        f"Em andamento: **{month['em_andamento']}**\n\n"
         "*Relatório automático — Luca*"
     )
     return text, {

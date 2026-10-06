@@ -156,6 +156,39 @@ def listar_leads_dia(day: date) -> list[dict[str, Any]]:
     )
 
 
+
+def contar_reunioes(start_iso: str, end_iso: str) -> int:
+    """Conta a visão de reuniões do Agendor pela data agendada (dueDate).
+
+    Não tenta classificar reunião como realizada/cancelada: replica apenas a visão
+    de atividades do tipo meeting existente no Agendor.
+    """
+    payload = _get(
+        "/tasks",
+        params={
+            "per_page": 1,
+            "page": 1,
+            "typesIn": "meeting",
+            "dueDateGt": start_iso,
+            "dueDateLt": end_iso,
+        },
+    )
+    meta = payload.get("meta") or {}
+    total = meta.get("totalCount")
+    if total is not None:
+        return int(total)
+    return len(payload.get("data") or [])
+
+
+def reunioes_dia(day: date) -> int:
+    start_iso, end_iso = _bounds(day)
+    return contar_reunioes(start_iso, end_iso)
+
+
+def reunioes_mes(through_day: date) -> int:
+    start_iso, end_iso = _month_bounds(through_day)
+    return contar_reunioes(start_iso, end_iso)
+
 def buscar_mapa_campos_personalizados() -> dict[str, dict[Any, str]]:
     try:
         payload = _get("/custom_fields/deals", timeout=20)

@@ -5,6 +5,8 @@ from .agendor import (
     listar_leads_dia,
     metricas_dia,
     metricas_mes,
+    reunioes_dia,
+    reunioes_mes,
 )
 from .comercial import build_comercial
 from .gestao import build_gestao
@@ -17,6 +19,12 @@ def gerar_preview(now: datetime | None = None) -> dict:
     ontem = metricas_dia(yesterday)
     antes = metricas_dia(before)
     mes = metricas_mes(yesterday)
+
+    # A API do Agendor só permite afirmar a visão de reuniões.
+    # Não classificamos como realizada/cancelada/no-show.
+    ontem["reunioes"] = reunioes_dia(yesterday)
+    antes["reunioes"] = reunioes_dia(before)
+    mes["reunioes"] = reunioes_mes(yesterday)
 
     # Só os leads de ontem precisam ser carregados linha a linha, porque o
     # report comercial precisa classificar a origem de cada um.
