@@ -1,5 +1,6 @@
 import threading
 import time
+from functools import lru_cache
 from datetime import date, datetime, time as dt_time
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -110,6 +111,53 @@ def listar_deals(**filters) -> list[dict[str, Any]]:
     return deals
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+_WON_CACHE_LOCK = threading.Lock()
+_WON_CACHE_AT = 0.0
+_WON_CACHE: list[dict[str, Any]] = []
+_WON_CACHE_TTL = 60.0
+
+
+def listar_ganhos_cacheados() -> list[dict[str, Any]]:
+    """Carrega apenas negócios ganhos e reaproveita por 60s.
+
+    O Agendor expõe `wonAt` no negócio, mas atualmente ignora filtros
+    `wonAtGt/wonAtLt` no endpoint de deals. Como o universo de ganhos é muito
+    menor que o funil inteiro, buscamos somente dealStatus=2 e filtramos
+    `wonAt` localmente.
+    """
+    global _WON_CACHE_AT, _WON_CACHE
+    now = time.monotonic()
+    with _WON_CACHE_LOCK:
+        if _WON_CACHE and (now - _WON_CACHE_AT) < _WON_CACHE_TTL:
+            return _WON_CACHE
+        data = listar_deals(dealStatus=2)
+        _WON_CACHE = data
+        _WON_CACHE_AT = time.monotonic()
+        return _WON_CACHE
+
+
+def contar_ganhos_por_won_at(start_iso: str, end_iso: str) -> int:
+    start = _parse_iso(start_iso)
+    end = _parse_iso(end_iso)
+    if start is None or end is None:
+        return 0
+    total = 0
+    for deal in listar_ganhos_cacheados():
+        won_at = _parse_iso(deal.get("wonAt"))
+        if won_at is not None and start < won_at < end:
+            total += 1
+    return total
+
+
 def _snapshot_open(day: date) -> int:
     """Estoque no fim do dia sem baixar os 6.789 negócios do funil.
 
@@ -131,7 +179,7 @@ def _snapshot_open(day: date) -> int:
 def _period_metrics(start_iso: str, end_iso: str, snapshot_day: date) -> dict[str, int]:
     return {
         "leads": contar_deals(startAtGt=start_iso, startAtLt=end_iso),
-        "ganhos": contar_deals(dealStatus=2, endAtGt=start_iso, endAtLt=end_iso),
+        "ganhos": contar_ganhos_por_won_at(start_iso, end_iso),
         "perdidos": contar_deals(dealStatus=3, endAtGt=start_iso, endAtLt=end_iso),
         "em_andamento": _snapshot_open(snapshot_day),
     }
