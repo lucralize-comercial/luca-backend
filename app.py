@@ -1919,6 +1919,264 @@ def rd_retroativo_dry_run():
     }), 202
 
 
+# ── RD Station: retroativo controlado (escrita SOMENTE origem_do_negocio) ──
+# Esta rotina é deliberadamente mais restritiva que o webhook em tempo real.
+# Revalida tudo no momento da execução e só grava origem_do_negocio quando:
+# - negócio está no Funil Comercial e dentro dos últimos 30 dias;
+# - pessoa possui e-mail e existe contato correspondente no RD;
+# - existe evento CONVERSION com diferença temporal <= 20 segundos;
+# - não há empate/ambiguidade temporal;
+# - identificador pertence ao DE/PARA fechado;
+# - origem_do_negocio continua vazia no GET fresco do negócio.
+# Nenhum outro campo é alterado por esta rotina.
+RD_RETRO_WRITE_MAX_DIAS = 30
+RD_RETRO_WRITE_MAX_ITENS = 250
+RD_RETRO_WRITE_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
+_rd_retro_write_lock = threading.Lock()
+_rd_retro_write_state = {
+    "status": "nunca_executado",
+    "started_at": None,
+    "finished_at": None,
+    "resultado": None,
+    "erro": None,
+    "progresso": {"atual": 0, "total": 0, "deal_id": None},
+}
+
+
+def _rd_retro_write_executar(dias=RD_RETRO_WRITE_MAX_DIAS, limite=RD_RETRO_WRITE_MAX_ITENS):
+    if not _rd_retro_write_lock.acquire(blocking=False):
+        return False
+    try:
+        _rd_retro_write_state.update({
+            "status": "executando",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "resultado": None,
+            "erro": None,
+            "progresso": {"atual": 0, "total": 0, "deal_id": None},
+        })
+        token = _rd_obter_access_token()
+        rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        deals = _rd_dryrun_deals_candidatos(dias, limite)
+        resumo = {
+            "modo": "RETROATIVO_RD_ORIGEM_CONTROLADO",
+            "dias": dias,
+            "limite": limite,
+            "candidatos_agendor": len(deals),
+            "analisados": 0,
+            "match_seguro": 0,
+            "atualizados": 0,
+            "ja_preenchidos": 0,
+            "sem_match_temporal": 0,
+            "sem_contato_rd": 0,
+            "sem_email": 0,
+            "identificador_fora_depara": 0,
+            "ambiguos": 0,
+            "erros": 0,
+            "atualizacoes": [],
+        }
+        total = len(deals)
+        _rd_retro_write_state["progresso"] = {"atual": 0, "total": total, "deal_id": None}
+        print(f"[rd-retro-write] inicio dias={dias} limite={limite} candidatos={total}", flush=True)
+
+        for indice, deal_base in enumerate(deals, start=1):
+            resumo["analisados"] += 1
+            deal_id = deal_base.get("id")
+            _rd_retro_write_state["progresso"] = {"atual": indice, "total": total, "deal_id": deal_id}
+            if indice == 1 or indice % 10 == 0 or indice == total:
+                print(f"[rd-retro-write] progresso {indice}/{total} deal={deal_id}", flush=True)
+            try:
+                # 1) GET fresco do negócio: nenhuma decisão de escrita usa só o cache.
+                r_deal = requests.get(
+                    f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+                    params={"withCustomFields": "true"}, timeout=20,
+                )
+                r_deal.raise_for_status()
+                deal = r_deal.json().get("data") or r_deal.json()
+
+                stage = deal.get("dealStage") or {}
+                if ((stage.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
+                    continue
+
+                # Se alguém preencheu a origem depois do dry-run, preserva imediatamente.
+                custom = deal.get("customFields") or {}
+                atual = _rd_valor_atual(custom, "origem_do_negocio")
+                if atual not in (None, "", [], {}):
+                    resumo["ja_preenchidos"] += 1
+                    continue
+
+                dt_deal = _rd_parse_iso(deal.get("startTime") or deal_base.get("startTime"))
+                if not dt_deal:
+                    resumo["sem_match_temporal"] += 1
+                    continue
+                if dt_deal.tzinfo is None:
+                    dt_deal = dt_deal.replace(tzinfo=timezone.utc)
+
+                # 2) Resolve a pessoa/e-mail novamente.
+                person_id = _rd_deal_person_id(deal) or _rd_deal_person_id(deal_base)
+                email = ""
+                if person_id:
+                    r_pessoa = requests.get(f"{AGENDOR_BASE}/people/{person_id}", headers=HEADERS, timeout=20)
+                    if r_pessoa.status_code == 200:
+                        pessoa = r_pessoa.json().get("data") or r_pessoa.json()
+                        email = (pessoa.get("email") or "").strip().lower()
+                        if not email:
+                            emails = pessoa.get("emails") or []
+                            if isinstance(emails, list) and emails:
+                                primeiro = emails[0]
+                                email = ((primeiro.get("email") if isinstance(primeiro, dict) else primeiro) or "").strip().lower()
+                if not email:
+                    resumo["sem_email"] += 1
+                    continue
+
+                # 3) Contato e conversões históricos do RD, somente leitura.
+                r_contato = requests.get(
+                    "https://api.rd.services/platform/contacts/email:" + quote(email, safe="@"),
+                    headers=rd_headers, timeout=20,
+                )
+                if r_contato.status_code == 404:
+                    resumo["sem_contato_rd"] += 1
+                    continue
+                r_contato.raise_for_status()
+                contato = r_contato.json() if r_contato.content else {}
+                uuid = (contato or {}).get("uuid") or ""
+                if not uuid:
+                    resumo["sem_contato_rd"] += 1
+                    continue
+
+                r_eventos = requests.get(
+                    f"https://api.rd.services/platform/contacts/{quote(uuid, safe='')}/events",
+                    headers=rd_headers, params={"event_type": "CONVERSION"}, timeout=20,
+                )
+                r_eventos.raise_for_status()
+                eventos = _rd_eventos_lista(r_eventos.json() if r_eventos.content else {})
+
+                plausiveis = []
+                for evento in eventos:
+                    dados = _rd_evento_para_dados(evento, contato, email)
+                    dt_rd = _rd_parse_iso(dados.get("data_conversao"))
+                    if not dt_rd:
+                        continue
+                    if dt_rd.tzinfo is None:
+                        dt_rd = dt_rd.replace(tzinfo=timezone.utc)
+                    diff = abs((dt_deal.astimezone(timezone.utc) - dt_rd.astimezone(timezone.utc)).total_seconds())
+                    if diff <= 20:
+                        plausiveis.append((diff, dados))
+
+                plausiveis.sort(key=lambda x: x[0])
+                if not plausiveis:
+                    resumo["sem_match_temporal"] += 1
+                    continue
+                if len(plausiveis) > 1 and abs(plausiveis[1][0] - plausiveis[0][0]) < 1:
+                    resumo["ambiguos"] += 1
+                    continue
+
+                diff, dados = plausiveis[0]
+                origem = _rd_mapear_origem_negocio(dados.get("identificador"))
+                if not origem:
+                    resumo["identificador_fora_depara"] += 1
+                    continue
+                resumo["match_seguro"] += 1
+
+                # 4) Última trava imediatamente antes do PUT: GET fresco novamente.
+                r_final = requests.get(
+                    f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+                    params={"withCustomFields": "true"}, timeout=20,
+                )
+                r_final.raise_for_status()
+                deal_final = r_final.json().get("data") or r_final.json()
+                stage_final = deal_final.get("dealStage") or {}
+                if ((stage_final.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
+                    continue
+                custom_final = deal_final.get("customFields") or {}
+                atual_final = _rd_valor_atual(custom_final, "origem_do_negocio")
+                if atual_final not in (None, "", [], {}):
+                    resumo["ja_preenchidos"] += 1
+                    continue
+
+                # ÚNICA escrita permitida nesta rotina.
+                r_put = requests.put(
+                    f"{AGENDOR_BASE}/deals/{deal_id}",
+                    headers={**HEADERS, "Content-Type": "application/json"},
+                    json={"customFields": {"origem_do_negocio": origem}},
+                    timeout=20,
+                )
+                r_put.raise_for_status()
+                resumo["atualizados"] += 1
+                registro = {
+                    "deal_id": deal_id,
+                    "origem_do_negocio": origem,
+                    "identificador_rd": dados.get("identificador"),
+                    "diferenca_seg": round(diff, 1),
+                }
+                resumo["atualizacoes"].append(registro)
+                print(f"[rd-retro-write] ATUALIZADO {json.dumps(registro, ensure_ascii=False)}", flush=True)
+
+            except Exception as e:
+                resumo["erros"] += 1
+                print(f"[rd-retro-write] ERRO deal={deal_id}: {type(e).__name__}: {str(e)[:180]}", flush=True)
+
+        _rd_retro_write_state.update({
+            "status": "concluido",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "resultado": resumo,
+            "erro": None,
+            "progresso": {"atual": resumo["analisados"], "total": total, "deal_id": None},
+        })
+        print(f"[rd-retro-write] concluido resumo={json.dumps(resumo, ensure_ascii=False, default=str)}", flush=True)
+        return True
+    except Exception as e:
+        _rd_retro_write_state.update({
+            "status": "erro",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "erro": f"{type(e).__name__}: {str(e)[:300]}",
+        })
+        print(f"[rd-retro-write] erro_geral={type(e).__name__}: {str(e)[:180]}", flush=True)
+        return False
+    finally:
+        _rd_retro_write_lock.release()
+
+
+@app.route("/rd/retroativo/aplicar", methods=["POST", "GET"])
+def rd_retroativo_aplicar():
+    """Consulta ou dispara a escrita retroativa controlada de origem_do_negocio.
+
+    Segurança em duas camadas para POST:
+    - X-API-Key deve ser a chave privada já usada nas rotas administrativas;
+    - X-Confirm-Write deve ser exatamente CONFIRMAR_RETROATIVO_RD.
+    GET apenas consulta o estado, mas também exige X-API-Key.
+    """
+    if not AGENDAR_API_KEY:
+        return jsonify({"status": "indisponivel", "mensagem": "AGENDAR_API_KEY não configurada"}), 503
+    if request.headers.get("X-API-Key", "") != AGENDAR_API_KEY:
+        return jsonify({"status": "nao_autorizado"}), 401
+
+    if request.method == "GET":
+        return jsonify(_rd_retro_write_state), 200
+
+    if request.headers.get("X-Confirm-Write", "") != RD_RETRO_WRITE_CONFIRM:
+        return jsonify({
+            "status": "confirmacao_necessaria",
+            "mensagem": "Envie X-Confirm-Write com a confirmação exata para habilitar a escrita controlada.",
+        }), 409
+    if _rd_retro_write_state.get("status") == "executando":
+        return jsonify(_rd_retro_write_state), 202
+
+    t = threading.Thread(
+        target=_rd_retro_write_executar,
+        args=(RD_RETRO_WRITE_MAX_DIAS, RD_RETRO_WRITE_MAX_ITENS),
+        daemon=True,
+    )
+    t.start()
+    return jsonify({
+        "status": "iniciado",
+        "modo": "RETROATIVO_RD_ORIGEM_CONTROLADO",
+        "dias": RD_RETRO_WRITE_MAX_DIAS,
+        "limite": RD_RETRO_WRITE_MAX_ITENS,
+        "campo_escrita": "origem_do_negocio",
+    }), 202
+
+
 def _rd_enriquecer_deal(deal_id, dados):
     """Preenche apenas campos existentes e vazios; nunca sobrescreve."""
     origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
