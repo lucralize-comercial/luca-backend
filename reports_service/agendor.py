@@ -131,7 +131,8 @@ def listar_ganhos_cacheados() -> list[dict[str, Any]]:
 
     Como os filtros de data de conclusão do endpoint não reproduziram de forma
     confiável a visão do Sumário, buscamos somente dealStatus=2 e aplicamos
-    `endTime` localmente. O universo de ganhos é muito menor que o funil inteiro.
+    a mesma prioridade de data da aba Contratos Ganhos localmente. O universo de
+    ganhos é muito menor que o funil inteiro.
     """
     global _WON_CACHE_AT, _WON_CACHE
     now = time.monotonic()
@@ -144,22 +145,32 @@ def listar_ganhos_cacheados() -> list[dict[str, Any]]:
         return _WON_CACHE
 
 
-def contar_ganhos_por_end_time(start_iso: str, end_iso: str) -> int:
-    """Conta ganhos pela data de conclusão (endTime), como no Sumário do Agendor.
+def _data_ganho(deal: dict[str, Any]) -> datetime | None:
+    """Replica a prioridade usada na aba Contratos Ganhos do dashboard.
 
-    `wonAt` informa quando o status foi alterado para Ganho, mas o período da
-    venda no relatório é determinado pela data de conclusão do negócio.
+    Ordem: endTime -> wonAt -> finishedAt -> closedAt.
+    Assim, quando há data de conclusão ela prevalece; os demais campos são
+    apenas fallback quando endTime não está preenchido.
     """
+    for field in ("endTime", "wonAt", "finishedAt", "closedAt"):
+        value = _parse_iso(deal.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def contar_ganhos_por_data_ganho(start_iso: str, end_iso: str) -> int:
+    """Conta ganhos com a mesma regra da aba Contratos Ganhos do dashboard."""
     start = _parse_iso(start_iso)
     end = _parse_iso(end_iso)
     if start is None or end is None:
         return 0
-    total = 0
-    for deal in listar_ganhos_cacheados():
-        end_time = _parse_iso(deal.get("endTime"))
-        if end_time is not None and start <= end_time <= end:
-            total += 1
-    return total
+    return sum(
+        1
+        for deal in listar_ganhos_cacheados()
+        if (data_ganho := _data_ganho(deal)) is not None
+        and start <= data_ganho <= end
+    )
 
 
 def _snapshot_open(day: date) -> int:
@@ -180,12 +191,12 @@ def _snapshot_open(day: date) -> int:
     if cutoff_dt is not None:
         for deal in listar_ganhos_cacheados():
             started_at = _parse_iso(deal.get("startTime") or deal.get("createdAt"))
-            end_time = _parse_iso(deal.get("endTime"))
+            data_ganho = _data_ganho(deal)
             if (
                 started_at is not None
                 and started_at <= cutoff_dt
-                and end_time is not None
-                and end_time > cutoff_dt
+                and data_ganho is not None
+                and data_ganho > cutoff_dt
             ):
                 won_after += 1
 
@@ -196,7 +207,7 @@ def _snapshot_open(day: date) -> int:
 def _period_metrics(start_iso: str, end_iso: str, snapshot_day: date) -> dict[str, int]:
     return {
         "leads": contar_deals(startAtGt=start_iso, startAtLt=end_iso),
-        "ganhos": contar_ganhos_por_end_time(start_iso, end_iso),
+        "ganhos": contar_ganhos_por_data_ganho(start_iso, end_iso),
         "perdidos": contar_deals(dealStatus=3, endAtGt=start_iso, endAtLt=end_iso),
         "em_andamento": _snapshot_open(snapshot_day),
     }
