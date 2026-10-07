@@ -145,31 +145,47 @@ def listar_ganhos_cacheados() -> list[dict[str, Any]]:
         return _WON_CACHE
 
 
-def _data_ganho(deal: dict[str, Any]) -> datetime | None:
+def _data_ganho_raw(deal: dict[str, Any]) -> str | None:
     """Replica a prioridade usada na aba Contratos Ganhos do dashboard.
 
     Ordem: endTime -> wonAt -> finishedAt -> closedAt.
-    Assim, quando há data de conclusão ela prevalece; os demais campos são
-    apenas fallback quando endTime não está preenchido.
+    O valor bruto é preservado porque endTime é uma data de negócio
+    representada como meia-noite UTC; convertê-la para o fuso de Brasília
+    mudaria indevidamente o dia usado nos relatórios.
     """
     for field in ("endTime", "wonAt", "finishedAt", "closedAt"):
-        value = _parse_iso(deal.get(field))
-        if value is not None:
-            return value
+        value = deal.get(field)
+        if value:
+            return str(value)
     return None
 
 
-def contar_ganhos_por_data_ganho(start_iso: str, end_iso: str) -> int:
-    """Conta ganhos com a mesma regra da aba Contratos Ganhos do dashboard."""
-    start = _parse_iso(start_iso)
-    end = _parse_iso(end_iso)
-    if start is None or end is None:
-        return 0
+def _data_ganho_date(deal: dict[str, Any]) -> date | None:
+    value = _data_ganho_raw(deal)
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _eh_funil_comercial(deal: dict[str, Any]) -> bool:
+    funnel = ((deal.get("dealStage") or {}).get("funnel") or {})
+    try:
+        return int(funnel.get("id")) == int(FUNIL_COMERCIAL_ID)
+    except (TypeError, ValueError):
+        return False
+
+
+def contar_ganhos_por_data_ganho(start_day: date, end_day: date) -> int:
+    """Conta ganhos pela data de conclusão, sem conversão de fuso horário."""
     return sum(
         1
         for deal in listar_ganhos_cacheados()
-        if (data_ganho := _data_ganho(deal)) is not None
-        and start <= data_ganho <= end
+        if _eh_funil_comercial(deal)
+        and (data_ganho := _data_ganho_date(deal)) is not None
+        and start_day <= data_ganho <= end_day
     )
 
 
@@ -190,13 +206,15 @@ def _snapshot_open(day: date) -> int:
     won_after = 0
     if cutoff_dt is not None:
         for deal in listar_ganhos_cacheados():
+            if not _eh_funil_comercial(deal):
+                continue
             started_at = _parse_iso(deal.get("startTime") or deal.get("createdAt"))
-            data_ganho = _data_ganho(deal)
+            data_ganho = _data_ganho_date(deal)
             if (
                 started_at is not None
                 and started_at <= cutoff_dt
                 and data_ganho is not None
-                and data_ganho > cutoff_dt
+                and data_ganho > day
             ):
                 won_after += 1
 
@@ -204,10 +222,16 @@ def _snapshot_open(day: date) -> int:
     return ongoing + won_after + lost_after
 
 
-def _period_metrics(start_iso: str, end_iso: str, snapshot_day: date) -> dict[str, int]:
+def _period_metrics(
+    start_iso: str,
+    end_iso: str,
+    snapshot_day: date,
+    gains_start_day: date,
+    gains_end_day: date,
+) -> dict[str, int]:
     return {
         "leads": contar_deals(startAtGt=start_iso, startAtLt=end_iso),
-        "ganhos": contar_ganhos_por_data_ganho(start_iso, end_iso),
+        "ganhos": contar_ganhos_por_data_ganho(gains_start_day, gains_end_day),
         "perdidos": contar_deals(dealStatus=3, endAtGt=start_iso, endAtLt=end_iso),
         "em_andamento": _snapshot_open(snapshot_day),
     }
@@ -215,12 +239,18 @@ def _period_metrics(start_iso: str, end_iso: str, snapshot_day: date) -> dict[st
 
 def metricas_dia(day: date) -> dict[str, int]:
     start_iso, end_iso = _bounds(day)
-    return _period_metrics(start_iso, end_iso, day)
+    return _period_metrics(start_iso, end_iso, day, day, day)
 
 
 def metricas_mes(through_day: date) -> dict[str, int]:
     start_iso, end_iso = _month_bounds(through_day)
-    return _period_metrics(start_iso, end_iso, through_day)
+    return _period_metrics(
+        start_iso,
+        end_iso,
+        through_day,
+        through_day.replace(day=1),
+        through_day,
+    )
 
 
 def listar_leads_dia(day: date) -> list[dict[str, Any]]:
