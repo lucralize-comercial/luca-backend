@@ -10,6 +10,7 @@ import threading
 import json
 import hmac
 import hashlib
+import inspect
 from urllib.parse import parse_qs, quote
 
 app = Flask(__name__)
@@ -145,11 +146,27 @@ def _agendor_aplicar_cooldown(segundos):
     with _AGENDOR_RATE_LOCK:
         _AGENDOR_COOLDOWN_UNTIL = max(_AGENDOR_COOLDOWN_UNTIL, time.monotonic() + max(0.0, segundos))
 
+def _agendor_caller():
+    """Identifica a rotina do Luca que originou a chamada, sem payload/tokens."""
+    frame = inspect.currentframe()
+    ignorar = {"_agendor_caller", "_agendor_request_controlado", "wrapper", "_agendor_esperar_slot"}
+    try:
+        frame = frame.f_back if frame else None
+        while frame:
+            nome = frame.f_code.co_name
+            if nome not in ignorar:
+                return nome
+            frame = frame.f_back
+    finally:
+        del frame
+    return "desconhecido"
+
 def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
     # Não interfere em RD, Teams, Graph, AgendorChat, Autentique etc.
     if not isinstance(url, str) or not url.startswith(AGENDOR_BASE):
         return original(url, *args, **kwargs)
 
+    caller = _agendor_caller()
     for tentativa in range(_AGENDOR_429_RETRIES + 1):
         _agendor_esperar_slot()
         resp = original(url, *args, **kwargs)
@@ -157,7 +174,7 @@ def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
             return resp
 
         if tentativa >= _AGENDOR_429_RETRIES:
-            print(f"[agendor-rate] 429 persistente após {_AGENDOR_429_RETRIES + 1} tentativas: {metodo.upper()} {url}", flush=True)
+            print(f"[agendor-rate] 429 persistente caller={caller} após {_AGENDOR_429_RETRIES + 1} tentativas: {metodo.upper()} {url}", flush=True)
             return resp
 
         retry_after = resp.headers.get("Retry-After")
@@ -169,7 +186,7 @@ def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
         jitter = 0.20 + ((threading.get_ident() % 7) * 0.07)
         espera_429 = max(1.0, base + jitter)
         _agendor_aplicar_cooldown(espera_429)
-        print(f"[agendor-rate] 429 em {metodo.upper()} {url} — cooldown global {espera_429:.1f}s antes da tentativa {tentativa + 2}/{_AGENDOR_429_RETRIES + 1}", flush=True)
+        print(f"[agendor-rate] 429 caller={caller} em {metodo.upper()} {url} — cooldown global {espera_429:.1f}s antes da tentativa {tentativa + 2}/{_AGENDOR_429_RETRIES + 1}", flush=True)
         # _agendor_esperar_slot na próxima tentativa respeitará o cooldown global.
 
     return resp
