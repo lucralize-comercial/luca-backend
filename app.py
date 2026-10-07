@@ -2328,11 +2328,14 @@ def rd_retroativo_aplicar_deal(deal_id):
                         "erro": f"{type(e).__name__}: {str(e)[:300]}"}), 502
 
 
-# ── RD Station: retroativo automático e retomável ────────────────────────────
+# ── RD Station: retroativo automático, retomável e de baixa prioridade ────────
 RD_RETRO_AUTO_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
 RD_RETRO_AUTO_STATE_FILE = os.environ.get("RD_RETRO_AUTO_STATE_FILE", "/data/rd_retro_auto.json")
+RD_RETRO_AUTO_LOCK_FILE = os.environ.get("RD_RETRO_AUTO_LOCK_FILE", "/data/rd_retro_auto.lock")
 RD_RETRO_AUTO_RETRIES = int(os.environ.get("RD_RETRO_AUTO_RETRIES", "3"))
 RD_RETRO_AUTO_RETRY_SECONDS = float(os.environ.get("RD_RETRO_AUTO_RETRY_SECONDS", "3"))
+RD_RETRO_AUTO_PACE_SECONDS = float(os.environ.get("RD_RETRO_AUTO_PACE_SECONDS", "0.65"))
+RD_RETRO_AUTO_MAX_ROUNDS = int(os.environ.get("RD_RETRO_AUTO_MAX_ROUNDS", "8"))
 _rd_retro_auto_lock = threading.Lock()
 _rd_retro_auto_state = {
     "status": "nunca_executado", "started_at": None, "finished_at": None,
@@ -2361,7 +2364,37 @@ def _rd_retro_auto_carregar():
         print(f"[rd-retro-auto] checkpoint inválido: {type(e).__name__}: {str(e)[:160]}", flush=True)
         return {}
 
-def _rd_retro_auto_candidatos():
+def _rd_retro_auto_process_lock():
+    """Lock entre processos Gunicorn; retorna arquivo aberto ou None se já houver worker."""
+    try:
+        import fcntl
+        os.makedirs(os.path.dirname(RD_RETRO_AUTO_LOCK_FILE) or ".", exist_ok=True)
+        fh = open(RD_RETRO_AUTO_LOCK_FILE, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except BlockingIOError:
+            fh.close()
+            return None
+    except Exception as e:
+        print(f"[rd-retro-auto] lock de processo indisponível: {type(e).__name__}: {str(e)[:160]}", flush=True)
+        return None
+
+def _rd_retro_auto_erro_transiente(exc):
+    """429, timeout, conexão e 5xx ficam elegíveis para nova tentativa automática."""
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+        return status == 429 or (isinstance(status, int) and 500 <= status <= 599)
+    texto = str(exc).lower()
+    return any(x in texto for x in ("429", "timeout", "timed out", "connection reset", "temporarily unavailable"))
+
+def _rd_retro_auto_candidatos(cutoff_at=None):
+    cutoff = _rd_parse_iso(cutoff_at) if cutoff_at else None
+    if cutoff is not None and cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
     candidatos = []
     for deal in list(cache.get("deals") or []):
         stage = deal.get("dealStage") or {}
@@ -2372,107 +2405,204 @@ def _rd_retro_auto_candidatos():
             continue
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        if cutoff is not None and dt.astimezone(timezone.utc) > cutoff.astimezone(timezone.utc):
+            continue
         candidatos.append(deal)
-    candidatos.sort(
-        key=lambda d: _rd_parse_iso(d.get("startTime")) or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
+    candidatos.sort(key=lambda d: (
+        _rd_parse_iso(d.get("startTime")) or datetime.min.replace(tzinfo=timezone.utc),
+        int(d.get("id") or 0),
+    ), reverse=True)
     return candidatos
+
+def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada=1, erro=None):
+    payload = {
+        "status": status, "started_at": started_at,
+        "cutoff_at": cutoff_at, "updated_at": datetime.now(timezone.utc).isoformat(),
+        "concluidos": sorted(concluidos), "resultados": resultados,
+        "pendentes_transientes": pendentes, "rodada": rodada,
+        "resumo": resumo, "erro": erro,
+    }
+    _rd_retro_auto_salvar(payload)
+    return payload
 
 def _rd_retro_auto_executar():
     if not _rd_retro_auto_lock.acquire(blocking=False):
         return False
+    process_lock = None
     try:
+        process_lock = _rd_retro_auto_process_lock()
+        if process_lock is None:
+            print("[rd-retro-auto] outro processo já possui o lock; worker não iniciado", flush=True)
+            return False
+
         anterior = _rd_retro_auto_carregar()
+        started_at = anterior.get("started_at") or datetime.now(timezone.utc).isoformat()
+        cutoff_at = anterior.get("cutoff_at") or started_at
         concluidos = set(str(x) for x in (anterior.get("concluidos") or []))
         resultados = anterior.get("resultados") or {}
         if not isinstance(resultados, dict):
             resultados = {}
+        pendentes = anterior.get("pendentes_transientes") or {}
+        if not isinstance(pendentes, dict):
+            pendentes = {}
+        rodada = max(1, int(anterior.get("rodada") or 1))
 
-        deals = _rd_retro_auto_candidatos()
-        total = len(deals)
-        resumo = {
+        deals = _rd_retro_auto_candidatos(cutoff_at)
+        if not deals:
+            raise RuntimeError("cache_deals_ainda_vazio")
+        por_id = {str(d.get("id")): d for d in deals if d.get("id")}
+        total = len(por_id)
+        resumo = anterior.get("resumo") or {}
+        resumo.update({
             "modo": "RETROATIVO_RD_ORIGEM_AUTOMATICO",
-            "candidatos_agendor": total, "analisados_nesta_execucao": 0,
-            "retomados_do_checkpoint": len(concluidos), "atualizados": 0,
-            "ja_preenchidos": 0, "inconclusivos": 0, "erros_finais": 0,
-            "por_motivo": {},
-        }
-        _rd_retro_auto_state.update({
-            "status": "executando", "started_at": datetime.now(timezone.utc).isoformat(),
-            "finished_at": None, "resultado": resumo, "erro": None,
-            "progresso": {"atual": 0, "total": total, "deal_id": None},
+            "candidatos_agendor": total,
+            "retomados_do_checkpoint": len(concluidos),
         })
-        print(f"[rd-retro-auto] inicio candidatos={total} checkpoint={len(concluidos)}", flush=True)
+        for k, v in {
+            "analisados": 0, "atualizados": 0, "ja_preenchidos": 0,
+            "inconclusivos": 0, "erros_terminais": 0, "retries_transientes": 0,
+            "por_motivo": {},
+        }.items():
+            resumo.setdefault(k, v)
 
-        for indice, deal_base in enumerate(deals, start=1):
-            deal_id = deal_base.get("id")
-            chave = str(deal_id)
-            _rd_retro_auto_state["progresso"] = {"atual": indice, "total": total, "deal_id": deal_id}
-            if chave in concluidos:
-                continue
+        _rd_retro_auto_state.update({
+            "status": "executando", "started_at": started_at, "finished_at": None,
+            "resultado": resumo, "erro": None,
+            "progresso": {"atual": len(concluidos), "total": total, "deal_id": None},
+        })
+        _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+        print(f"[rd-retro-auto] iniciado/retomado total={total} concluidos={len(concluidos)} cutoff={cutoff_at}", flush=True)
 
-            resultado = None
-            ultimo_erro = None
-            for tentativa in range(1, RD_RETRO_AUTO_RETRIES + 1):
-                try:
-                    resultado = _rd_retro_single_processar(deal_id, aplicar_limite_dias=False)
-                    ultimo_erro = None
-                    break
-                except Exception as e:
-                    ultimo_erro = f"{type(e).__name__}: {str(e)[:240]}"
-                    print(f"[rd-retro-auto] retry deal={deal_id} tentativa={tentativa}/{RD_RETRO_AUTO_RETRIES} erro={ultimo_erro}", flush=True)
-                    if tentativa < RD_RETRO_AUTO_RETRIES:
-                        time.sleep(RD_RETRO_AUTO_RETRY_SECONDS * tentativa)
+        while rodada <= RD_RETRO_AUTO_MAX_ROUNDS:
+            fila = [k for k in por_id if k not in concluidos]
+            if not fila:
+                break
+            houve_progresso = False
+            print(f"[rd-retro-auto] rodada={rodada} fila={len(fila)}", flush=True)
+            for chave in fila:
+                deal_id = int(chave)
+                _rd_retro_auto_state["progresso"] = {"atual": len(concluidos), "total": total, "deal_id": deal_id}
+                resultado = None
+                ultimo_erro = None
+                transiente = False
 
-            resumo["analisados_nesta_execucao"] += 1
-            if resultado is None:
-                resultado = {"deal_id": deal_id, "status": "erro",
-                             "motivo": "erro_apos_retries", "erro": ultimo_erro}
-                resumo["erros_finais"] += 1
-            else:
-                status = resultado.get("status")
-                motivo = resultado.get("motivo") or "sem_motivo"
-                if status == "atualizado":
-                    resumo["atualizados"] += 1
-                elif status == "ja_preenchido":
-                    resumo["ja_preenchidos"] += 1
+                for tentativa in range(1, RD_RETRO_AUTO_RETRIES + 1):
+                    try:
+                        resultado = _rd_retro_single_processar(deal_id, aplicar_limite_dias=False)
+                        ultimo_erro = None
+                        break
+                    except Exception as e:
+                        ultimo_erro = f"{type(e).__name__}: {str(e)[:240]}"
+                        transiente = _rd_retro_auto_erro_transiente(e)
+                        print(f"[rd-retro-auto] erro deal={deal_id} tentativa={tentativa}/{RD_RETRO_AUTO_RETRIES} transiente={transiente} erro={ultimo_erro}", flush=True)
+                        if not transiente:
+                            break
+                        resumo["retries_transientes"] += 1
+                        if tentativa < RD_RETRO_AUTO_RETRIES:
+                            time.sleep(min(30.0, RD_RETRO_AUTO_RETRY_SECONDS * (2 ** (tentativa - 1))))
+
+                if resultado is not None:
+                    status = resultado.get("status")
+                    motivo = resultado.get("motivo") or "sem_motivo"
+                    resumo["analisados"] += 1
+                    if status == "atualizado":
+                        resumo["atualizados"] += 1
+                    elif status == "ja_preenchido":
+                        resumo["ja_preenchidos"] += 1
+                    else:
+                        resumo["inconclusivos"] += 1
+                    resumo["por_motivo"][motivo] = resumo["por_motivo"].get(motivo, 0) + 1
+                    resultados[chave] = resultado
+                    concluidos.add(chave)
+                    pendentes.pop(chave, None)
+                    houve_progresso = True
+                elif transiente:
+                    pendentes[chave] = {
+                        "deal_id": deal_id, "ultimo_erro": ultimo_erro,
+                        "ultima_tentativa": datetime.now(timezone.utc).isoformat(), "rodada": rodada,
+                    }
                 else:
-                    resumo["inconclusivos"] += 1
-                resumo["por_motivo"][motivo] = resumo["por_motivo"].get(motivo, 0) + 1
+                    resumo["analisados"] += 1
+                    resumo["erros_terminais"] += 1
+                    resultados[chave] = {"deal_id": deal_id, "status": "erro", "motivo": "erro_terminal", "erro": ultimo_erro}
+                    concluidos.add(chave)
+                    pendentes.pop(chave, None)
+                    houve_progresso = True
 
-            resultados[chave] = resultado
-            concluidos.add(chave)
-            _rd_retro_auto_salvar({
-                "status": "executando",
-                "started_at": _rd_retro_auto_state["started_at"],
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "concluidos": list(concluidos), "resultados": resultados, "resumo": resumo,
-            })
-            if indice == 1 or indice % 25 == 0 or indice == total:
-                print(f"[rd-retro-auto] progresso {indice}/{total} atualizados={resumo['atualizados']} inconclusivos={resumo['inconclusivos']} erros={resumo['erros_finais']}", flush=True)
+                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+                time.sleep(max(0.0, RD_RETRO_AUTO_PACE_SECONDS))
+
+                if len(concluidos) % 25 == 0 and concluidos:
+                    print(f"[rd-retro-auto] progresso {len(concluidos)}/{total} atualizados={resumo['atualizados']} pendentes={len(pendentes)}", flush=True)
+
+            if not pendentes:
+                break
+            rodada += 1
+            if rodada <= RD_RETRO_AUTO_MAX_ROUNDS:
+                espera = min(300.0, 15.0 * (2 ** min(rodada - 2, 4)))
+                print(f"[rd-retro-auto] {len(pendentes)} transientes pendentes; nova rodada em {espera:.0f}s", flush=True)
+                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+                time.sleep(espera)
 
         resumo["total_concluido_checkpoint"] = len(concluidos)
-        final = {
-            "status": "concluido", "started_at": _rd_retro_auto_state["started_at"],
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "concluidos": list(concluidos), "resultados": resultados, "resumo": resumo,
-        }
+        resumo["pendentes_transientes"] = len(pendentes)
+        final_status = "concluido" if not pendentes else "concluido_com_pendencias_transientes"
+        final = _rd_retro_auto_checkpoint(final_status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+        final["finished_at"] = datetime.now(timezone.utc).isoformat()
         _rd_retro_auto_salvar(final)
         _rd_retro_auto_state.update({
-            "status": "concluido", "finished_at": final["finished_at"],
+            "status": final_status, "finished_at": final["finished_at"],
             "resultado": resumo, "erro": None,
-            "progresso": {"atual": total, "total": total, "deal_id": None},
+            "progresso": {"atual": len(concluidos), "total": total, "deal_id": None},
         })
-        print(f"[rd-retro-auto] concluido resumo={json.dumps(resumo, ensure_ascii=False)}", flush=True)
+        print(f"[rd-retro-auto] finalizado status={final_status} resumo={json.dumps(resumo, ensure_ascii=False)}", flush=True)
         return True
     except Exception as e:
         erro = f"{type(e).__name__}: {str(e)[:300]}"
-        _rd_retro_auto_state.update({"status": "erro", "finished_at": datetime.now(timezone.utc).isoformat(), "erro": erro})
-        print(f"[rd-retro-auto] erro_geral={erro}", flush=True)
+        anterior = _rd_retro_auto_carregar()
+        # cache vazio no boot é condição de retomada, não falha definitiva
+        status = "aguardando_retomada" if "cache_deals_ainda_vazio" in erro else "erro_retomavel"
+        anterior.update({"status": status, "updated_at": datetime.now(timezone.utc).isoformat(), "erro": erro})
+        try:
+            _rd_retro_auto_salvar(anterior)
+        except Exception:
+            pass
+        _rd_retro_auto_state.update({"status": status, "erro": erro})
+        print(f"[rd-retro-auto] {status}={erro}", flush=True)
         return False
     finally:
+        if process_lock is not None:
+            try:
+                import fcntl
+                fcntl.flock(process_lock.fileno(), fcntl.LOCK_UN)
+                process_lock.close()
+            except Exception:
+                pass
         _rd_retro_auto_lock.release()
+
+def _rd_retro_auto_iniciar_thread():
+    if _rd_retro_auto_state.get("status") == "executando":
+        return False
+    t = threading.Thread(target=_rd_retro_auto_executar, daemon=True, name="rd-retro-auto")
+    t.start()
+    return True
+
+def _rd_retro_auto_retomar_se_necessario():
+    """Chamado pelo scheduler: após restart, retoma sozinho quando o cache já existir."""
+    try:
+        persistido = _rd_retro_auto_carregar()
+        status = persistido.get("status")
+        if status not in ("executando", "aguardando_retomada", "erro_retomavel"):
+            return
+        if not (cache.get("deals") or []):
+            print("[rd-retro-auto] retomada aguardando cache de deals", flush=True)
+            return
+        if _rd_retro_auto_state.get("status") == "executando":
+            return
+        print(f"[rd-retro-auto] retomada automática solicitada status_checkpoint={status}", flush=True)
+        _rd_retro_auto_iniciar_thread()
+    except Exception as e:
+        print(f"[rd-retro-auto] erro ao avaliar retomada: {type(e).__name__}: {str(e)[:180]}", flush=True)
 
 @app.route("/rd/retroativo/automatico", methods=["POST", "GET"])
 def rd_retroativo_automatico():
@@ -2487,23 +2617,30 @@ def rd_retroativo_automatico():
             "checkpoint": {
                 "status": persistido.get("status"),
                 "started_at": persistido.get("started_at"),
+                "cutoff_at": persistido.get("cutoff_at"),
                 "updated_at": persistido.get("updated_at"),
                 "finished_at": persistido.get("finished_at"),
                 "resumo": persistido.get("resumo"),
                 "concluidos": len(persistido.get("concluidos") or []),
+                "pendentes_transientes": len(persistido.get("pendentes_transientes") or {}),
+                "rodada": persistido.get("rodada"),
             },
         }), 200
     if request.headers.get("X-Confirm-Write", "") != RD_RETRO_AUTO_CONFIRM:
         return jsonify({"status": "confirmacao_necessaria"}), 409
-    if _rd_retro_auto_state.get("status") == "executando":
-        return jsonify(_rd_retro_auto_state), 202
-    t = threading.Thread(target=_rd_retro_auto_executar, daemon=True)
-    t.start()
+    persistido = _rd_retro_auto_carregar()
+    if persistido.get("status") == "concluido":
+        return jsonify({"status": "ja_concluido", "resumo": persistido.get("resumo")}), 200
+    iniciado = _rd_retro_auto_iniciar_thread()
     return jsonify({
-        "status": "iniciado", "modo": "RETROATIVO_RD_ORIGEM_AUTOMATICO",
-        "escopo": "todo_historico_disponivel_no_cache",
+        "status": "iniciado" if iniciado else "ja_em_execucao",
+        "modo": "RETROATIVO_RD_ORIGEM_AUTOMATICO",
+        "escopo": "historico_disponivel_ate_o_inicio_da_execucao",
         "checkpoint": RD_RETRO_AUTO_STATE_FILE,
-        "retries_por_negocio": RD_RETRO_AUTO_RETRIES,
+        "retries_imediatos_por_negocio": RD_RETRO_AUTO_RETRIES,
+        "rodadas_transientes": RD_RETRO_AUTO_MAX_ROUNDS,
+        "retomada_automatica_apos_restart": True,
+        "nunca_sobrescreve_origem_existente": True,
     }), 202
 
 
@@ -7126,6 +7263,8 @@ scheduler.add_job(verificar_followup_dias_silencio_safe, "interval", hours=3, id
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "interval", hours=3, id="reconciliar_perdidos_d10")
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "date", run_date=datetime.now() + timedelta(minutes=2), id="reconciliar_perdidos_d10_inicial")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
+scheduler.add_job(_rd_retro_auto_retomar_se_necessario, "interval", minutes=5, id="rd_retro_auto_retomada")
+scheduler.add_job(_rd_retro_auto_retomar_se_necessario, "date", run_date=datetime.now() + timedelta(minutes=10), id="rd_retro_auto_retomada_inicial")
 scheduler.start()
 
 if __name__ == "__main__":
