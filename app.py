@@ -2430,7 +2430,7 @@ def _rd_retro_auto_candidatos(cutoff_at=None):
     ), reverse=True)
     return candidatos
 
-def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada=1, erro=None, modo=None):
+def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada=1, erro=None, modo=None, candidatos_ids=None):
     payload = {
         "status": status, "started_at": started_at,
         "cutoff_at": cutoff_at, "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -2438,6 +2438,7 @@ def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resulta
         "pendentes_transientes": pendentes, "rodada": rodada,
         "resumo": resumo, "erro": erro,
         "modo": modo or "completo",
+        "candidatos_ids": [str(x) for x in (candidatos_ids or [])],
     }
     _rd_retro_auto_salvar(payload)
     return payload
@@ -2468,12 +2469,22 @@ def _rd_retro_auto_executar(validacao=False):
             pendentes = {}
         rodada = max(1, int(anterior.get("rodada") or 1))
 
-        deals = _rd_retro_auto_candidatos(cutoff_at)
-        if validacao:
-            deals = deals[:max(1, RD_RETRO_VALIDACAO_LIMITE)]
-        if not deals:
-            raise RuntimeError("cache_deals_ainda_vazio")
-        por_id = {str(d.get("id")): d for d in deals if d.get("id")}
+        # Depois que a execução começa, a lista de IDs vira parte do checkpoint.
+        # Assim um restart não depende de reconstruir todo o cache do Agendor para retomar.
+        candidatos_persistidos = [str(x) for x in (anterior.get("candidatos_ids") or []) if str(x).strip()]
+        if candidatos_persistidos:
+            candidatos_ids = candidatos_persistidos
+        else:
+            deals = _rd_retro_auto_candidatos(cutoff_at)
+            if validacao:
+                deals = deals[:max(1, RD_RETRO_VALIDACAO_LIMITE)]
+            if not deals:
+                raise RuntimeError("cache_deals_ainda_vazio")
+            candidatos_ids = [str(d.get("id")) for d in deals if d.get("id")]
+        # dict preserva ordem e elimina eventual duplicidade. O processamento individual
+        # busca o negócio pelo ID, portanto não precisa do objeto completo em cache.
+        candidatos_ids = list(dict.fromkeys(candidatos_ids))
+        por_id = {deal_id: True for deal_id in candidatos_ids}
         total = len(por_id)
         resumo = anterior.get("resumo") or {}
         resumo.update({
@@ -2493,7 +2504,7 @@ def _rd_retro_auto_executar(validacao=False):
             "resultado": resumo, "erro": None,
             "progresso": {"atual": len(concluidos), "total": total, "deal_id": None},
         })
-        _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
+        _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao, candidatos_ids=candidatos_ids)
         print(f"[rd-retro-auto] iniciado/retomado total={total} concluidos={len(concluidos)} cutoff={cutoff_at}", flush=True)
 
         while rodada <= RD_RETRO_AUTO_MAX_ROUNDS:
@@ -2552,7 +2563,7 @@ def _rd_retro_auto_executar(validacao=False):
                     pendentes.pop(chave, None)
                     houve_progresso = True
 
-                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
+                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao, candidatos_ids=candidatos_ids)
                 time.sleep(max(0.0, RD_RETRO_AUTO_PACE_SECONDS))
 
                 if len(concluidos) % 25 == 0 and concluidos:
@@ -2564,13 +2575,13 @@ def _rd_retro_auto_executar(validacao=False):
             if rodada <= RD_RETRO_AUTO_MAX_ROUNDS:
                 espera = min(300.0, 15.0 * (2 ** min(rodada - 2, 4)))
                 print(f"[rd-retro-auto] {len(pendentes)} transientes pendentes; nova rodada em {espera:.0f}s", flush=True)
-                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
+                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao, candidatos_ids=candidatos_ids)
                 time.sleep(espera)
 
         resumo["total_concluido_checkpoint"] = len(concluidos)
         resumo["pendentes_transientes"] = len(pendentes)
         final_status = (("validacao_concluida" if validacao else "concluido") if not pendentes else ("validacao_com_pendencias_transientes" if validacao else "concluido_com_pendencias_transientes"))
-        final = _rd_retro_auto_checkpoint(final_status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
+        final = _rd_retro_auto_checkpoint(final_status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao, candidatos_ids=candidatos_ids)
         final["finished_at"] = datetime.now(timezone.utc).isoformat()
         _rd_retro_auto_salvar(final)
         _rd_retro_auto_state.update({
@@ -2617,8 +2628,11 @@ def _rd_retro_auto_retomar_se_necessario():
         status = persistido.get("status")
         if status not in ("executando", "aguardando_retomada", "erro_retomavel"):
             return
-        if not (cache.get("deals") or []):
-            print("[rd-retro-auto] retomada aguardando cache de deals", flush=True)
+        # Se a execução já gravou seus candidatos no checkpoint, pode retomar
+        # imediatamente após restart, sem aguardar a carga completa de /deals.
+        # Checkpoints antigos, sem essa lista, mantêm o comportamento legado seguro.
+        if not (persistido.get("candidatos_ids") or []) and not (cache.get("deals") or []):
+            print("[rd-retro-auto] retomada aguardando cache de deals (checkpoint legado sem candidatos_ids)", flush=True)
             return
         if _rd_retro_auto_state.get("status") == "executando":
             return
