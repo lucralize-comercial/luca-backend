@@ -236,36 +236,73 @@ def contar_perdidos_por_data_conclusao(start_day: date, end_day: date) -> int:
     )
 
 
-def _snapshot_open(day: date) -> int:
-    """Estoque no fim do dia sem baixar os 6.789 negócios do funil.
+def _data_inicio_date(deal: dict[str, Any]) -> date | None:
+    """Data de entrada do negócio no funil.
 
-    Mantém a mesma lógica conceitual do cálculo anterior para negócios que hoje
-    pertencem ao Funil Comercial: entrou até o corte e ainda não havia encerrado.
+    `startTime` é uma data de negócio serializada à meia-noite UTC, então deve
+    ser comparada como YYYY-MM-DD. Se não existir, `createdAt` é um timestamp
+    real e é convertido para Brasília antes de extrair a data.
     """
-    _, cutoff = _bounds(day)
+    start_time = deal.get("startTime")
+    if start_time:
+        try:
+            return date.fromisoformat(str(start_time)[:10])
+        except (TypeError, ValueError):
+            pass
 
-    # Negócios que continuam abertos hoje e já existiam no corte.
-    ongoing = contar_deals(dealStatus=1, startAtLt=cutoff)
+    created_at = _parse_iso(deal.get("createdAt"))
+    if created_at is None:
+        return None
+    return created_at.astimezone(BRT).date()
 
-    # Negócios que hoje estão fechados, mas só foram encerrados depois do corte.
-    # Portanto, no fim daquele dia ainda estavam em andamento.
-    cutoff_dt = _parse_iso(cutoff)
-    won_after = 0
-    if cutoff_dt is not None:
-        for deal in listar_ganhos_cacheados():
-            if not _eh_funil_comercial(deal):
-                continue
-            started_at = _parse_iso(deal.get("startTime") or deal.get("createdAt"))
-            data_ganho = _data_ganho_date(deal)
-            if (
-                started_at is not None
-                and started_at <= cutoff_dt
-                and data_ganho is not None
-                and data_ganho > day
-            ):
-                won_after += 1
 
-    lost_after = contar_deals(dealStatus=3, startAtLt=cutoff, endAtGt=cutoff)
+def _snapshot_open(day: date) -> int:
+    """Estoque no fim do dia pela data de negócio, sem deslocamento de fuso.
+
+    Um negócio conta como em andamento no fechamento de `day` quando:
+    - já havia iniciado até essa data; e
+    - continua aberto hoje, ou só foi concluído em data posterior a `day`.
+
+    Isso evita interpretar `startTime`/`endTime` à meia-noite UTC como horário
+    de Brasília, o que deslocava negócios do dia seguinte para o dia anterior.
+    """
+    # Negócios que continuam abertos hoje e já tinham iniciado até o corte.
+    ongoing = sum(
+        1
+        for deal in listar_deals(dealStatus=1)
+        if _eh_funil_comercial(deal)
+        and (data_inicio := _data_inicio_date(deal)) is not None
+        and data_inicio <= day
+    )
+
+    # Ganhos concluídos depois do corte ainda estavam abertos naquele dia.
+    won_after = sum(
+        1
+        for deal in listar_ganhos_cacheados()
+        if _eh_funil_comercial(deal)
+        and (data_inicio := _data_inicio_date(deal)) is not None
+        and data_inicio <= day
+        and (data_ganho := _data_ganho_date(deal)) is not None
+        and data_ganho > day
+    )
+
+    # Para perdas, pedimos à API apenas as conclusões posteriores ao corte e
+    # fazemos a seleção definitiva localmente por YYYY-MM-DD.
+    query_start = datetime.combine(day + timedelta(days=1), dt_time.min, tzinfo=UTC) - timedelta(seconds=1)
+    lost_candidates = listar_deals(
+        dealStatus=3,
+        endAtGt=_iso(query_start),
+    )
+    lost_after = sum(
+        1
+        for deal in lost_candidates
+        if _eh_funil_comercial(deal)
+        and (data_inicio := _data_inicio_date(deal)) is not None
+        and data_inicio <= day
+        and (data_perda := _data_perda_date(deal)) is not None
+        and data_perda > day
+    )
+
     return ongoing + won_after + lost_after
 
 
