@@ -1204,19 +1204,27 @@ def fetch_deals():
         # O limitador central já aplica AGENDOR_MIN_INTERVAL. Mantemos uma
         # margem adicional entre páginas para reduzir rajadas no startup.
         time.sleep(float(os.environ.get("AGENDOR_DEALS_PAGE_PACE_SECONDS", "1.25")))
-    # Preserva produtos já conhecidos antes de substituir o cache básico.
-    # Durante o retroativo o enriquecimento via Agendor é suspenso; sem esta
-    # cópia, uma nova paginação apagaria products_entities e poderia afetar
-    # temporariamente comissões/visões que dependem do produto.
+    # Preserva produtos conhecidos do cache em memória e reidrata também
+    # pelo cache persistente. O cache progressivo acima substitui cache["deals"],
+    # então depender só dele fazia os produtos desaparecerem após uma nova carga.
+    products_cache = _carregar_products_cache()
     produtos_anteriores = {
         str(d.get("id")): d.get("products_entities")
         for d in (cache.get("deals") or [])
         if d.get("id") is not None and "products_entities" in d
     }
     for deal in all_deals:
-        produtos = produtos_anteriores.get(str(deal.get("id")))
+        deal_id = str(deal.get("id")) if deal.get("id") is not None else None
+        produtos = produtos_anteriores.get(deal_id) if deal_id else None
         if produtos is not None and "products_entities" not in deal:
             deal["products_entities"] = produtos
+        salvo = products_cache.get(deal_id) if deal_id else None
+        if (
+            "products_entities" not in deal
+            and isinstance(salvo, dict)
+            and isinstance(salvo.get("products"), list)
+        ):
+            deal["products_entities"] = salvo["products"]
 
     cache["deals"] = all_deals
     cache["total"] = total_count or len(all_deals)
@@ -1235,7 +1243,6 @@ def fetch_deals():
     if not enriquecer_produtos:
         print(f"[fetch_deals] produtos adiados durante retroativo status={retro_status}", flush=True)
         won_recent = []
-    products_cache = _carregar_products_cache()
     products_cache_changed = False
     reaproveitados = 0
     consultas_agendor = 0
