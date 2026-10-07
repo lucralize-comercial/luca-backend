@@ -237,56 +237,83 @@ Regras:
   ressalvas (array de strings).
 """
 
+def _parse_ai_json(raw: str) -> dict[str, Any]:
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("resposta sem bloco de texto")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("resposta sem JSON")
+        return json.loads(raw[start:end + 1])
+
+
 def analisar_com_ia(pacote: dict[str, Any]) -> dict[str, Any]:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY não configurada no luca-reports")
     model = os.environ.get("REPORT_AI_MODEL", "claude-sonnet-5").strip()
     payload_text = json.dumps(pacote, ensure_ascii=False, separators=(",", ":"))
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": model,
-            "max_tokens": 1400,
-            "system": SYSTEM_PROMPT,
-            "messages": [{
-                "role": "user",
-                "content": "Analise o relatório semanal a seguir e gere a leitura gerencial solicitada.\n\nDADOS:\n" + payload_text,
-            }],
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
-    body = r.json()
-    text_parts = [
-        block.get("text", "") for block in body.get("content", [])
-        if block.get("type") == "text"
-    ]
-    raw = "\n".join(text_parts).strip()
-    try:
-        analysis = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
-            raise RuntimeError("IA retornou resposta sem JSON válido")
-        analysis = json.loads(raw[start:end + 1])
-    usage = body.get("usage") or {}
-    return {
-        "modelo": model,
-        "analise": analysis,
-        "uso": {
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
-            "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
-            "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
-        },
+    usage_total = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
     }
+    last_detail = ""
+    for attempt, max_tokens in enumerate((2600, 4200), start=1):
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": SYSTEM_PROMPT,
+                "messages": [{
+                    "role": "user",
+                    "content": "Analise o relatório semanal a seguir e gere a leitura gerencial solicitada. "
+                               "Seja objetivo e devolva obrigatoriamente o JSON final completo.\n\nDADOS:\n" + payload_text,
+                }],
+            },
+            timeout=90,
+        )
+        r.raise_for_status()
+        body = r.json()
+        usage = body.get("usage") or {}
+        for key in usage_total:
+            usage_total[key] += int(usage.get(key) or 0)
+
+        content = body.get("content") or []
+        text_parts = [
+            block.get("text", "") for block in content
+            if block.get("type") == "text" and block.get("text")
+        ]
+        raw = "\n".join(text_parts).strip()
+        try:
+            analysis = _parse_ai_json(raw)
+        except (ValueError, json.JSONDecodeError) as exc:
+            block_types = [str(block.get("type")) for block in content]
+            last_detail = (
+                f"tentativa={attempt}; stop_reason={body.get('stop_reason')}; "
+                f"blocos={block_types}; erro={exc}"
+            )
+            continue
+
+        return {
+            "modelo": model,
+            "tentativas": attempt,
+            "analise": analysis,
+            "uso": usage_total,
+        }
+
+    raise RuntimeError("IA não retornou JSON válido após retry: " + last_detail)
 
 def gerar_relatorio_semanal(now: datetime | None = None, *, usar_ia: bool = True) -> dict[str, Any]:
     pacote = montar_pacote_semanal(now)
