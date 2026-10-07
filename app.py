@@ -2652,6 +2652,22 @@ def _rd_retro_auto_retomar_se_necessario():
         if modo not in ("validacao", "completo"):
             print(f"[rd-retro-auto] retomada bloqueada: checkpoint ativo sem modo válido status={status}", flush=True)
             return
+        # Quarentena pontual do checkpoint acidental criado em 07/10/2026.
+        # Ele nasceu de uma validação de 25 que, por bug já corrigido, perdeu o
+        # modo e virou execução completa. Não apagar: arquivar para auditoria.
+        checkpoint_acidental = (
+            modo == "completo"
+            and str(persistido.get("cutoff_at") or "").startswith("2026-10-07T03:11:19.905079")
+            and len(persistido.get("candidatos_ids") or []) == 6792
+        )
+        if checkpoint_acidental:
+            try:
+                destino = RD_RETRO_AUTO_STATE_FILE + ".acidental-20261007"
+                os.replace(RD_RETRO_AUTO_STATE_FILE, destino)
+                print(f"[rd-retro-auto] checkpoint acidental colocado em quarentena arquivo={destino}", flush=True)
+            except Exception as e:
+                print(f"[rd-retro-auto] falha ao colocar checkpoint acidental em quarentena: {type(e).__name__}: {str(e)[:160]}", flush=True)
+            return
         print(f"[rd-retro-auto] retomada automática solicitada status_checkpoint={status} modo={modo}", flush=True)
         _rd_retro_auto_iniciar_thread(validacao=(modo == "validacao"))
     except Exception as e:
