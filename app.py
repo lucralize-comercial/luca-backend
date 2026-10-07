@@ -111,10 +111,13 @@ HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 # para manter margem e impedir que jobs, webhooks e rotinas concorrentes
 # estourem o limite quando rodam ao mesmo tempo. Todas as chamadas feitas
 # por requests.get/post/put/patch/delete para AGENDOR_BASE passam por aqui.
-_AGENDOR_MIN_INTERVAL = 0.36
+# 07/10/2026: margem maior + cooldown global para reduzir tempestades de 429.
+# Pode ser afinado no Railway sem novo deploy.
+_AGENDOR_MIN_INTERVAL = float(os.environ.get("AGENDOR_MIN_INTERVAL", "0.55"))
 _AGENDOR_RATE_LOCK = threading.Lock()
 _AGENDOR_LAST_REQUEST_AT = 0.0
-_AGENDOR_429_RETRIES = 4
+_AGENDOR_COOLDOWN_UNTIL = 0.0
+_AGENDOR_429_RETRIES = int(os.environ.get("AGENDOR_429_RETRIES", "5"))
 
 _REQUESTS_ORIGINAL = {
     "get": requests.get,
@@ -128,10 +131,17 @@ def _agendor_esperar_slot():
     global _AGENDOR_LAST_REQUEST_AT
     with _AGENDOR_RATE_LOCK:
         agora = time.monotonic()
-        espera = _AGENDOR_MIN_INTERVAL - (agora - _AGENDOR_LAST_REQUEST_AT)
+        espera_intervalo = _AGENDOR_MIN_INTERVAL - (agora - _AGENDOR_LAST_REQUEST_AT)
+        espera_cooldown = _AGENDOR_COOLDOWN_UNTIL - agora
+        espera = max(0.0, espera_intervalo, espera_cooldown)
         if espera > 0:
             time.sleep(espera)
         _AGENDOR_LAST_REQUEST_AT = time.monotonic()
+
+def _agendor_aplicar_cooldown(segundos):
+    global _AGENDOR_COOLDOWN_UNTIL
+    with _AGENDOR_RATE_LOCK:
+        _AGENDOR_COOLDOWN_UNTIL = max(_AGENDOR_COOLDOWN_UNTIL, time.monotonic() + max(0.0, segundos))
 
 def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
     # Não interfere em RD, Teams, Graph, AgendorChat, Autentique etc.
@@ -150,12 +160,15 @@ def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
 
         retry_after = resp.headers.get("Retry-After")
         try:
-            espera_429 = float(retry_after) if retry_after else min(2 ** tentativa, 8)
+            base = float(retry_after) if retry_after else min(2 ** tentativa, 16)
         except (TypeError, ValueError):
-            espera_429 = min(2 ** tentativa, 8)
-        espera_429 = max(1.0, espera_429)
-        print(f"[agendor-rate] 429 em {metodo.upper()} {url} — aguardando {espera_429:.1f}s antes da tentativa {tentativa + 2}/{_AGENDOR_429_RETRIES + 1}", flush=True)
-        time.sleep(espera_429)
+            base = min(2 ** tentativa, 16)
+        # jitter determinístico por thread evita que jobs concorrentes retomem juntos.
+        jitter = 0.20 + ((threading.get_ident() % 7) * 0.07)
+        espera_429 = max(1.0, base + jitter)
+        _agendor_aplicar_cooldown(espera_429)
+        print(f"[agendor-rate] 429 em {metodo.upper()} {url} — cooldown global {espera_429:.1f}s antes da tentativa {tentativa + 2}/{_AGENDOR_429_RETRIES + 1}", flush=True)
+        # _agendor_esperar_slot na próxima tentativa respeitará o cooldown global.
 
     return resp
 
@@ -2336,6 +2349,7 @@ RD_RETRO_AUTO_RETRIES = int(os.environ.get("RD_RETRO_AUTO_RETRIES", "3"))
 RD_RETRO_AUTO_RETRY_SECONDS = float(os.environ.get("RD_RETRO_AUTO_RETRY_SECONDS", "3"))
 RD_RETRO_AUTO_PACE_SECONDS = float(os.environ.get("RD_RETRO_AUTO_PACE_SECONDS", "0.65"))
 RD_RETRO_AUTO_MAX_ROUNDS = int(os.environ.get("RD_RETRO_AUTO_MAX_ROUNDS", "8"))
+RD_RETRO_VALIDACAO_LIMITE = int(os.environ.get("RD_RETRO_VALIDACAO_LIMITE", "25"))
 _rd_retro_auto_lock = threading.Lock()
 _rd_retro_auto_state = {
     "status": "nunca_executado", "started_at": None, "finished_at": None,
@@ -2425,7 +2439,7 @@ def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resulta
     _rd_retro_auto_salvar(payload)
     return payload
 
-def _rd_retro_auto_executar():
+def _rd_retro_auto_executar(validacao=False):
     if not _rd_retro_auto_lock.acquire(blocking=False):
         return False
     process_lock = None
@@ -2448,6 +2462,8 @@ def _rd_retro_auto_executar():
         rodada = max(1, int(anterior.get("rodada") or 1))
 
         deals = _rd_retro_auto_candidatos(cutoff_at)
+        if validacao:
+            deals = deals[:max(1, RD_RETRO_VALIDACAO_LIMITE)]
         if not deals:
             raise RuntimeError("cache_deals_ainda_vazio")
         por_id = {str(d.get("id")): d for d in deals if d.get("id")}
@@ -2546,7 +2562,7 @@ def _rd_retro_auto_executar():
 
         resumo["total_concluido_checkpoint"] = len(concluidos)
         resumo["pendentes_transientes"] = len(pendentes)
-        final_status = "concluido" if not pendentes else "concluido_com_pendencias_transientes"
+        final_status = (("validacao_concluida" if validacao else "concluido") if not pendentes else ("validacao_com_pendencias_transientes" if validacao else "concluido_com_pendencias_transientes"))
         final = _rd_retro_auto_checkpoint(final_status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
         final["finished_at"] = datetime.now(timezone.utc).isoformat()
         _rd_retro_auto_salvar(final)
@@ -2580,10 +2596,10 @@ def _rd_retro_auto_executar():
                 pass
         _rd_retro_auto_lock.release()
 
-def _rd_retro_auto_iniciar_thread():
+def _rd_retro_auto_iniciar_thread(validacao=False):
     if _rd_retro_auto_state.get("status") == "executando":
         return False
-    t = threading.Thread(target=_rd_retro_auto_executar, daemon=True, name="rd-retro-auto")
+    t = threading.Thread(target=_rd_retro_auto_executar, kwargs={"validacao": validacao}, daemon=True, name="rd-retro-auto")
     t.start()
     return True
 
@@ -2603,6 +2619,32 @@ def _rd_retro_auto_retomar_se_necessario():
         _rd_retro_auto_iniciar_thread()
     except Exception as e:
         print(f"[rd-retro-auto] erro ao avaliar retomada: {type(e).__name__}: {str(e)[:180]}", flush=True)
+
+@app.route("/rd/retroativo/automatico/validar", methods=["POST"])
+def rd_retroativo_automatico_validar():
+    if not AGENDAR_API_KEY:
+        return jsonify({"status": "indisponivel", "mensagem": "AGENDAR_API_KEY não configurada"}), 503
+    if request.headers.get("X-API-Key", "") != AGENDAR_API_KEY:
+        return jsonify({"status": "nao_autorizado"}), 401
+    if request.headers.get("X-Confirm-Write", "") != RD_RETRO_AUTO_CONFIRM:
+        return jsonify({"status": "confirmacao_necessaria"}), 409
+    persistido = _rd_retro_auto_carregar()
+    if persistido.get("status") in ("executando", "aguardando_retomada", "erro_retomavel"):
+        return jsonify({"status": "ja_em_execucao_ou_retomada"}), 409
+    # A validação é uma execução nova e limitada; não reaproveita conclusão de testes anteriores.
+    try:
+        if os.path.isfile(RD_RETRO_AUTO_STATE_FILE):
+            os.replace(RD_RETRO_AUTO_STATE_FILE, RD_RETRO_AUTO_STATE_FILE + ".bak")
+    except Exception as e:
+        return jsonify({"status": "erro_checkpoint", "erro": f"{type(e).__name__}: {str(e)[:180]}"}), 500
+    iniciado = _rd_retro_auto_iniciar_thread(validacao=True)
+    return jsonify({
+        "status": "validacao_iniciada" if iniciado else "ja_em_execucao",
+        "limite": RD_RETRO_VALIDACAO_LIMITE,
+        "escrita_real": True,
+        "nunca_sobrescreve_origem_existente": True,
+        "checkpoint": RD_RETRO_AUTO_STATE_FILE,
+    }), 202
 
 @app.route("/rd/retroativo/automatico", methods=["POST", "GET"])
 def rd_retroativo_automatico():
@@ -2631,6 +2673,11 @@ def rd_retroativo_automatico():
     persistido = _rd_retro_auto_carregar()
     if persistido.get("status") == "concluido":
         return jsonify({"status": "ja_concluido", "resumo": persistido.get("resumo")}), 200
+    if str(persistido.get("status") or "").startswith("validacao_"):
+        try:
+            os.replace(RD_RETRO_AUTO_STATE_FILE, RD_RETRO_AUTO_STATE_FILE + ".validacao")
+        except Exception as e:
+            return jsonify({"status": "erro_checkpoint", "erro": f"{type(e).__name__}: {str(e)[:180]}"}), 500
     iniciado = _rd_retro_auto_iniciar_thread()
     return jsonify({
         "status": "iniciado" if iniciado else "ja_em_execucao",
