@@ -3,6 +3,7 @@ import os
 
 from flask import Flask, jsonify, request
 
+from .anthropic_usage import gerar_resumo_consumo
 from .config import REPORT_ALLOW_UNAUTHENTICATED_TEST, REPORT_TEST_KEY
 from .service import gerar_preview
 
@@ -31,6 +32,17 @@ def reports_test():
         return jsonify(gerar_preview())
     except Exception as exc:
         app.logger.exception("Falha ao gerar preview")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/reports/consumo/teste")
+def consumo_test():
+    if not _authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        return jsonify(gerar_resumo_consumo())
+    except Exception as exc:
+        app.logger.exception("Falha ao gerar resumo de consumo Anthropic")
         return jsonify({"error": str(exc)}), 500
 
 
