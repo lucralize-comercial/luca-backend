@@ -256,6 +256,46 @@ def _data_inicio_date(deal: dict[str, Any]) -> date | None:
     return created_at.astimezone(BRT).date()
 
 
+def listar_leads_por_data_inicio(
+    start_day: date,
+    end_day: date,
+    *,
+    with_custom_fields: bool = False,
+) -> list[dict[str, Any]]:
+    """Retorna leads pelo dia de negócio de `startTime`, sem deslocamento BRT.
+
+    A API recebe uma janela UTC deliberadamente inclusiva nas bordas; a
+    seleção definitiva usa a data YYYY-MM-DD e o Funil Comercial. Isto inclui
+    negócios manuais cadastrados depois, com início retroativo, e os negócios
+    que já foram ganhos ou perdidos.
+    """
+    if end_day < start_day:
+        return []
+    query_start = datetime.combine(start_day, dt_time.min, tzinfo=UTC) - timedelta(seconds=1)
+    query_end = datetime.combine(end_day + timedelta(days=1), dt_time.min, tzinfo=UTC) + timedelta(seconds=1)
+    filters: dict[str, Any] = {
+        "startAtGt": _iso(query_start),
+        "startAtLt": _iso(query_end),
+    }
+    if with_custom_fields:
+        filters["withCustomFields"] = "true"
+    candidates = listar_deals(**filters)
+    unique: dict[Any, dict[str, Any]] = {}
+    for deal in candidates:
+        if not _eh_funil_comercial(deal):
+            continue
+        start_time = deal.get("startTime")
+        if not start_time:
+            continue  # Métrica definida por startTime; não usar createdAt.
+        try:
+            start_date = date.fromisoformat(str(start_time)[:10])
+        except (TypeError, ValueError):
+            continue
+        if start_day <= start_date <= end_day:
+            unique[deal.get("id", id(deal))] = deal
+    return list(unique.values())
+
+
 def _snapshot_open(day: date) -> int:
     """Estoque no fim do dia pela data de negócio, sem deslocamento de fuso.
 
@@ -314,7 +354,7 @@ def _period_metrics(
     gains_end_day: date,
 ) -> dict[str, int]:
     return {
-        "leads": contar_deals(startAtGt=start_iso, startAtLt=end_iso),
+        "leads": len(listar_leads_por_data_inicio(gains_start_day, gains_end_day)),
         "ganhos": contar_ganhos_por_data_ganho(gains_start_day, gains_end_day),
         "perdidos": contar_perdidos_por_data_conclusao(gains_start_day, gains_end_day),
         "em_andamento": _snapshot_open(snapshot_day),
@@ -338,12 +378,7 @@ def metricas_mes(through_day: date) -> dict[str, int]:
 
 
 def listar_leads_dia(day: date) -> list[dict[str, Any]]:
-    start_iso, end_iso = _bounds(day)
-    return listar_deals(
-        startAtGt=start_iso,
-        startAtLt=end_iso,
-        withCustomFields="true",
-    )
+    return listar_leads_por_data_inicio(day, day, with_custom_fields=True)
 
 
 
