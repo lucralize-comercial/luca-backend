@@ -2636,7 +2636,13 @@ def _rd_retro_auto_retomar_se_necessario():
             return
         if _rd_retro_auto_state.get("status") == "executando":
             return
-        modo = persistido.get("modo") or "completo"
+        modo = persistido.get("modo")
+        # Fail-closed: checkpoint ativo sem modo explícito é legado/ambíguo.
+        # Nunca assumir "completo", pois isso poderia ampliar uma validação limitada
+        # para todo o histórico após restart.
+        if modo not in ("validacao", "completo"):
+            print(f"[rd-retro-auto] retomada bloqueada: checkpoint ativo sem modo válido status={status}", flush=True)
+            return
         print(f"[rd-retro-auto] retomada automática solicitada status_checkpoint={status} modo={modo}", flush=True)
         _rd_retro_auto_iniciar_thread(validacao=(modo == "validacao"))
     except Exception as e:
@@ -2654,9 +2660,17 @@ def rd_retroativo_automatico_validar():
     if persistido.get("status") in ("executando", "aguardando_retomada", "erro_retomavel"):
         return jsonify({"status": "ja_em_execucao_ou_retomada"}), 409
     # A validação é uma execução nova e limitada; não reaproveita conclusão de testes anteriores.
+    # IMPORTANTE: grava o modo ANTES de iniciar a thread. Se o cache ainda estiver vazio
+    # e o processo reiniciar nesse intervalo, a retomada nunca pode interpretar a validação
+    # como execução completa.
     try:
         if os.path.isfile(RD_RETRO_AUTO_STATE_FILE):
             os.replace(RD_RETRO_AUTO_STATE_FILE, RD_RETRO_AUTO_STATE_FILE + ".bak")
+        agora = datetime.now(timezone.utc).isoformat()
+        _rd_retro_auto_checkpoint(
+            "aguardando_retomada", agora, agora, set(), {}, {}, {},
+            rodada=1, modo="validacao", candidatos_ids=[]
+        )
     except Exception as e:
         return jsonify({"status": "erro_checkpoint", "erro": f"{type(e).__name__}: {str(e)[:180]}"}), 500
     iniciado = _rd_retro_auto_iniciar_thread(validacao=True)
