@@ -1302,9 +1302,12 @@ def fetch_deals():
         deal_id = str(deal.get("id"))
         signature = _deal_products_signature(deal)
         salvo = products_cache.get(deal_id) if deal_id else None
-        if isinstance(salvo, dict) and salvo.get("signature") == signature and isinstance(salvo.get("products"), list):
+        if isinstance(salvo, dict) and isinstance(salvo.get("products"), list):
             deal["products_entities"] = salvo["products"]
             reaproveitados += 1
+            if salvo.get("signature") != signature:
+                products_cache[deal_id] = {"signature": signature, "products": salvo["products"]}
+                products_cache_changed = True
             continue
         try:
             consultas_agendor += 1
