@@ -1147,17 +1147,18 @@ def fetch_deals():
         if total_count is None:
             total_count = data.get("meta", {}).get("totalCount", 0)
         all_deals.extend(page_deals)
-        # Não publica cópias parciais do cache durante a paginação.
-        # O cache anterior continua disponível até a nova carga terminar; isso
-        # evita manter listas duplicadas em RAM e reduz picos de memória.
+        # Publica progressivamente o cache básico. Isso permite que rotinas que
+        # dependem apenas dos negócios (incluindo a validação retroativa) avancem
+        # sem esperar o enriquecimento pesado de produtos.
+        cache["deals"] = list(all_deals)
+        cache["total"] = total_count or len(all_deals)
+        cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if not data.get("links", {}).get("next") or len(page_deals) == 0:
             break
         page += 1
-        # Corrigido 03/09: 0.2s não bastava — 429 continuava aparecendo
-        # regularmente nas páginas mais pesadas (produção confirmou). Subindo
-        # pra 0.4s como medida preventiva, não só reativa (o backoff em
-        # fetch_page já cobre o caso de falhar mesmo assim).
-        time.sleep(0.4)
+        # O limitador central já aplica AGENDOR_MIN_INTERVAL. Mantemos uma
+        # margem adicional entre páginas para reduzir rajadas no startup.
+        time.sleep(float(os.environ.get("AGENDOR_DEALS_PAGE_PACE_SECONDS", "1.25")))
     cache["deals"] = all_deals
     cache["total"] = total_count or len(all_deals)
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1167,6 +1168,14 @@ def fetch_deals():
         if d.get("dealStatus", {}).get("id") == 2
         and d.get("wonAt") and datetime.strptime(d["wonAt"][:10], "%Y-%m-%d") > cutoff
     ]
+    # Durante um retroativo ativo, produtos não são necessários para a
+    # correlação RD e só competem pela mesma cota da API. O cache básico já
+    # está publicado; adiamos esse enriquecimento para a próxima carga normal.
+    retro_status = (_rd_retro_auto_carregar().get("status") if "_rd_retro_auto_carregar" in globals() else None)
+    enriquecer_produtos = retro_status not in ("executando", "aguardando_retomada", "erro_retomavel")
+    if not enriquecer_produtos:
+        print(f"[fetch_deals] produtos adiados durante retroativo status={retro_status}", flush=True)
+        won_recent = []
     for deal in won_recent:
         try:
             r = requests.get(f"{AGENDOR_BASE}/deals/{deal['id']}/products", headers=HEADERS, timeout=15)
