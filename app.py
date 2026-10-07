@@ -111,9 +111,11 @@ HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 # para manter margem e impedir que jobs, webhooks e rotinas concorrentes
 # estourem o limite quando rodam ao mesmo tempo. Todas as chamadas feitas
 # por requests.get/post/put/patch/delete para AGENDOR_BASE passam por aqui.
-# 07/10/2026: margem maior + cooldown global para reduzir tempestades de 429.
+# 07/10/2026: teto oficial informado pelo suporte = 4 req/s. Usamos ~1,25 req/s
+# por processo como margem operacional, pois outras integrações podem compartilhar a cota.
+# Cooldown global reduz tempestades de 429.
 # Pode ser afinado no Railway sem novo deploy.
-_AGENDOR_MIN_INTERVAL = float(os.environ.get("AGENDOR_MIN_INTERVAL", "0.55"))
+_AGENDOR_MIN_INTERVAL = float(os.environ.get("AGENDOR_MIN_INTERVAL", "0.80"))
 _AGENDOR_RATE_LOCK = threading.Lock()
 _AGENDOR_LAST_REQUEST_AT = 0.0
 _AGENDOR_COOLDOWN_UNTIL = 0.0
@@ -1174,7 +1176,7 @@ def fetch_deals():
                     deal["products_entities"] = products
         except Exception as e:
             print(f"Erro produtos {deal['id']}: {e}", flush=True)
-        time.sleep(0.1)
+        time.sleep(float(os.environ.get("AGENDOR_PRODUCTS_PACE_SECONDS", "1.50")))
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # Desativado: endpoint /deals/{id}/history retorna 404 na API v3 do Agendor
@@ -2428,13 +2430,14 @@ def _rd_retro_auto_candidatos(cutoff_at=None):
     ), reverse=True)
     return candidatos
 
-def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada=1, erro=None):
+def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada=1, erro=None, modo=None):
     payload = {
         "status": status, "started_at": started_at,
         "cutoff_at": cutoff_at, "updated_at": datetime.now(timezone.utc).isoformat(),
         "concluidos": sorted(concluidos), "resultados": resultados,
         "pendentes_transientes": pendentes, "rodada": rodada,
         "resumo": resumo, "erro": erro,
+        "modo": modo or "completo",
     }
     _rd_retro_auto_salvar(payload)
     return payload
@@ -2450,6 +2453,10 @@ def _rd_retro_auto_executar(validacao=False):
             return False
 
         anterior = _rd_retro_auto_carregar()
+        modo_persistido = anterior.get("modo")
+        if modo_persistido in ("validacao", "completo"):
+            validacao = (modo_persistido == "validacao")
+        modo_execucao = "validacao" if validacao else "completo"
         started_at = anterior.get("started_at") or datetime.now(timezone.utc).isoformat()
         cutoff_at = anterior.get("cutoff_at") or started_at
         concluidos = set(str(x) for x in (anterior.get("concluidos") or []))
@@ -2486,7 +2493,7 @@ def _rd_retro_auto_executar(validacao=False):
             "resultado": resumo, "erro": None,
             "progresso": {"atual": len(concluidos), "total": total, "deal_id": None},
         })
-        _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+        _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
         print(f"[rd-retro-auto] iniciado/retomado total={total} concluidos={len(concluidos)} cutoff={cutoff_at}", flush=True)
 
         while rodada <= RD_RETRO_AUTO_MAX_ROUNDS:
@@ -2545,7 +2552,7 @@ def _rd_retro_auto_executar(validacao=False):
                     pendentes.pop(chave, None)
                     houve_progresso = True
 
-                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
                 time.sleep(max(0.0, RD_RETRO_AUTO_PACE_SECONDS))
 
                 if len(concluidos) % 25 == 0 and concluidos:
@@ -2557,13 +2564,13 @@ def _rd_retro_auto_executar(validacao=False):
             if rodada <= RD_RETRO_AUTO_MAX_ROUNDS:
                 espera = min(300.0, 15.0 * (2 ** min(rodada - 2, 4)))
                 print(f"[rd-retro-auto] {len(pendentes)} transientes pendentes; nova rodada em {espera:.0f}s", flush=True)
-                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+                _rd_retro_auto_checkpoint("executando", started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
                 time.sleep(espera)
 
         resumo["total_concluido_checkpoint"] = len(concluidos)
         resumo["pendentes_transientes"] = len(pendentes)
         final_status = (("validacao_concluida" if validacao else "concluido") if not pendentes else ("validacao_com_pendencias_transientes" if validacao else "concluido_com_pendencias_transientes"))
-        final = _rd_retro_auto_checkpoint(final_status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada)
+        final = _rd_retro_auto_checkpoint(final_status, started_at, cutoff_at, concluidos, resultados, pendentes, resumo, rodada, modo=modo_execucao)
         final["finished_at"] = datetime.now(timezone.utc).isoformat()
         _rd_retro_auto_salvar(final)
         _rd_retro_auto_state.update({
@@ -2615,8 +2622,9 @@ def _rd_retro_auto_retomar_se_necessario():
             return
         if _rd_retro_auto_state.get("status") == "executando":
             return
-        print(f"[rd-retro-auto] retomada automática solicitada status_checkpoint={status}", flush=True)
-        _rd_retro_auto_iniciar_thread()
+        modo = persistido.get("modo") or "completo"
+        print(f"[rd-retro-auto] retomada automática solicitada status_checkpoint={status} modo={modo}", flush=True)
+        _rd_retro_auto_iniciar_thread(validacao=(modo == "validacao"))
     except Exception as e:
         print(f"[rd-retro-auto] erro ao avaliar retomada: {type(e).__name__}: {str(e)[:180]}", flush=True)
 
@@ -2658,6 +2666,7 @@ def rd_retroativo_automatico():
             "runtime": _rd_retro_auto_state,
             "checkpoint": {
                 "status": persistido.get("status"),
+                "modo": persistido.get("modo"),
                 "started_at": persistido.get("started_at"),
                 "cutoff_at": persistido.get("cutoff_at"),
                 "updated_at": persistido.get("updated_at"),
