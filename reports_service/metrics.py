@@ -139,12 +139,30 @@ def classify_origin(deal: dict, fields_map: dict[str, dict[Any, str]] | None = N
 
 
 def origins_for_day(deals: list[dict], day: date, fields_map=None) -> dict[str, int]:
-    ini, fim = day_bounds(day)
-    counter = Counter(
-        classify_origin(d, fields_map)
-        for d in deals
-        if is_between(start_dt(d), ini, fim)
-    )
+    """Classifica os mesmos leads do indicador, pela data bruta de startTime.
+
+    O Agendor serializa startTime à meia-noite UTC mesmo para uma data de
+    negócio. Converter para Brasília deslocaria o lead para o dia anterior.
+    A ausência de origem identificável é contabilizada em "Outros".
+    """
+    counter = Counter()
+    seen_ids = set()
+    for deal in deals:
+        raw_start = deal.get("startTime")
+        if not raw_start:
+            continue
+        try:
+            start_date = date.fromisoformat(str(raw_start)[:10])
+        except (TypeError, ValueError):
+            continue
+        if start_date != day:
+            continue
+        deal_id = deal.get("id")
+        if deal_id is not None:
+            if deal_id in seen_ids:
+                continue
+            seen_ids.add(deal_id)
+        counter[classify_origin(deal, fields_map)] += 1
     return {name: counter.get(name, 0) for name in (
         "Google Ads", "Meta Ads", "Calculadora", "WhatsApp/Site", "Outros"
     )}
