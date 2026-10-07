@@ -5,6 +5,8 @@ import os
 
 from .weekly_analysis import gerar_relatorio_semanal
 
+# build marker v2
+
 
 def _dump(label, value):
     print(label + "=" + json.dumps(value, ensure_ascii=False, separators=(",", ":")), flush=True)
