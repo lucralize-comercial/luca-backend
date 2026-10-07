@@ -2682,6 +2682,22 @@ def rd_retroativo_automatico_validar():
     if request.headers.get("X-Confirm-Write", "") != RD_RETRO_AUTO_CONFIRM:
         return jsonify({"status": "confirmacao_necessaria"}), 409
     persistido = _rd_retro_auto_carregar()
+    # O checkpoint abaixo foi criado pelo bug já corrigido que converteu uma
+    # validação de 25 em execução completa. Coloca-o em quarentena antes da
+    # trava de "já em execução", para que ele não bloqueie uma nova validação.
+    checkpoint_acidental = (
+        persistido.get("modo") == "completo"
+        and str(persistido.get("cutoff_at") or "").startswith("2026-10-07T03:11:19.905079")
+        and len(persistido.get("candidatos_ids") or []) == 6792
+    )
+    if checkpoint_acidental:
+        try:
+            destino = RD_RETRO_AUTO_STATE_FILE + ".acidental-20261007"
+            os.replace(RD_RETRO_AUTO_STATE_FILE, destino)
+            print(f"[rd-retro-auto] checkpoint acidental colocado em quarentena pelo endpoint validar arquivo={destino}", flush=True)
+            persistido = {}
+        except Exception as e:
+            return jsonify({"status": "erro_quarentena_checkpoint", "erro": f"{type(e).__name__}: {str(e)[:180]}"}), 500
     if persistido.get("status") in ("executando", "aguardando_retomada", "erro_retomavel"):
         return jsonify({"status": "ja_em_execucao_ou_retomada"}), 409
     # A validação é uma execução nova e limitada; não reaproveita conclusão de testes anteriores.
