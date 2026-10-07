@@ -1180,7 +1180,7 @@ def _salvar_products_cache(data):
         print(f"[products-cache] falha ao salvar: {type(e).__name__}: {str(e)[:160]}", flush=True)
 
 def _deal_products_signature(deal):
-    return deal.get("updatedAt") or deal.get("wonAt") or deal.get("startTime") or ""
+    return deal.get("wonAt") or deal.get("startTime") or ""
 
 VALIDACAO_OPERACIONAL_FILE = os.environ.get("VALIDACAO_OPERACIONAL_FILE", "/data/validacao_operacional.json")
 _VALIDACAO_ULTIMO_429 = 0
