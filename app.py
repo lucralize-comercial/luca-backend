@@ -121,6 +121,7 @@ _AGENDOR_RATE_LOCK = threading.Lock()
 _AGENDOR_LAST_REQUEST_AT = 0.0
 _AGENDOR_COOLDOWN_UNTIL = 0.0
 _AGENDOR_429_RETRIES = int(os.environ.get("AGENDOR_429_RETRIES", "5"))
+_AGENDOR_429_COUNT = 0
 
 _REQUESTS_ORIGINAL = {
     "get": requests.get,
@@ -162,6 +163,7 @@ def _agendor_caller():
     return "desconhecido"
 
 def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
+    global _AGENDOR_429_COUNT
     # Não interfere em RD, Teams, Graph, AgendorChat, Autentique etc.
     if not isinstance(url, str) or not url.startswith(AGENDOR_BASE):
         return original(url, *args, **kwargs)
@@ -173,6 +175,7 @@ def _agendor_request_controlado(metodo, original, url, *args, **kwargs):
         if resp.status_code != 429:
             return resp
 
+        _AGENDOR_429_COUNT += 1
         if tentativa >= _AGENDOR_429_RETRIES:
             print(f"[agendor-rate] 429 persistente caller={caller} após {_AGENDOR_429_RETRIES + 1} tentativas: {metodo.upper()} {url}", flush=True)
             return resp
@@ -1179,6 +1182,55 @@ def _salvar_products_cache(data):
 def _deal_products_signature(deal):
     return deal.get("updatedAt") or deal.get("wonAt") or deal.get("startTime") or ""
 
+VALIDACAO_OPERACIONAL_FILE = os.environ.get("VALIDACAO_OPERACIONAL_FILE", "/data/validacao_operacional.json")
+_VALIDACAO_ULTIMO_429 = 0
+
+def _registrar_validacao_operacional(elegiveis, reaproveitados, consultas_agendor):
+    """Registra automaticamente o resultado de cada ciclo, sem IA/tokens."""
+    global _VALIDACAO_ULTIMO_429
+    novos_429 = max(0, _AGENDOR_429_COUNT - _VALIDACAO_ULTIMO_429)
+    _VALIDACAO_ULTIMO_429 = _AGENDOR_429_COUNT
+    taxa = (reaproveitados / elegiveis) if elegiveis else 1.0
+    motivos = []
+    if novos_429:
+        motivos.append(f"429_no_ciclo={novos_429}")
+    if elegiveis and taxa < 0.90:
+        motivos.append(f"reaproveitamento={taxa:.1%}")
+    status = "ok" if not motivos else "bloqueado"
+    resultado = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "products_cache": {
+            "elegiveis": elegiveis,
+            "reaproveitados": reaproveitados,
+            "consultas_agendor": consultas_agendor,
+            "taxa_reaproveitamento": round(taxa, 4),
+        },
+        "agendor_429_no_ciclo": novos_429,
+        "motivos": motivos,
+        "retroativo_liberado": status == "ok",
+    }
+    try:
+        os.makedirs(os.path.dirname(VALIDACAO_OPERACIONAL_FILE) or ".", exist_ok=True)
+        tmp = VALIDACAO_OPERACIONAL_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(resultado, fh, ensure_ascii=False, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, VALIDACAO_OPERACIONAL_FILE)
+    except Exception as e:
+        print(f"[auto-validacao] falha ao persistir: {type(e).__name__}: {str(e)[:160]}", flush=True)
+    print(f"[auto-validacao] status={status} 429={novos_429} reaproveitamento={taxa:.1%} consultas_agendor={consultas_agendor} motivos={motivos}", flush=True)
+    return resultado
+
+def _ler_validacao_operacional():
+    try:
+        with open(VALIDACAO_OPERACIONAL_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
     all_deals = []
@@ -1272,6 +1324,11 @@ def fetch_deals():
         _salvar_products_cache(products_cache)
     if enriquecer_produtos:
         print(f"[products-cache] elegiveis={len(won_recent)} reaproveitados={reaproveitados} consultas_agendor={consultas_agendor}", flush=True)
+        _registrar_validacao_operacional(
+            elegiveis=len(won_recent),
+            reaproveitados=reaproveitados,
+            consultas_agendor=consultas_agendor,
+        )
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # Desativado: endpoint /deals/{id}/history retorna 404 na API v3 do Agendor
@@ -1304,6 +1361,13 @@ def index():
         "history_updated_at": history_cache["updated_at"],
         "tasks_cached": len(tasks_cache["data"]), "tasks_updated_at": tasks_cache["updated_at"]
     })
+
+@app.route("/validacao-operacional")
+def validacao_operacional():
+    data = _ler_validacao_operacional()
+    if not data:
+        return jsonify({"status": "aguardando_primeiro_ciclo", "retroativo_liberado": False}), 200
+    return jsonify(data), 200
 
 @app.route("/usage-stats")
 def usage_stats():
