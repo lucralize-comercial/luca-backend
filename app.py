@@ -1159,6 +1159,20 @@ def fetch_deals():
         # O limitador central já aplica AGENDOR_MIN_INTERVAL. Mantemos uma
         # margem adicional entre páginas para reduzir rajadas no startup.
         time.sleep(float(os.environ.get("AGENDOR_DEALS_PAGE_PACE_SECONDS", "1.25")))
+    # Preserva produtos já conhecidos antes de substituir o cache básico.
+    # Durante o retroativo o enriquecimento via Agendor é suspenso; sem esta
+    # cópia, uma nova paginação apagaria products_entities e poderia afetar
+    # temporariamente comissões/visões que dependem do produto.
+    produtos_anteriores = {
+        str(d.get("id")): d.get("products_entities")
+        for d in (cache.get("deals") or [])
+        if d.get("id") is not None and "products_entities" in d
+    }
+    for deal in all_deals:
+        produtos = produtos_anteriores.get(str(deal.get("id")))
+        if produtos is not None and "products_entities" not in deal:
+            deal["products_entities"] = produtos
+
     cache["deals"] = all_deals
     cache["total"] = total_count or len(all_deals)
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -2446,7 +2460,9 @@ def _rd_retro_auto_checkpoint(status, started_at, cutoff_at, concluidos, resulta
         "concluidos": sorted(concluidos), "resultados": resultados,
         "pendentes_transientes": pendentes, "rodada": rodada,
         "resumo": resumo, "erro": erro,
-        "modo": modo or "completo",
+        # Fail-closed: o modo deve ser sempre explícito. Ausência de modo
+        # nunca pode significar execução completa implicitamente.
+        "modo": modo if modo in ("validacao", "completo") else None,
         "candidatos_ids": [str(x) for x in (candidatos_ids or [])],
     }
     _rd_retro_auto_salvar(payload)
