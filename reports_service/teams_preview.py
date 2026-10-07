@@ -55,16 +55,16 @@ def montar_cartao(preview: dict[str, Any], destino: str) -> dict[str, Any]:
 
     if destino == "comercial":
         m = preview["comercial"]["indicadores"]
+        g = preview["gestao"]["indicadores"]
+        b, y = g["antes_de_ontem"], g["ontem"]
         d = _date(m["data"], "%d/%m/%Y")
         body = _base(f"RESUMO COMERCIAL — {d}")
-        body.extend([
-            _line("Leads recebidos:", str(m["leads"])),
-            _line("Reuniões:", str(m["reunioes"])),
-            _line("Negócios ganhos:", str(m["ganhos"])),
-            _line("Negócios perdidos:", str(m["perdidos"])),
-            _line("Em andamento:", str(m["em_andamento"])),
-            _heading("Origem dos leads"),
-        ])
+        body.append(_heading(f"Antes de ontem ({_date(b['data'], '%d/%m')}) | Ontem ({_date(y['data'], '%d/%m')})"))
+        for label, key in (("Leads recebidos:", "leads"), ("Reuniões:", "reunioes"),
+                           ("Ganhos:", "ganhos"), ("Perdidos:", "perdidos"),
+                           ("Em andamento:", "em_andamento")):
+            body.append(_line(label, f"{b[key]} | {y[key]} {_pct(b[key], y[key])}"))
+        body.append(_heading("Origem dos leads"))
         for origin in ("Google Ads", "Meta Ads", "Calculadora", "WhatsApp/Site", "Outros"):
             body.append(_line(f"• {origin}:", str(m["origens"][origin])))
         body.extend([
