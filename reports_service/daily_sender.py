@@ -24,6 +24,7 @@ from .teams_preview import WEBHOOKS, montar_cartao
 BRT = ZoneInfo("America/Sao_Paulo")
 LOGGER = logging.getLogger("luca-reports-daily")
 STORE_DEFAULT = "/data/luca_reports_dispatch.sqlite3"
+DESTINATIONS_DEFAULT = "comercial"
 
 
 class DispatchLedger:
@@ -82,6 +83,18 @@ def _now() -> datetime:
     return datetime.now(BRT)
 
 
+def _active_destinations() -> dict[str, str]:
+    """Destinos habilitados para o cron. Ex.: REPORT_DESTINATIONS=comercial."""
+    raw = os.environ.get("REPORT_DESTINATIONS", DESTINATIONS_DEFAULT)
+    requested = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    invalid = [item for item in requested if item not in WEBHOOKS]
+    if invalid:
+        raise RuntimeError("Destino(s) inválido(s) em REPORT_DESTINATIONS: " + ", ".join(invalid))
+    if not requested:
+        raise RuntimeError("Nenhum destino habilitado em REPORT_DESTINATIONS")
+    return {dest: WEBHOOKS[dest] for dest in requested}
+
+
 def _validate_preview(preview: dict, reference_date: str):
     c = preview["comercial"]["indicadores"]
     g = preview["gestao"]["indicadores"]
@@ -99,6 +112,7 @@ def run(*, dry_run: bool = False, now: datetime | None = None,
         preview_provider=None) -> dict:
     current = (now or _now()).astimezone(BRT)
     period = (current.date() - timedelta(days=1)).isoformat()
+    destinations = _active_destinations()
     if not dry_run:
         if os.environ.get("REPORT_CRON_ENABLED", "false").lower() != "true":
             raise RuntimeError("Envio diário bloqueado: REPORT_CRON_ENABLED não está habilitado")
@@ -106,7 +120,7 @@ def run(*, dry_run: bool = False, now: datetime | None = None,
             raise RuntimeError("Envio diário bloqueado: REPORT_SEND_ENABLED não está habilitado")
         if current.hour != 8:
             raise RuntimeError("Fora da janela permitida: 08:00–08:59, America/Sao_Paulo")
-        for env in WEBHOOKS.values():
+        for env in destinations.values():
             if not os.environ.get(env, "").startswith("https://"):
                 raise RuntimeError("Webhook não configurado: " + env)
 
@@ -117,7 +131,7 @@ def run(*, dry_run: bool = False, now: datetime | None = None,
     _validate_preview(preview, period)
     result = {"reference_date": period, "mode": "dry_run" if dry_run else "real", "destinations": {}}
     if dry_run:
-        for dest in WEBHOOKS:
+        for dest in destinations:
             card = montar_cartao(preview, dest)
             result["destinations"][dest] = {"status": "prepared", "blocks": len(card["attachments"][0]["content"]["body"])}
         return result
@@ -130,7 +144,7 @@ def run(*, dry_run: bool = False, now: datetime | None = None,
     http = session or requests
     failed = False
     try:
-        for dest, env in WEBHOOKS.items():
+        for dest, env in destinations.items():
             key = f"v1:{dest}:{period}"
             if not ledger.reserve(key, dest, period, current.isoformat()):
                 result["destinations"][dest] = {"status": "already_reserved"}
