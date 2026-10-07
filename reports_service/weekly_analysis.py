@@ -124,12 +124,34 @@ def _losses_breakdown(deals: list[dict[str, Any]], fields_map: dict) -> dict[str
         origins[origin] += 1
         matrix[origin][reason] += 1
     total = len(deals)
+    detailed_reasons = []
+    for reason, qty in reasons.most_common():
+        by_origin = sorted(
+            (
+                {"origem": origin, "quantidade": counter.get(reason, 0)}
+                for origin, counter in matrix.items()
+                if counter.get(reason, 0) > 0
+            ),
+            key=lambda row: (-row["quantidade"], row["origem"]),
+        )
+        for row in by_origin:
+            row["participacao_no_motivo_pct"] = _pct(row["quantidade"], qty)
+        top2_qty = sum(row["quantidade"] for row in by_origin[:2])
+        detailed_reasons.append({
+            "motivo": reason,
+            "quantidade": qty,
+            "participacao_pct": _pct(qty, total),
+            "por_origem": by_origin,
+            "top2_origens_quantidade": top2_qty,
+            "top2_origens_participacao_no_motivo_pct": _pct(top2_qty, qty),
+        })
     return {
         "total": total,
         "motivos": [
             {"motivo": name, "quantidade": qty, "participacao_pct": _pct(qty, total)}
             for name, qty in reasons.most_common()
         ],
+        "motivos_detalhados": detailed_reasons,
         "origens": [
             {"origem": name, "quantidade": qty, "participacao_pct": _pct(qty, total)}
             for name, qty in origins.most_common()
@@ -186,6 +208,17 @@ def montar_pacote_semanal(now: datetime | None = None) -> dict[str, Any]:
     for key in ("leads", "reunioes", "ganhos", "perdidos", "em_andamento"):
         indicators[key] = _delta(int(current_metrics.get(key, 0)), int(previous_metrics.get(key, 0)))
 
+    losses_current = _losses_breakdown(lost_current, fields_map)
+    losses_previous = _losses_breakdown(lost_previous, fields_map)
+    origins_current = _cohort_by_origin(leads_current, fields_map)
+    origins_previous = _cohort_by_origin(leads_previous, fields_map)
+
+    origem_outros_leads = int((origins_current.get("Outros") or {}).get("leads", 0))
+    origem_outros_perdas = next(
+        (int(row["quantidade"]) for row in losses_current["origens"] if row["origem"] == "Outros"),
+        0,
+    )
+
     return {
         "periodo": {
             "semana_atual": {"inicio": start.isoformat(), "fim": end.isoformat()},
@@ -198,10 +231,19 @@ def montar_pacote_semanal(now: datetime | None = None) -> dict[str, Any]:
             "semana_anterior_lead_para_reuniao_pct": _pct(previous_metrics["reunioes"], previous_metrics["leads"]),
             "semana_anterior_lead_para_ganho_pct": _pct(previous_metrics["ganhos"], previous_metrics["leads"]),
         },
-        "origens_coorte_semana_atual": _cohort_by_origin(leads_current, fields_map),
-        "origens_coorte_semana_anterior": _cohort_by_origin(leads_previous, fields_map),
-        "perdas_semana_atual": _losses_breakdown(lost_current, fields_map),
-        "perdas_semana_anterior": _losses_breakdown(lost_previous, fields_map),
+        "origens_coorte_semana_atual": origins_current,
+        "origens_coorte_semana_anterior": origins_previous,
+        "perdas_semana_atual": losses_current,
+        "perdas_semana_anterior": losses_previous,
+        "qualidade_dados": {
+            "origem_outros_leads_pct": _pct(origem_outros_leads, len(leads_current)),
+            "origem_outros_perdas_pct": _pct(origem_outros_perdas, len(lost_current)),
+            "motivo_perda_nao_informado_pct": _pct(
+                next((int(row["quantidade"]) for row in losses_current["motivos"] if row["motivo"] == "Não informado"), 0),
+                len(lost_current),
+            ),
+            "regra": "Se 'Outros' for alto, reduzir confiança em conclusões por origem e priorizar melhoria de classificação.",
+        },
         "ganhos_semana_atual": {
             "total": len(won_current),
             "por_origem": dict(Counter(classify_origin(d, fields_map) for d in won_current).most_common()),
@@ -221,9 +263,13 @@ Regras:
 - Separe claramente fatos de hipóteses. Nunca afirme causalidade que os dados não sustentam.
 - Priorize relações entre origem, avanço, ganho, perda, motivo de perda e inatividade.
 - Compare semana atual com anterior quando isso muda a decisão.
+- NÃO faça contas novas nem invente denominadores. Só cite percentuais, totais e concentrações que já estejam explicitamente presentes nos dados.
+- "por_etapa" significa quantidade atualmente naquela etapa; NÃO chame esses negócios de parados/inativos. Só use "parado", "inativo" ou equivalente para os blocos "sem_atualizacao_5d_por_etapa" e "sem_atualizacao_10d_por_etapa".
+- Motivo "Sem Retorno" NÃO prova falha de follow-up nem baixa qualidade do lead. Pode indicar hipótese a investigar, nunca causa confirmada.
+- Se "qualidade_dados.origem_outros_perdas_pct" estiver alta (>=30%), reduza a força de conclusões por origem nas perdas e diga que a classificação de origem limita a análise.
 - Não trate leads recém-chegados como fracasso só porque ainda estão abertos.
 - Use no máximo 3 achados em 'performando', 3 em 'prejudicando' e 4 ações.
-- Cada ação deve dizer O QUE fazer e POR QUÊ, sustentada por algum dado.
+- Cada ação deve dizer O QUE fazer e POR QUÊ, sustentada por algum dado explícito.
 - Se não houver evidência suficiente, diga explicitamente.
 - Seja direto, executivo e útil; não encha espaço.
 - Responda em português do Brasil.
