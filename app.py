@@ -115,7 +115,7 @@ HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 # por processo como margem operacional, pois outras integrações podem compartilhar a cota.
 # Cooldown global reduz tempestades de 429.
 # Pode ser afinado no Railway sem novo deploy.
-_AGENDOR_MIN_INTERVAL = float(os.environ.get("AGENDOR_MIN_INTERVAL", "0.80"))
+_AGENDOR_MIN_INTERVAL = float(os.environ.get("AGENDOR_MIN_INTERVAL", "1.25"))
 _AGENDOR_RATE_LOCK = threading.Lock()
 _AGENDOR_LAST_REQUEST_AT = 0.0
 _AGENDOR_COOLDOWN_UNTIL = 0.0
