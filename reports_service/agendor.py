@@ -1,7 +1,7 @@
 import threading
 import time
 from functools import lru_cache
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -189,6 +189,53 @@ def contar_ganhos_por_data_ganho(start_day: date, end_day: date) -> int:
     )
 
 
+def _data_perda_raw(deal: dict[str, Any]) -> str | None:
+    """Data de conclusão de negócio perdido.
+
+    A data de negócio (`endTime`) tem prioridade. `lostAt` é apenas fallback
+    para registros antigos ou incompletos. O valor bruto é preservado para
+    evitar deslocamento de dia por fuso horário.
+    """
+    for field in ("endTime", "lostAt", "finishedAt", "closedAt"):
+        value = deal.get(field)
+        if value:
+            return str(value)
+    return None
+
+
+def _data_perda_date(deal: dict[str, Any]) -> date | None:
+    value = _data_perda_raw(deal)
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def contar_perdidos_por_data_conclusao(start_day: date, end_day: date) -> int:
+    """Conta perdidos pela data de conclusão, sem conversão de fuso.
+
+    O recorte enviado à API é propositalmente ligeiramente mais largo porque
+    `endTime` é uma data de negócio serializada à meia-noite UTC. A seleção
+    definitiva é feita localmente por YYYY-MM-DD e pelo Funil Comercial.
+    """
+    query_start = datetime.combine(start_day, dt_time.min, tzinfo=UTC) - timedelta(seconds=1)
+    query_end = datetime.combine(end_day + timedelta(days=1), dt_time.min, tzinfo=UTC) + timedelta(seconds=1)
+    deals = listar_deals(
+        dealStatus=3,
+        endAtGt=_iso(query_start),
+        endAtLt=_iso(query_end),
+    )
+    return sum(
+        1
+        for deal in deals
+        if _eh_funil_comercial(deal)
+        and (data_perda := _data_perda_date(deal)) is not None
+        and start_day <= data_perda <= end_day
+    )
+
+
 def _snapshot_open(day: date) -> int:
     """Estoque no fim do dia sem baixar os 6.789 negócios do funil.
 
@@ -232,7 +279,7 @@ def _period_metrics(
     return {
         "leads": contar_deals(startAtGt=start_iso, startAtLt=end_iso),
         "ganhos": contar_ganhos_por_data_ganho(gains_start_day, gains_end_day),
-        "perdidos": contar_deals(dealStatus=3, endAtGt=start_iso, endAtLt=end_iso),
+        "perdidos": contar_perdidos_por_data_conclusao(gains_start_day, gains_end_day),
         "em_andamento": _snapshot_open(snapshot_day),
     }
 
