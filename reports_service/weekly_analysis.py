@@ -264,7 +264,7 @@ def analisar_com_ia(pacote: dict[str, Any]) -> dict[str, Any]:
         "cache_creation_input_tokens": 0,
     }
     last_detail = ""
-    for attempt, max_tokens in enumerate((2600, 4200), start=1):
+    for attempt, max_tokens in enumerate((1800, 2600), start=1):
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -275,6 +275,7 @@ def analisar_com_ia(pacote: dict[str, Any]) -> dict[str, Any]:
             json={
                 "model": model,
                 "max_tokens": max_tokens,
+                "thinking": {"type": "disabled"},
                 "system": SYSTEM_PROMPT,
                 "messages": [{
                     "role": "user",
