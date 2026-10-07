@@ -434,3 +434,61 @@ def buscar_mapa_campos_personalizados() -> dict[str, dict[Any, str]]:
                 mapping[str(oid)] = str(name)
         result[str(key)] = mapping
     return result
+
+
+def metricas_periodo(start_day: date, end_day: date) -> dict[str, int]:
+    """Métricas de um intervalo fechado, mantendo o estoque no fim do período."""
+    if end_day < start_day:
+        raise ValueError("end_day anterior a start_day")
+    start_iso, _ = _bounds(start_day)
+    _, end_iso = _bounds(end_day)
+    return _period_metrics(start_iso, end_iso, end_day, start_day, end_day)
+
+
+def reunioes_periodo(start_day: date, end_day: date) -> int:
+    if end_day < start_day:
+        return 0
+    start_iso, _ = _bounds(start_day)
+    _, end_iso = _bounds(end_day)
+    return contar_reunioes(start_iso, end_iso)
+
+
+def listar_perdidos_periodo(start_day: date, end_day: date, *, with_custom_fields: bool = True) -> list[dict[str, Any]]:
+    """Negócios perdidos cuja data de conclusão cai no intervalo."""
+    query_start = datetime.combine(start_day, dt_time.min, tzinfo=UTC) - timedelta(seconds=1)
+    query_end = datetime.combine(end_day + timedelta(days=1), dt_time.min, tzinfo=UTC) + timedelta(seconds=1)
+    filters: dict[str, Any] = {
+        "dealStatus": 3,
+        "endAtGt": _iso(query_start),
+        "endAtLt": _iso(query_end),
+    }
+    if with_custom_fields:
+        filters["withCustomFields"] = "true"
+    deals = listar_deals(**filters)
+    return [
+        deal for deal in deals
+        if _eh_funil_comercial(deal)
+        and (d := _data_perda_date(deal)) is not None
+        and start_day <= d <= end_day
+    ]
+
+
+def listar_ganhos_periodo(start_day: date, end_day: date, *, with_custom_fields: bool = True) -> list[dict[str, Any]]:
+    """Negócios ganhos concluídos no intervalo, com detalhes para análise."""
+    filters: dict[str, Any] = {"dealStatus": 2}
+    if with_custom_fields:
+        filters["withCustomFields"] = "true"
+    deals = listar_deals(**filters)
+    return [
+        deal for deal in deals
+        if _eh_funil_comercial(deal)
+        and (d := _data_ganho_date(deal)) is not None
+        and start_day <= d <= end_day
+    ]
+
+
+def listar_abertos_detalhados(*, with_custom_fields: bool = True) -> list[dict[str, Any]]:
+    filters: dict[str, Any] = {"dealStatus": 1}
+    if with_custom_fields:
+        filters["withCustomFields"] = "true"
+    return [deal for deal in listar_deals(**filters) if _eh_funil_comercial(deal)]
