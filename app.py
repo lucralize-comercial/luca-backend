@@ -1134,6 +1134,34 @@ def fetch_history_job():
     finally:
         history_running = False
 
+AGENDOR_PRODUCTS_CACHE_FILE = os.environ.get("AGENDOR_PRODUCTS_CACHE_FILE", "/data/agendor_products_cache.json")
+
+def _carregar_products_cache():
+    try:
+        if not os.path.isfile(AGENDOR_PRODUCTS_CACHE_FILE):
+            return {}
+        with open(AGENDOR_PRODUCTS_CACHE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[products-cache] falha ao carregar: {type(e).__name__}: {str(e)[:160]}", flush=True)
+        return {}
+
+def _salvar_products_cache(data):
+    try:
+        os.makedirs(os.path.dirname(AGENDOR_PRODUCTS_CACHE_FILE) or ".", exist_ok=True)
+        tmp = AGENDOR_PRODUCTS_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, separators=(",", ":"), default=str)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, AGENDOR_PRODUCTS_CACHE_FILE)
+    except Exception as e:
+        print(f"[products-cache] falha ao salvar: {type(e).__name__}: {str(e)[:160]}", flush=True)
+
+def _deal_products_signature(deal):
+    return deal.get("updatedAt") or deal.get("wonAt") or deal.get("startTime") or ""
+
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
     all_deals = []
@@ -1190,16 +1218,36 @@ def fetch_deals():
     if not enriquecer_produtos:
         print(f"[fetch_deals] produtos adiados durante retroativo status={retro_status}", flush=True)
         won_recent = []
+    products_cache = _carregar_products_cache()
+    products_cache_changed = False
+    reaproveitados = 0
+    consultas_agendor = 0
     for deal in won_recent:
+        deal_id = str(deal.get("id"))
+        signature = _deal_products_signature(deal)
+        salvo = products_cache.get(deal_id) if deal_id else None
+        if isinstance(salvo, dict) and salvo.get("signature") == signature and isinstance(salvo.get("products"), list):
+            deal["products_entities"] = salvo["products"]
+            reaproveitados += 1
+            continue
         try:
+            consultas_agendor += 1
             r = requests.get(f"{AGENDOR_BASE}/deals/{deal['id']}/products", headers=HEADERS, timeout=15)
             if r.status_code == 200:
                 products = r.json().get("data", [])
-                if products:
-                    deal["products_entities"] = products
+                if not isinstance(products, list):
+                    products = []
+                deal["products_entities"] = products
+                if deal_id:
+                    products_cache[deal_id] = {"signature": signature, "products": products}
+                    products_cache_changed = True
         except Exception as e:
             print(f"Erro produtos {deal['id']}: {e}", flush=True)
         time.sleep(float(os.environ.get("AGENDOR_PRODUCTS_PACE_SECONDS", "1.50")))
+    if products_cache_changed:
+        _salvar_products_cache(products_cache)
+    if enriquecer_produtos:
+        print(f"[products-cache] elegiveis={len(won_recent)} reaproveitados={reaproveitados} consultas_agendor={consultas_agendor}", flush=True)
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # Desativado: endpoint /deals/{id}/history retorna 404 na API v3 do Agendor
