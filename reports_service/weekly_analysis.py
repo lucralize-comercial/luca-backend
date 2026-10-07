@@ -30,13 +30,13 @@ LOSS_REASON_NAMES = {
     3162049: "Satisfeito com o Contador Atual",
     3162043: "Sem retorno",
     3162045: "Prazo (momento inadequado)",
-    3162044: "Contato inválido",
-    3162051: "Sem WhatsApp",
+    3187920: "Contato inválido",
+    3217904: "Sem WhatsApp",
     3162046: "Preço",
     3162047: "Produto/Serviço não atendeu",
     3162048: "Fechou com Concorrente",
     3162050: "Desistiu da negociação",
-    3162052: "Lead parou de interagir",
+    3200168: "Lead parou de interagir",
     3265096: "Empresa Baixada/Em Processo de Baixa",
 }
 
