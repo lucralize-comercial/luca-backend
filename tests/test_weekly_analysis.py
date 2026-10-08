@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from reports_service.weekly_view import renderizar_semanal_html
 from reports_service.weekly_analysis import (
-    _validar_analise, _week_window, _open_pipeline,
+    _validar_analise, _parse_ai_json, _week_window, _open_pipeline,
     montar_apresentacao_semanal,
 )
 
@@ -57,6 +57,20 @@ class WeeklyAnalysisTests(unittest.TestCase):
         self.assertEqual(rendered["cards"][0]["comparacao"], "↓ 25,6%")
         self.assertEqual(rendered["sinal_proxima_semana"],
                          ANALISE["sinal_proxima_semana"])
+
+    def test_parse_json_with_trailing_commentary(self):
+        import json
+        raw = json.dumps(ANALISE, ensure_ascii=False) + "\\n\\nObservação adicional"
+        self.assertEqual(_parse_ai_json(raw), ANALISE)
+
+    def test_parse_json_with_markdown_and_two_objects(self):
+        import json
+        raw = "Segue análise:\\n```json\\n" + json.dumps(ANALISE) + "\\n```\\n" + '{"extra":1}'
+        self.assertEqual(_parse_ai_json(raw), ANALISE)
+
+    def test_parse_rejects_incomplete_json(self):
+        with self.assertRaises(ValueError):
+            _parse_ai_json('{"leitura_gestor": "texto", "performando": [')
 
     def test_html_preview_and_escaping(self):
         presentation = {
