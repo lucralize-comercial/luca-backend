@@ -25,6 +25,7 @@ def main():
     }
     _dump("WEEKLY_DATA", resumo)
     _dump("WEEKLY_AI", result["ia"]["analise"])
+    _dump("WEEKLY_PRESENTATION", result["apresentacao"])
     _dump("WEEKLY_USAGE", result["ia"]["uso"])
     print("WEEKLY_MODEL=" + result["ia"]["modelo"], flush=True)
     os.execvp("gunicorn", ["gunicorn", "reports_service.app:app"])
