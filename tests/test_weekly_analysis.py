@@ -44,6 +44,7 @@ class WeeklyAnalysisTests(unittest.TestCase):
             "indicadores": {
                 "leads": {"valor": 58, "anterior": 78, "variacao_pct": -25.6},
                 "reunioes": {"valor": 7, "anterior": 8, "variacao_pct": -12.5},
+                "ganhos": {"valor": 3, "anterior": 3, "variacao_pct": 0.0},
                 "perdidos": {"valor": 49, "anterior": 101, "variacao_pct": -51.5},
             },
         }
@@ -53,7 +54,7 @@ class WeeklyAnalysisTests(unittest.TestCase):
         self.assertEqual(rendered["versao_layout"], 1)
         self.assertEqual(rendered["titulo"], "ACOMPANHAMENTO COMERCIAL")
         self.assertEqual([x["titulo"] for x in rendered["cards"]],
-                         ["Leads recebidos", "Reuniões", "Perdidos"])
+                         ["Leads recebidos", "Reuniões", "Ganhos", "Perdidos"])
         self.assertEqual(rendered["cards"][0]["comparacao"], "↓ 25,6%")
         self.assertEqual(rendered["sinal_proxima_semana"],
                          ANALISE["sinal_proxima_semana"])
@@ -79,6 +80,7 @@ class WeeklyAnalysisTests(unittest.TestCase):
             "cards": [
                 {"titulo": "Leads", "valor": 58, "comparacao": "↓ 25,6%", "anterior": 78},
                 {"titulo": "Reuniões", "valor": 7, "comparacao": "↓ 12,5%", "anterior": 8},
+                {"titulo": "Ganhos", "valor": 3, "comparacao": "→ 0,0%", "anterior": 3},
                 {"titulo": "Perdidos", "valor": 49, "comparacao": "↓ 51,5%", "anterior": 101},
             ],
             **ANALISE,
@@ -91,7 +93,7 @@ class WeeklyAnalysisTests(unittest.TestCase):
         self.assertNotIn("<script>", html)
         self.assertIn("Ações recomendadas", html)
 
-    def test_html_requires_three_cards(self):
+    def test_html_requires_four_cards(self):
         with self.assertRaises(ValueError):
             renderizar_semanal_html({"cards": []})
 
@@ -120,6 +122,7 @@ class WeeklyAnalysisTests(unittest.TestCase):
             "cards": [
                 {"titulo": "Leads recebidos", "valor": 58, "comparacao": "↓ 25,6%", "anterior": 78},
                 {"titulo": "Reuniões", "valor": 7, "comparacao": "↓ 12,5%", "anterior": 8},
+                {"titulo": "Ganhos", "valor": 3, "comparacao": "→ 0,0%", "anterior": 3},
                 {"titulo": "Perdidos", "valor": 49, "comparacao": "↓ 51,5%", "anterior": 101},
             ],
             **ANALISE,
@@ -169,6 +172,7 @@ class WeeklyAnalysisTests(unittest.TestCase):
             "cards": [
                 {"titulo": "Leads", "valor": 58, "comparacao": "↓ 25,6%", "anterior": 78},
                 {"titulo": "Reuniões", "valor": 7, "comparacao": "↓ 12,5%", "anterior": 8},
+                {"titulo": "Ganhos", "valor": 3, "comparacao": "→ 0,0%", "anterior": 3},
                 {"titulo": "Perdidos", "valor": 49, "comparacao": "↓ 51,5%", "anterior": 101},
             ],
             **ANALISE,
