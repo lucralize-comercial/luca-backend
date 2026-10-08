@@ -1,4 +1,4 @@
-"""Validação privada, temporária e sem envio do relatório semanal real.
+"""Validação privada, pontual e sem envio do relatório semanal real.
 
 Executar somente de forma explícita em pre-deploy controlado. Não grava dados
 do Agendor nem texto da IA em logs; apenas resumo técnico e tokens.
