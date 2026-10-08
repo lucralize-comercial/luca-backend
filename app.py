@@ -2587,6 +2587,9 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=Fa
         atual = _rd_valor_atual(final_custom, slug)
         if str(atual) == str(valor):
             confirmados.append(slug)
+        elif (slug == "origem_do_negocio" and
+              str(atual).strip() == str(origem or "").strip()):
+            confirmados.append(slug)
         elif isinstance(final_custom.get(slug), dict) and str(final_custom[slug].get("id")) == str(valor):
             confirmados.append(slug)
     resultado.update(
