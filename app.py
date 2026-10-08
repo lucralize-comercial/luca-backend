@@ -1676,7 +1676,7 @@ RD_ORIGEM_DE_PARA = {
     "Formulário Meta Afiliados - Alexia": "Formulário Meta Afiliados - Alexia",
 }
 _rd_origens_cache_lock = threading.Lock()
-_rd_origens_cache = {"at": 0, "options": {}}
+_rd_origens_cache = {"at": 0, "options": {}, "misses": {}}
 RD_ORIGENS_CACHE_TTL = 900  # 15 minutos; refresh no miss
 
 
@@ -1710,7 +1710,7 @@ def _rd_opcoes_origem(force=False):
             break
         if not options:
             raise ValueError("Agendor sem opções válidas de origem_do_negocio")
-        _rd_origens_cache.update(at=time.monotonic(), options=options)
+        _rd_origens_cache.update(at=time.monotonic(), options=options, misses={})
         return dict(options)
 
 
@@ -1720,8 +1720,15 @@ def _rd_resolver_origem_id(identificador):
     if not nome:
         return None
     opcoes = _rd_opcoes_origem()
-    if nome not in opcoes:
-        opcoes = _rd_opcoes_origem(force=True)
+    if nome in opcoes:
+        return opcoes[nome]
+    # Uma origem ainda não cadastrada não deve provocar GET a cada webhook.
+    with _rd_origens_cache_lock:
+        ultima = _rd_origens_cache["misses"].get(nome, 0)
+        if time.monotonic() - ultima < RD_ORIGENS_CACHE_TTL:
+            return None
+        _rd_origens_cache["misses"][nome] = time.monotonic()
+    opcoes = _rd_opcoes_origem(force=True)
     return opcoes.get(nome)
 
 
