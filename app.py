@@ -1302,7 +1302,12 @@ def fetch_deals():
     products_cache_changed = False
     reaproveitados = 0
     consultas_agendor = 0
+    products_http_status = {}
+    falhas_consecutivas = 0
     for deal in won_recent:
+        if falhas_consecutivas >= 3:
+            print(f"[products-cache] consultas interrompidas apos 3 falhas consecutivas; status={products_http_status}", flush=True)
+            break
         deal_id = str(deal.get("id"))
         signature = _deal_products_signature(deal)
         salvo = products_cache.get(deal_id) if deal_id else None
@@ -1316,7 +1321,9 @@ def fetch_deals():
         try:
             consultas_agendor += 1
             r = requests.get(f"{AGENDOR_BASE}/deals/{deal['id']}/products", headers=HEADERS, timeout=15)
+            products_http_status[str(r.status_code)] = products_http_status.get(str(r.status_code), 0) + 1
             if r.status_code == 200:
+                falhas_consecutivas = 0
                 products = r.json().get("data", [])
                 if not isinstance(products, list):
                     products = []
@@ -1324,8 +1331,12 @@ def fetch_deals():
                 if deal_id:
                     products_cache[deal_id] = {"signature": signature, "products": products}
                     products_cache_changed = True
+            else:
+                falhas_consecutivas += 1
+                print(f"[products-cache] HTTP {r.status_code} na consulta de produtos (sem payload); falhas_consecutivas={falhas_consecutivas}", flush=True)
         except Exception as e:
-            print(f"Erro produtos {deal['id']}: {e}", flush=True)
+            falhas_consecutivas += 1
+            print(f"Erro produtos {deal['id']}: {type(e).__name__}: {str(e)[:140]}", flush=True)
         # Checkpoint progressivo: reinicios durante as consultas nao perdem
         # todos os produtos ja obtidos. Evita repetir centenas de GETs.
         if products_cache_changed and consultas_agendor > 0 and consultas_agendor % 10 == 0:
@@ -1336,7 +1347,7 @@ def fetch_deals():
     if products_cache_changed:
         _salvar_products_cache(products_cache)
     if enriquecer_produtos:
-        print(f"[products-cache] elegiveis={len(won_recent)} reaproveitados={reaproveitados} consultas_agendor={consultas_agendor}", flush=True)
+        print(f"[products-cache] elegiveis={len(won_recent)} reaproveitados={reaproveitados} consultas_agendor={consultas_agendor} http_status={products_http_status}", flush=True)
         _registrar_validacao_operacional(
             elegiveis=len(won_recent),
             reaproveitados=reaproveitados,
