@@ -51,7 +51,9 @@ def semanal_test():
 
 @app.get("/reports/semanal/visual/teste")
 def semanal_visual_test():
-    if not _authorized():
+    # Relatório gerencial: nunca permite bypass por REPORT_ALLOW_UNAUTHENTICATED_TEST.
+    supplied = request.headers.get("X-API-Key", "")
+    if not REPORT_TEST_KEY or not hmac.compare_digest(supplied, REPORT_TEST_KEY):
         return jsonify({"error": "unauthorized"}), 401
     try:
         # A chamada com IA só ocorre mediante parâmetro explícito.
