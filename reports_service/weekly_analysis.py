@@ -291,17 +291,24 @@ Regras:
 """
 
 def _parse_ai_json(raw: str) -> dict[str, Any]:
+    """Extrai um objeto JSON completo sem engolir texto adicional da resposta."""
     raw = (raw or "").strip()
     if not raw:
         raise ValueError("resposta sem bloco de texto")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("resposta sem JSON")
-        return json.loads(raw[start:end + 1])
+    decoder = json.JSONDecoder()
+    for pos, char in enumerate(raw):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(raw, pos)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and all(key in data for key in (
+            "leitura_gestor", "performando", "prejudicando",
+            "acoes_recomendadas", "sinal_proxima_semana",
+        )):
+            return data
+    raise ValueError("resposta sem objeto JSON completo da análise")
 
 
 def _validar_analise(analysis: Any) -> dict[str, Any]:
