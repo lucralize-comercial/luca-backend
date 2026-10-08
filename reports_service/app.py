@@ -1,5 +1,7 @@
 import hmac
 import os
+import threading
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, Response
 
@@ -10,6 +12,9 @@ from .weekly_analysis import gerar_relatorio_semanal
 from .weekly_view import renderizar_semanal_html
 
 app = Flask(__name__)
+_weekly_lock = threading.Lock()
+_weekly_last_run = None
+
 
 
 def _authorized() -> bool:
@@ -70,6 +75,43 @@ def semanal_visual_test():
     except Exception:
         app.logger.exception("Falha ao gerar visual semanal")
         return jsonify({"error": "falha ao gerar visual semanal"}), 500
+
+
+@app.post("/reports/semanal/executar")
+def executar_semanal_controlado():
+    """Execução sob demanda, sem envio e com proteção simples contra repetição."""
+    global _weekly_last_run
+    supplied = request.headers.get("X-API-Key", "")
+    if not REPORT_TEST_KEY or not hmac.compare_digest(supplied, REPORT_TEST_KEY):
+        return jsonify({"error": "unauthorized"}), 401
+    if request.headers.get("X-Confirm-Execution") != "EXECUTAR_SEMANAL":
+        return jsonify({"error": "confirmation_required"}), 400
+    if not _weekly_lock.acquire(blocking=False):
+        return jsonify({"error": "already_running"}), 409
+    try:
+        now = datetime.now(timezone.utc)
+        if _weekly_last_run and (now - _weekly_last_run).total_seconds() < 3600:
+            return jsonify({"error": "cooldown_active", "retry_after_seconds": 3600}), 429
+        # O bloqueio limita concorrência neste processo; múltiplas réplicas exigem
+        # armazenamento compartilhado para garantir idempotência global.
+        _weekly_last_run = now
+        report = gerar_relatorio_semanal(usar_ia=True)
+        presentation = report["apresentacao"]
+        renderizar_semanal_html(presentation)
+        return jsonify({
+            "ok": True, "sent": False,
+            "periodo": presentation["periodo"],
+            "cards": len(presentation["cards"]),
+            "acoes": len(presentation["acoes_recomendadas"]),
+            "confianca": presentation["confianca"],
+            "modelo": report["ia"]["modelo"],
+            "uso": report["ia"]["uso"],
+        })
+    except Exception:
+        app.logger.exception("Falha na execução controlada semanal")
+        return jsonify({"error": "weekly_execution_failed"}), 500
+    finally:
+        _weekly_lock.release()
 
 
 @app.get("/reports/consumo/teste")
