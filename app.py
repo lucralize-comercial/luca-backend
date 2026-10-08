@@ -1304,6 +1304,7 @@ def fetch_deals():
     # O enriquecimento usa apenas os dados ja obtidos na paginacao.
     reaproveitados = 0
     disponiveis = 0
+    products_cache_changed = False
     for deal in won_recent:
         deal_id = str(deal.get("id"))
         products = deal.get("products_entities")
@@ -1315,14 +1316,17 @@ def fetch_deals():
         if isinstance(salvo, dict) and salvo.get("products") == products:
             reaproveitados += 1
             continue
+        # [] e valor confirmado: nao ressuscitar itens antigos do cache.
         products_cache[deal_id] = {"signature": signature, "products": products}
-    if disponiveis:
+        products_cache_changed = True
+    if products_cache_changed:
         _salvar_products_cache(products_cache)
     print(f"[products-cache] pela_lista negocios_com_produtos_disponiveis={disponiveis} "
           f"elegiveis={len(won_recent)} reaproveitados={reaproveitados} "
           "consultas_adicionais=0", flush=True)
-    # Nao usar uma taxa artificial de reutilizacao para liberar retroativo:
-    # validacao operacional exige verificacoes especificas da integracao RD.
+    # Sem alterar/renovar o gate operacional do retroativo RD: o gate antigo
+    # depende de uma metrica de chamadas de produtos que deixou de existir.
+    # Liberacao de retroativo exige validacao independente e explicita.
 
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
