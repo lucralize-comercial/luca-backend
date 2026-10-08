@@ -1963,14 +1963,18 @@ def _rd_dryrun_executar(dias=30, limite=250):
             "sem_contato_rd": 0,
             "sem_email": 0,
             "identificador_fora_depara": 0,
+            "sem_identificador": 0,
             "identificadores_fora_depara": {},
             "ja_totalmente_preenchido": 0,
+            "sem_valores_rd": 0,
+            "com_preenchimento_pendente": 0,
             "erros": 0,
             "would_fill_por_campo": {
                 "origem_do_negocio": 0, "origem": 0, "campanha": 0,
                 "grupo_de_anuncio": 0, "anuncio": 0, "meta_ads_source_id": 0,
             },
             "amostras": [],
+            "amostras_pendentes": [],
         }
 
         total_deals = len(deals)
@@ -2057,10 +2061,13 @@ def _rd_dryrun_executar(dias=30, limite=250):
                 diff, dados = plausiveis[0]
                 origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
                 if not origem_negocio:
-                    resumo["identificador_fora_depara"] += 1
-                    identificador = str(dados.get("identificador") or "(vazio)").strip() or "(vazio)"
-                    fora = resumo["identificadores_fora_depara"]
-                    fora[identificador] = fora.get(identificador, 0) + 1
+                    identificador = str(dados.get("identificador") or "").strip()
+                    if not identificador:
+                        resumo["sem_identificador"] += 1
+                    else:
+                        resumo["identificador_fora_depara"] += 1
+                        fora = resumo["identificadores_fora_depara"]
+                        fora[identificador] = fora.get(identificador, 0) + 1
                 resumo["match_seguro"] += 1
 
                 desejados = {
@@ -2073,16 +2080,29 @@ def _rd_dryrun_executar(dias=30, limite=250):
                 }
                 would_fill = {}
                 ja_preenchidos = []
+                valores_rd_disponiveis = 0
                 for slug, valor in desejados.items():
                     if valor is None or str(valor).strip() == "":
                         continue
+                    valores_rd_disponiveis += 1
                     atual = _rd_valor_atual(custom, slug)
                     if atual not in (None, "", [], {}):
                         ja_preenchidos.append(slug)
                         continue
                     would_fill[slug] = str(valor).strip()
                     resumo["would_fill_por_campo"][slug] += 1
-                if not would_fill:
+                if would_fill:
+                    resumo["com_preenchimento_pendente"] += 1
+                    if len(resumo["amostras_pendentes"]) < 15:
+                        resumo["amostras_pendentes"].append({
+                            "deal_id": deal_id,
+                            "diferenca_seg": round(diff, 1),
+                            "campos_pendentes": list(would_fill),
+                            "identificador_presente": bool(dados.get("identificador")),
+                        })
+                elif not valores_rd_disponiveis:
+                    resumo["sem_valores_rd"] += 1
+                else:
                     resumo["ja_totalmente_preenchido"] += 1
                 if len(resumo["amostras"]) < 25:
                     resumo["amostras"].append({
