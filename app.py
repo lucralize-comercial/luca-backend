@@ -1665,8 +1665,8 @@ def rd_oauth_callback():
 # Recebe a conversão, localiza de forma conservadora o negócio correspondente
 # e preenche SOMENTE campos vazios. Identificadores desconhecidos são ignorados.
 
-# DE/PARA fechado: só estes identificadores podem escrever Origem do Negócio.
-# Novos identificadores devem ser validados antes de entrar aqui.
+# Exceções semânticas conhecidas; as demais origens são resolvidas pelas
+# opções cadastradas no Agendor, sem precisar de atualização do app.py.
 RD_ORIGEM_DE_PARA = {
     "calculadora-impostos-desenvolvedores": "calculadora-impostos-desenvolvedores",
     "Transformação do MEI": "Transformação do MEI",
@@ -1675,17 +1675,54 @@ RD_ORIGEM_DE_PARA = {
     "ei-dev-nao-precisa-perder-tempo-com-burocracia": "ei-dev-nao-precisa-perder-tempo-com-burocracia",
     "Formulário Meta Afiliados - Alexia": "Formulário Meta Afiliados - Alexia",
 }
+_rd_origens_cache_lock = threading.Lock()
+_rd_origens_cache = {"at": 0, "options": {}}
+RD_ORIGENS_CACHE_TTL = 900  # 15 minutos; refresh no miss
 
-# Slugs esperados dos campos personalizados do negócio no Agendor.
+
 def _rd_mapear_origem_negocio(identificador):
-    """Regra validada: qualquer calculadora sem 'dividendos' é a calculadora dev."""
-    valor = (identificador or "").strip()
+    """Mantém somente exceções legadas; outras opções são descobertas dinamicamente."""
+    valor = str(identificador or "").strip()
     normalizado = valor.lower()
     if "calculadora" in normalizado:
         if "dividendos" in normalizado:
             return "calculadora-de-impostos-e-ir-sobre-dividendos"
         return "calculadora-impostos-desenvolvedores"
-    return RD_ORIGEM_DE_PARA.get(valor)
+    return RD_ORIGEM_DE_PARA.get(valor, valor) if valor else None
+
+
+def _rd_opcoes_origem(force=False):
+    """Obtém IDs numéricos do select Origem do Negócio (cache por 15 minutos)."""
+    with _rd_origens_cache_lock:
+        atual = _rd_origens_cache
+        if not force and atual["options"] and time.monotonic() - atual["at"] < RD_ORIGENS_CACHE_TTL:
+            return dict(atual["options"])
+        r = requests.get(f"{AGENDOR_BASE}/custom_fields/deals", headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        options = {}
+        for campo in (r.json().get("data") or []):
+            if campo.get("identifier") != "origem_do_negocio":
+                continue
+            for opt in (campo.get("options") or []):
+                nome, oid = str(opt.get("name") or "").strip(), opt.get("id")
+                if nome and isinstance(oid, int) and not isinstance(oid, bool):
+                    options[nome] = oid
+            break
+        if not options:
+            raise ValueError("Agendor sem opções válidas de origem_do_negocio")
+        _rd_origens_cache.update(at=time.monotonic(), options=options)
+        return dict(options)
+
+
+def _rd_resolver_origem_id(identificador):
+    """Correspondência exata; refresh na ausência; nunca inventa opção."""
+    nome = _rd_mapear_origem_negocio(identificador)
+    if not nome:
+        return None
+    opcoes = _rd_opcoes_origem()
+    if nome not in opcoes:
+        opcoes = _rd_opcoes_origem(force=True)
+    return opcoes.get(nome)
 
 
 RD_CAMPOS_AGENDOR = {
@@ -3070,9 +3107,13 @@ def rd_retroativo_automatico():
 
 def _rd_enriquecer_deal(deal_id, dados):
     """Preenche apenas campos existentes e vazios; nunca sobrescreve."""
-    origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
-    if not origem_negocio:
-        print(f"[rd-write] identificador sem mapeamento: preenchimento limitado aos campos UTM", flush=True)
+    try:
+        origem_id = _rd_resolver_origem_id(dados.get("identificador"))
+    except (requests.RequestException, ValueError) as e:
+        origem_id = None
+        print(f"[rd-write] consulta de opções indisponível: {type(e).__name__}", flush=True)
+    if origem_id is None:
+        print("[rd-write] origem sem opção correspondente: somente UTMs disponíveis", flush=True)
 
     try:
         r = requests.get(
@@ -3091,7 +3132,7 @@ def _rd_enriquecer_deal(deal_id, dados):
     # portanto ausência do slug NÃO significa que o campo não exista.
     # Só envia valores que vieram do RD e nunca sobrescreve campo já preenchido.
     desejados = {
-        "origem_do_negocio": origem_negocio,
+        "origem_do_negocio": origem_id,
         "origem": dados.get("utm_source"),
         "campanha": dados.get("utm_campaign"),
         "grupo_de_anuncio": dados.get("utm_term"),
@@ -3109,7 +3150,7 @@ def _rd_enriquecer_deal(deal_id, dados):
         if atual not in (None, "", [], {}):
             pulados[slug] = f"ja_preenchido:{atual}"
             continue
-        atualizar[slug] = str(valor).strip()
+        atualizar[slug] = valor if slug == "origem_do_negocio" else str(valor).strip()
 
     print(f"[rd-write] deal={deal_id} atualizar={json.dumps(atualizar, ensure_ascii=False)} pulados={json.dumps(pulados, ensure_ascii=False, default=str)}", flush=True)
     if not atualizar:
