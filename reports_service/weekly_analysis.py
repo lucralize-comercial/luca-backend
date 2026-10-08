@@ -253,6 +253,8 @@ def montar_pacote_semanal(now: datetime | None = None) -> dict[str, Any]:
             "Conversão por origem da coorte usa o status atual dos leads que entraram na semana; leads recentes ainda podem estar em maturação.",
             "Perdas e ganhos da semana usam a data de conclusão, podendo incluir leads originados em semanas anteriores.",
             "Tempo sem atualização usa updatedAt e não deve ser descrito como tempo exato na etapa.",
+            "Sem atualização há 10 dias significa 10 dias ou mais (>= 10), não estritamente mais de 10 dias.",
+            "Taxas lead/reunião e lead/ganho comparam volumes da semana e não são conversão de uma mesma coorte.",
         ],
     }
 
@@ -270,6 +272,8 @@ Regras:
 - Se "Outros" estiver >=30% em leads ou perdas, NÃO apresente "Outros" como canal performando nem recomende aumentar investimento nessa origem; trate primeiro como problema de classificação.
 - Para chamar uma origem de performando, prefira evidência de avanço/ganho e considere o tamanho da amostra. Com poucos casos, use linguagem cautelosa.
 - Não trate leads recém-chegados como fracasso só porque ainda estão abertos.
+- As taxas lead/reunião e lead/ganho são razões entre volumes do período, NÃO conversões comprovadas da mesma coorte. Não atribua mudança de uma taxa a melhora de conversão real sem evidência.
+- Sem atualização por 10 dias significa 10 dias ou mais (inclusive 10), conforme o pacote.
 - Priorize recomendações que possam mudar resultado comercial na próxima semana: recuperação de oportunidades inativas, redução de perdas evitáveis, correção de captura/qualificação e alinhamento de mídia/oferta. Qualidade de cadastro entra quando limita decisões.
 - Use no máximo 3 achados em 'performando', 3 em 'prejudicando' e 4 ações.
 - Cada ação deve dizer O QUE fazer e POR QUÊ, sustentada por algum dado explícito.
@@ -298,6 +302,25 @@ def _parse_ai_json(raw: str) -> dict[str, Any]:
         if start < 0 or end <= start:
             raise ValueError("resposta sem JSON")
         return json.loads(raw[start:end + 1])
+
+
+def _validar_analise(analysis: Any) -> dict[str, Any]:
+    """Impede que respostas incompletas ou com tipos errados cheguem ao visual."""
+    if not isinstance(analysis, dict):
+        raise ValueError("análise da IA precisa ser um objeto JSON")
+    for field in ("leitura_gestor", "sinal_proxima_semana"):
+        if not isinstance(analysis.get(field), str) or not analysis[field].strip():
+            raise ValueError(f"campo obrigatório inválido: {field}")
+    for field, limit in (("performando", 3), ("prejudicando", 3),
+                         ("acoes_recomendadas", 4), ("ressalvas", 8)):
+        value = analysis.get(field)
+        if not isinstance(value, list) or len(value) > limit or any(
+            not isinstance(item, str) or not item.strip() for item in value
+        ):
+            raise ValueError(f"campo obrigatório inválido: {field}")
+    if analysis.get("confianca") not in ("alta", "media", "baixa"):
+        raise ValueError("campo obrigatório inválido: confianca")
+    return analysis
 
 
 def analisar_com_ia(pacote: dict[str, Any]) -> dict[str, Any]:
@@ -347,7 +370,7 @@ def analisar_com_ia(pacote: dict[str, Any]) -> dict[str, Any]:
         ]
         raw = "\n".join(text_parts).strip()
         try:
-            analysis = _parse_ai_json(raw)
+            analysis = _validar_analise(_parse_ai_json(raw))
         except (ValueError, json.JSONDecodeError) as exc:
             block_types = [str(block.get("type")) for block in content]
             last_detail = (
@@ -376,10 +399,12 @@ def _fmt_delta(item: dict[str, Any]) -> str:
 def montar_apresentacao_semanal(pacote: dict[str, Any], ia_result: dict[str, Any]) -> dict[str, Any]:
     """Estrutura compacta pronta para o mockup gerencial."""
     indicadores = pacote["indicadores"]
-    analise = ia_result["analise"]
+    analise = _validar_analise(ia_result["analise"])
     periodo = pacote["periodo"]["semana_atual"]
 
     return {
+        "versao_layout": 1,
+        "titulo": "ACOMPANHAMENTO COMERCIAL",
         "periodo": periodo,
         "cards": [
             {
