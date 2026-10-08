@@ -267,7 +267,10 @@ Regras:
 - "por_etapa" significa quantidade atualmente naquela etapa; NÃO chame esses negócios de parados/inativos. Só use "parado", "inativo" ou equivalente para os blocos "sem_atualizacao_5d_por_etapa" e "sem_atualizacao_10d_por_etapa".
 - Motivo "Sem Retorno" NÃO prova falha de follow-up nem baixa qualidade do lead. Pode indicar hipótese a investigar, nunca causa confirmada.
 - Se "qualidade_dados.origem_outros_perdas_pct" estiver alta (>=30%), reduza a força de conclusões por origem nas perdas e diga que a classificação de origem limita a análise.
+- Se "Outros" estiver >=30% em leads ou perdas, NÃO apresente "Outros" como canal performando nem recomende aumentar investimento nessa origem; trate primeiro como problema de classificação.
+- Para chamar uma origem de performando, prefira evidência de avanço/ganho e considere o tamanho da amostra. Com poucos casos, use linguagem cautelosa.
 - Não trate leads recém-chegados como fracasso só porque ainda estão abertos.
+- Priorize recomendações que possam mudar resultado comercial na próxima semana: recuperação de oportunidades inativas, redução de perdas evitáveis, correção de captura/qualificação e alinhamento de mídia/oferta. Qualidade de cadastro entra quando limita decisões.
 - Use no máximo 3 achados em 'performando', 3 em 'prejudicando' e 4 ações.
 - Cada ação deve dizer O QUE fazer e POR QUÊ, sustentada por algum dado explícito.
 - Se não houver evidência suficiente, diga explicitamente.
@@ -362,9 +365,58 @@ def analisar_com_ia(pacote: dict[str, Any]) -> dict[str, Any]:
 
     raise RuntimeError("IA não retornou JSON válido após retry: " + last_detail)
 
+def _fmt_delta(item: dict[str, Any]) -> str:
+    pct = item.get("variacao_pct")
+    if pct is None:
+        return "novo" if item.get("valor") else "0,0%"
+    arrow = "↑" if pct > 0 else ("↓" if pct < 0 else "→")
+    return f"{arrow} {abs(float(pct)):.1f}%".replace(".", ",")
+
+
+def montar_apresentacao_semanal(pacote: dict[str, Any], ia_result: dict[str, Any]) -> dict[str, Any]:
+    """Estrutura compacta pronta para o mockup gerencial."""
+    indicadores = pacote["indicadores"]
+    analise = ia_result["analise"]
+    periodo = pacote["periodo"]["semana_atual"]
+
+    return {
+        "periodo": periodo,
+        "cards": [
+            {
+                "titulo": "Leads recebidos",
+                "valor": indicadores["leads"]["valor"],
+                "comparacao": _fmt_delta(indicadores["leads"]),
+                "anterior": indicadores["leads"]["anterior"],
+            },
+            {
+                "titulo": "Reuniões",
+                "valor": indicadores["reunioes"]["valor"],
+                "comparacao": _fmt_delta(indicadores["reunioes"]),
+                "anterior": indicadores["reunioes"]["anterior"],
+            },
+            {
+                "titulo": "Perdidos",
+                "valor": indicadores["perdidos"]["valor"],
+                "comparacao": _fmt_delta(indicadores["perdidos"]),
+                "anterior": indicadores["perdidos"]["anterior"],
+            },
+        ],
+        "leitura_gestor": analise.get("leitura_gestor", ""),
+        "performando": analise.get("performando", []),
+        "prejudicando": analise.get("prejudicando", []),
+        "acoes_recomendadas": analise.get("acoes_recomendadas", []),
+        "sinal_proxima_semana": analise.get("sinal_proxima_semana", ""),
+        "confianca": analise.get("confianca", "baixa"),
+        "ressalvas": analise.get("ressalvas", []),
+        "uso_ia": ia_result.get("uso", {}),
+        "modelo_ia": ia_result.get("modelo"),
+    }
+
+
 def gerar_relatorio_semanal(now: datetime | None = None, *, usar_ia: bool = True) -> dict[str, Any]:
     pacote = montar_pacote_semanal(now)
     result = {"pacote": pacote}
     if usar_ia:
         result["ia"] = analisar_com_ia(pacote)
+        result["apresentacao"] = montar_apresentacao_semanal(pacote, result["ia"])
     return result
