@@ -2547,15 +2547,59 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=Fa
         resultado.update(status="ja_preenchido", motivo="nenhum_campo_rd_vazio_com_valor")
         return resultado
 
+    # Agendor select exige option.id (int), e não o nome da opção.
+    if "origem_do_negocio" in atualizar:
+        r_opcoes = requests.get(
+            f"{AGENDOR_BASE}/custom_fields/deals", headers=HEADERS, timeout=15)
+        r_opcoes.raise_for_status()
+        opcao_id = None
+        for campo in (r_opcoes.json().get("data") or []):
+            if campo.get("identifier") == "origem_do_negocio":
+                for opcao in (campo.get("options") or []):
+                    if str(opcao.get("name") or "").strip() == str(origem or "").strip():
+                        opcao_id = opcao.get("id")
+                        break
+                break
+        if isinstance(opcao_id, int) and not isinstance(opcao_id, bool):
+            atualizar["origem_do_negocio"] = opcao_id
+        else:
+            atualizar.pop("origem_do_negocio", None)
+            resultado["origem_opcao_nao_encontrada"] = True
+    if not atualizar:
+        resultado.update(status="nao_atualizado", motivo="opcao_origem_indisponivel")
+        return resultado
+
     r_put = requests.put(
         f"{AGENDOR_BASE}/deals/{deal_id}",
         headers={**HEADERS, "Content-Type": "application/json"},
         json={"customFields": atualizar}, timeout=20)
     r_put.raise_for_status()
 
-    resultado.update(status="atualizado", origem_do_negocio=origem,
-                     campos_atualizados=list(atualizar), motivo="match_seguro")
-    print(f"[rd-retro-single] ATUALIZADO {json.dumps(resultado, ensure_ascii=False)}", flush=True)
+    # Confirma persistência antes de declarar sucesso.
+    r_verificar = requests.get(
+        f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+        params={"withCustomFields": "true"}, timeout=20)
+    r_verificar.raise_for_status()
+    verificado = r_verificar.json().get("data") or r_verificar.json()
+    final_custom = verificado.get("customFields") or {}
+    confirmados = []
+    for slug, valor in atualizar.items():
+        atual = _rd_valor_atual(final_custom, slug)
+        if str(atual) == str(valor):
+            confirmados.append(slug)
+        elif (slug == "origem_do_negocio" and
+              str(atual).strip() == str(origem or "").strip()):
+            confirmados.append(slug)
+        elif isinstance(final_custom.get(slug), dict) and str(final_custom[slug].get("id")) == str(valor):
+            confirmados.append(slug)
+    resultado.update(
+        status="atualizado_confirmado" if len(confirmados) == len(atualizar) else "escrita_nao_confirmada",
+        origem_do_negocio=origem, campos_enviados=list(atualizar),
+        campos_confirmados=confirmados,
+        motivo="match_seguro",
+    )
+    print(f"[rd-retro-single] RESULTADO deal={deal_id} status={resultado['status']} "
+          f"campos_confirmados={confirmados}", flush=True)
     return resultado
 
 @app.route("/rd/retroativo/diagnostico/<int:deal_id>", methods=["GET"])
