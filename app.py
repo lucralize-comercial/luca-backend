@@ -1672,6 +1672,7 @@ RD_ORIGEM_DE_PARA = {
     "Transformação do MEI": "Transformação do MEI",
     "whatsapp_pagina": "whatsapp_pagina",
     "leo-marconi": "leo-marconi",
+    "ei-dev-nao-precisa-perder-tempo-com-burocracia": "ei-dev-nao-precisa-perder-tempo-com-burocracia",
     "Formulário Meta Afiliados - Alexia": "Formulário Meta Afiliados - Alexia",
 }
 
