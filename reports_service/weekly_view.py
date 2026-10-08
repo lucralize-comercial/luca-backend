@@ -39,22 +39,22 @@ def renderizar_semanal_html(apresentacao: dict[str, Any]) -> str:
 <meta name="robots" content="noindex,nofollow">
 <title>Relatório semanal comercial</title>
 <style>
-:root{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:#17223b;background:#f4f6f9}
-*{box-sizing:border-box}body{margin:0;padding:32px 18px}
-main{max-width:950px;margin:auto;background:#fff;padding:42px;border-radius:18px;box-shadow:0 6px 25px #12223b12}
-header{border-bottom:1px solid #e7ebf0;padding-bottom:24px;margin-bottom:24px}
-h1{font-size:24px;letter-spacing:.03em;margin:0 0 8px}
-.period{color:#697386;font-size:14px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:20px 0 30px}
-.metric{background:#f4f6f9;border-radius:12px;padding:20px}
-.metric-title,.previous{color:#667084;font-size:13px}
-.metric-value{font-size:38px;font-weight:750;margin:9px 0}
-.metric-delta{font-weight:650;color:#273a66}.previous{margin-top:5px}
-section{border-top:1px solid #e7ebf0;padding:20px 0}
-h2{font-size:18px;margin:0 0 13px}p,li{font-size:15px;line-height:1.65}
-li{margin:7px 0}ul,ol{padding-left:23px}
-footer{color:#697386;font-size:12px;margin-top:20px}
-@media(max-width:640px){main{padding:23px}body{padding:10px}.cards{grid-template-columns:1fr}.metric-value{font-size:30px}}
-@media print{body{padding:0;background:#fff}main{box-shadow:none;padding:0;max-width:none}section{break-inside:avoid}}
+:root{{font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:#17223b;background:#f4f6f9}}
+*{{box-sizing:border-box}}body{{margin:0;padding:32px 18px}}
+main{{max-width:950px;margin:auto;background:#fff;padding:42px;border-radius:18px;box-shadow:0 6px 25px #12223b12}}
+header{{border-bottom:1px solid #e7ebf0;padding-bottom:24px;margin-bottom:24px}}
+h1{{font-size:24px;letter-spacing:.03em;margin:0 0 8px}}
+.period{{color:#697386;font-size:14px}}.cards{{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:20px 0 30px}}
+.metric{{background:#f4f6f9;border-radius:12px;padding:20px}}
+.metric-title,.previous{{color:#667084;font-size:13px}}
+.metric-value{{font-size:38px;font-weight:750;margin:9px 0}}
+.metric-delta{{font-weight:650;color:#273a66}}.previous{{margin-top:5px}}
+section{{border-top:1px solid #e7ebf0;padding:20px 0}}
+h2{{font-size:18px;margin:0 0 13px}}p,li{{font-size:15px;line-height:1.65}}
+li{{margin:7px 0}}ul,ol{{padding-left:23px}}
+footer{{color:#697386;font-size:12px;margin-top:20px}}
+@media(max-width:640px){{main{{padding:23px}}body{{padding:10px}}.cards{{grid-template-columns:1fr}}.metric-value{{font-size:30px}}}}
+@media print{{body{{padding:0;background:#fff}}main{{box-shadow:none;padding:0;max-width:none}}section{{break-inside:avoid}}}}
 </style></head><body><main>
 <header><h1>{title}</h1><div class="period">{inicio} a {fim}</div></header>
 <div class="cards">{cards}</div>
