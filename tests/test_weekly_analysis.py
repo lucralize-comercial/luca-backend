@@ -200,5 +200,39 @@ class WeeklyAnalysisTests(unittest.TestCase):
                          [{"etapa": "Follow-up", "quantidade": 1}])
 
 
+    def test_weekly_delivery_deduplicates_without_claude(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from reports_service.weekly_delivery import executar_envio_semanal
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.dict("os.environ", {"REPORT_SEND_ENABLED": "true",
+                        "TEAMS_WEBHOOK_SEMANAL_PRIVADO": "https://example.test/teams"}):
+            generate = Mock(return_value={"apresentacao": {
+                "periodo": {"inicio": "2026-10-05", "fim": "2026-10-11"},
+                "cards": [{"titulo": x, "valor": 1, "comparacao": "0%",
+                           "anterior": 1} for x in ("Leads", "Reuniões", "Ganhos", "Perdidos")],
+                **ANALISE}})
+            post = Mock(return_value=SimpleNamespace(raise_for_status=lambda: None))
+            now = datetime(2026, 10, 12, 8, 15, tzinfo=ZoneInfo("America/Sao_Paulo"))
+            first = executar_envio_semanal(now=now, generate=generate, post=post,
+                                           db_path=str(Path(folder) / "weekly.sqlite"))
+            second = executar_envio_semanal(now=now, generate=generate, post=post,
+                                            db_path=str(Path(folder) / "weekly.sqlite"))
+            self.assertEqual(first["status"], "sent")
+            self.assertEqual(second["status"], "already_attempted")
+            generate.assert_called_once()
+            post.assert_called_once()
+
+    def test_weekly_delivery_disabled_never_calls_ai(self):
+        from reports_service.weekly_delivery import executar_envio_semanal
+        from unittest.mock import Mock
+        with patch.dict("os.environ", {"REPORT_SEND_ENABLED": "false"}):
+            generate = Mock()
+            self.assertEqual(executar_envio_semanal(generate=generate)["status"], "disabled")
+            generate.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
