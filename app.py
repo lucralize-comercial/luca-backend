@@ -2357,7 +2357,7 @@ def rd_retroativo_aplicar():
 RD_RETRO_SINGLE_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
 
 def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True):
-    """Revalida e, se seguro, preenche somente origem_do_negocio de um deal."""
+    """Revalida e preenche somente campos RD vazios de um deal com match seguro."""
     token = _rd_obter_access_token()
     rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     resultado = {
@@ -2374,13 +2374,6 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True):
     stage = deal.get("dealStage") or {}
     if ((stage.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
         resultado["motivo"] = "fora_funil_comercial"
-        return resultado
-
-    custom = deal.get("customFields") or {}
-    atual = _rd_valor_atual(custom, "origem_do_negocio")
-    if atual not in (None, "", [], {}):
-        resultado.update(status="ja_preenchido", origem_do_negocio=atual,
-                         motivo="origem_ja_preenchida")
         return resultado
 
     dt_deal = _rd_parse_iso(deal.get("startTime"))
@@ -2457,10 +2450,6 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True):
     origem = _rd_mapear_origem_negocio(dados.get("identificador"))
     resultado["identificador_rd"] = dados.get("identificador")
     resultado["diferenca_seg"] = round(diff, 1)
-    if not origem:
-        resultado["motivo"] = "identificador_fora_depara"
-        return resultado
-
     r_final = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
                            params={"withCustomFields": "true"}, timeout=20)
     r_final.raise_for_status()
@@ -2471,22 +2460,34 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True):
         return resultado
 
     custom_final = deal_final.get("customFields") or {}
-    atual_final = _rd_valor_atual(custom_final, "origem_do_negocio")
-    if atual_final not in (None, "", [], {}):
-        resultado.update(status="ja_preenchido", origem_do_negocio=atual_final,
-                         motivo="origem_preenchida_antes_escrita")
+    desejados = {
+        "origem_do_negocio": origem,
+        "origem": dados.get("utm_source"),
+        "campanha": dados.get("utm_campaign"),
+        "grupo_de_anuncio": dados.get("utm_term"),
+        "anuncio": dados.get("utm_content"),
+        "meta_ads_source_id": dados.get("utm_id"),
+    }
+    atualizar = {
+        slug: str(valor).strip()
+        for slug, valor in desejados.items()
+        if valor is not None and str(valor).strip()
+        and _rd_valor_atual(custom_final, slug) in (None, "", [], {})
+    }
+    if not atualizar:
+        resultado.update(status="ja_preenchido", motivo="nenhum_campo_rd_vazio_com_valor")
         return resultado
 
     r_put = requests.put(
         f"{AGENDOR_BASE}/deals/{deal_id}",
         headers={**HEADERS, "Content-Type": "application/json"},
-        json={"customFields": {"origem_do_negocio": origem}}, timeout=20)
+        json={"customFields": atualizar}, timeout=20)
     r_put.raise_for_status()
 
-    resultado.update(status="atualizado", origem_do_negocio=origem, motivo="match_seguro")
+    resultado.update(status="atualizado", origem_do_negocio=origem,
+                     campos_atualizados=list(atualizar), motivo="match_seguro")
     print(f"[rd-retro-single] ATUALIZADO {json.dumps(resultado, ensure_ascii=False)}", flush=True)
     return resultado
-
 
 @app.route("/rd/retroativo/aplicar/<int:deal_id>", methods=["POST"])
 def rd_retroativo_aplicar_deal(deal_id):
