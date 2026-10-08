@@ -1,0 +1,27 @@
+name: Weekly commercial report tests
+
+on:
+  push:
+    branches:
+      - feature/luca-reports-fase1
+    paths:
+      - 'reports_service/**'
+      - 'tests/test_weekly_analysis.py'
+      - '.github/workflows/weekly-reports-tests.yml'
+  pull_request:
+    paths:
+      - 'reports_service/**'
+      - 'tests/test_weekly_analysis.py'
+
+jobs:
+  weekly-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Validate weekly report contract
+        run: python -m unittest discover -s tests -p 'test_weekly_analysis.py' -v
