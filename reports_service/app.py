@@ -18,8 +18,6 @@ _weekly_last_run = None
 
 
 def _authorized() -> bool:
-    if REPORT_ALLOW_UNAUTHENTICATED_TEST:
-        return True
     if not REPORT_TEST_KEY:
         return False
     supplied = request.headers.get("X-API-Key", "")
