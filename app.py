@@ -1260,6 +1260,7 @@ def fetch_deals():
     # pelo cache persistente. O cache progressivo acima substitui cache["deals"],
     # então depender só dele fazia os produtos desaparecerem após uma nova carga.
     products_cache = _carregar_products_cache()
+    print(f"[products-cache] carregado arquivo={AGENDOR_PRODUCTS_CACHE_FILE} entradas={len(products_cache)}", flush=True)
     produtos_anteriores = {
         str(d.get("id")): d.get("products_entities")
         for d in (cache.get("deals") or [])
@@ -1322,6 +1323,12 @@ def fetch_deals():
                     products_cache_changed = True
         except Exception as e:
             print(f"Erro produtos {deal['id']}: {e}", flush=True)
+        # Checkpoint progressivo: reinicios durante as consultas nao perdem
+        # todos os produtos ja obtidos. Evita repetir centenas de GETs.
+        if products_cache_changed and consultas_agendor > 0 and consultas_agendor % 10 == 0:
+            _salvar_products_cache(products_cache)
+            products_cache_changed = False
+            print(f"[products-cache] checkpoint consultas={consultas_agendor} entradas={len(products_cache)}", flush=True)
         time.sleep(float(os.environ.get("AGENDOR_PRODUCTS_PACE_SECONDS", "1.50")))
     if products_cache_changed:
         _salvar_products_cache(products_cache)
