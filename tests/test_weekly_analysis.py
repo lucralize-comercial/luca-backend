@@ -2,6 +2,7 @@
 import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
 
 from reports_service.weekly_view import renderizar_semanal_html
 from reports_service.weekly_analysis import (
@@ -79,6 +80,23 @@ class WeeklyAnalysisTests(unittest.TestCase):
     def test_html_requires_three_cards(self):
         with self.assertRaises(ValueError):
             renderizar_semanal_html({"cards": []})
+
+    def test_weekly_visual_requires_key_even_with_test_bypass(self):
+        from reports_service import app as app_module
+        with patch.object(app_module, "REPORT_ALLOW_UNAUTHENTICATED_TEST", True), \
+             patch.object(app_module, "REPORT_TEST_KEY", "test-secret"):
+            client = app_module.app.test_client()
+            self.assertEqual(
+                client.get("/reports/semanal/visual/teste?ia=1").status_code, 401
+            )
+            self.assertEqual(
+                client.get("/reports/semanal/visual/teste?ia=1",
+                           headers={"X-API-Key": "wrong"}).status_code, 401
+            )
+            self.assertEqual(
+                client.get("/reports/semanal/visual/teste",
+                           headers={"X-API-Key": "test-secret"}).status_code, 400
+            )
 
     def test_ten_days_inclusive(self):
         results = _open_pipeline([{
