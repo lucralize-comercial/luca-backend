@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from reports_service.weekly_view import renderizar_semanal_html
 from reports_service.weekly_analysis import (
     _validar_analise, _week_window, _open_pipeline,
     montar_apresentacao_semanal,
@@ -55,6 +56,29 @@ class WeeklyAnalysisTests(unittest.TestCase):
         self.assertEqual(rendered["cards"][0]["comparacao"], "↓ 25,6%")
         self.assertEqual(rendered["sinal_proxima_semana"],
                          ANALISE["sinal_proxima_semana"])
+
+    def test_html_preview_and_escaping(self):
+        presentation = {
+            "titulo": "ACOMPANHAMENTO COMERCIAL",
+            "periodo": {"inicio": "2026-10-01", "fim": "2026-10-07"},
+            "cards": [
+                {"titulo": "Leads", "valor": 58, "comparacao": "↓ 25,6%", "anterior": 78},
+                {"titulo": "Reuniões", "valor": 7, "comparacao": "↓ 12,5%", "anterior": 8},
+                {"titulo": "Perdidos", "valor": 49, "comparacao": "↓ 51,5%", "anterior": 101},
+            ],
+            **ANALISE,
+            "leitura_gestor": "<script>alert(1)</script>",
+        }
+        html = renderizar_semanal_html(presentation)
+        self.assertIn("ACOMPANHAMENTO COMERCIAL", html)
+        self.assertIn("58", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>", html)
+        self.assertIn("Ações recomendadas", html)
+
+    def test_html_requires_three_cards(self):
+        with self.assertRaises(ValueError):
+            renderizar_semanal_html({"cards": []})
 
     def test_ten_days_inclusive(self):
         results = _open_pipeline([{
