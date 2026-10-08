@@ -95,3 +95,8 @@ def executar_envio_semanal(*, now: datetime | None = None, generate=gerar_relato
         db.execute("UPDATE weekly_dispatch SET state='sent' WHERE week_key=?", (period_key,))
         db.commit()
     return {"status": "sent", "week_key": period_key}
+
+
+if __name__ == "__main__":
+    result = executar_envio_semanal()
+    print(json.dumps(result, ensure_ascii=False))
