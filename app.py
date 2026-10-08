@@ -2015,7 +2015,6 @@ def _rd_dryrun_executar(dias=30, limite=250):
                     identificador = str(dados.get("identificador") or "(vazio)").strip() or "(vazio)"
                     fora = resumo["identificadores_fora_depara"]
                     fora[identificador] = fora.get(identificador, 0) + 1
-                    continue
                 resumo["match_seguro"] += 1
 
                 desejados = {
@@ -2928,8 +2927,7 @@ def _rd_enriquecer_deal(deal_id, dados):
     """Preenche apenas campos existentes e vazios; nunca sobrescreve."""
     origem_negocio = _rd_mapear_origem_negocio(dados.get("identificador"))
     if not origem_negocio:
-        print(f"[rd-write] IGNORADO_IDENTIFICADOR — {dados.get('identificador')!r} não está no DE/PARA", flush=True)
-        return False
+        print(f"[rd-write] identificador sem mapeamento: preenchimento limitado aos campos UTM", flush=True)
 
     try:
         r = requests.get(
@@ -2993,10 +2991,6 @@ def _rd_enriquecer_deal(deal_id, dados):
 
 def _rd_correlacionar_e_enriquecer(dados):
     """Localiza candidato inequívoco e, somente então, enriquece o negócio."""
-    if not _rd_mapear_origem_negocio(dados.get("identificador")):
-        print(f"[rd-match] IGNORADO_IDENTIFICADOR — {dados.get('identificador')!r} fora do DE/PARA; nada será alterado", flush=True)
-        return
-
     for tentativa, espera in enumerate((10, 20, 30, 60, 90, 90), start=1):
         time.sleep(espera)
         pessoas = _rd_buscar_pessoas(dados["email"], dados["telefone_norm"])
