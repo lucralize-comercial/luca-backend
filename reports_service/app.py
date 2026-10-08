@@ -49,6 +49,7 @@ def semanal_test():
         return jsonify({"error": str(exc)}), 500
 
 
+# Preview visual reservado à gestão; não envia mensagens nem agenda execuções.
 @app.get("/reports/semanal/visual/teste")
 def semanal_visual_test():
     # Relatório gerencial: nunca permite bypass por REPORT_ALLOW_UNAUTHENTICATED_TEST.
