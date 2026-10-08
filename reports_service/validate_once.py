@@ -5,12 +5,13 @@ do Agendor nem texto da IA em logs; apenas resumo técnico e tokens.
 """
 import json
 import os
+import sys
 from .weekly_analysis import gerar_relatorio_semanal
 from .weekly_view import renderizar_semanal_html
 
 
 def main():
-    if os.environ.get("REPORT_REAL_SMOKE_ONCE") != "enabled":
+    if "--run-once" not in sys.argv:
         print("WEEKLY_REAL_SMOKE=SKIPPED (not enabled)")
         return
     report = gerar_relatorio_semanal(usar_ia=True)
