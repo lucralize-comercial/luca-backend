@@ -427,6 +427,12 @@ def montar_apresentacao_semanal(pacote: dict[str, Any], ia_result: dict[str, Any
                 "anterior": indicadores["reunioes"]["anterior"],
             },
             {
+                "titulo": "Ganhos",
+                "valor": indicadores["ganhos"]["valor"],
+                "comparacao": _fmt_delta(indicadores["ganhos"]),
+                "anterior": indicadores["ganhos"]["anterior"],
+            },
+            {
                 "titulo": "Perdidos",
                 "valor": indicadores["perdidos"]["valor"],
                 "comparacao": _fmt_delta(indicadores["perdidos"]),
