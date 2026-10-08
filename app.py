@@ -1299,6 +1299,13 @@ def fetch_deals():
     if not enriquecer_produtos:
         print(f"[fetch_deals] produtos adiados durante retroativo status={retro_status}", flush=True)
         won_recent = []
+    # Rota /deals/{id}/products retornou 404 em 3 consultas consecutivas.
+    # Desabilitada por padrao ate confirmacao oficial; habilitar somente
+    # com AGENDOR_PRODUCTS_ENDPOINT_ENABLED=true apos validar a rota.
+    if os.environ.get("AGENDOR_PRODUCTS_ENDPOINT_ENABLED", "false").lower() != "true":
+        print("[products-cache] consultas desabilitadas: endpoint de produtos nao confirmado (HTTP 404)", flush=True)
+        won_recent = []
+        enriquecer_produtos = False
     products_cache_changed = False
     reaproveitados = 0
     consultas_agendor = 0
