@@ -2903,6 +2903,21 @@ def rd_retroativo_automatico():
         }), 200
     if request.headers.get("X-Confirm-Write", "") != RD_RETRO_AUTO_CONFIRM:
         return jsonify({"status": "confirmacao_necessaria"}), 409
+    # A validação operacional é uma trava real, não apenas um indicador no painel.
+    # Não impede a execução limitada em /automatico/validar.
+    operacional = _ler_validacao_operacional()
+    atualizado = _rd_parse_iso(operacional.get("updated_at"))
+    if atualizado is not None and atualizado.tzinfo is None:
+        atualizado = atualizado.replace(tzinfo=timezone.utc)
+    if (operacional.get("retroativo_liberado") is not True
+            or atualizado is None
+            or (datetime.now(timezone.utc) - atualizado.astimezone(timezone.utc)).total_seconds() > 21600):
+        return jsonify({
+            "status": "bloqueado_validacao_operacional",
+            "mensagem": "Retroativo completo exige validacao operacional aprovada nas ultimas 6 horas.",
+            "validacao": operacional.get("status", "ausente"),
+            "motivos": operacional.get("motivos", []),
+        }), 409
     persistido = _rd_retro_auto_carregar()
     if persistido.get("status") == "concluido":
         return jsonify({"status": "ja_concluido", "resumo": persistido.get("resumo")}), 200
