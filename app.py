@@ -1299,67 +1299,31 @@ def fetch_deals():
     if not enriquecer_produtos:
         print(f"[fetch_deals] produtos adiados durante retroativo status={retro_status}", flush=True)
         won_recent = []
-    # Rota /deals/{id}/products retornou 404 em 3 consultas consecutivas.
-    # Desabilitada por padrao ate confirmacao oficial; habilitar somente
-    # com AGENDOR_PRODUCTS_ENDPOINT_ENABLED=true apos validar a rota.
-    if os.environ.get("AGENDOR_PRODUCTS_ENDPOINT_ENABLED", "false").lower() != "true":
-        print("[products-cache] consultas desabilitadas: endpoint de produtos nao confirmado (HTTP 404)", flush=True)
-        won_recent = []
-        enriquecer_produtos = False
-    products_cache_changed = False
+    # A API V3 inclui products_entities no proprio GET /deals.
+    # Nao consultar /deals/{id}/products: essa rota nao existe.
+    # O enriquecimento usa apenas os dados ja obtidos na paginacao.
     reaproveitados = 0
-    consultas_agendor = 0
-    products_http_status = {}
-    falhas_consecutivas = 0
+    disponiveis = 0
     for deal in won_recent:
-        if falhas_consecutivas >= 3:
-            print(f"[products-cache] consultas interrompidas apos 3 falhas consecutivas; status={products_http_status}", flush=True)
-            break
         deal_id = str(deal.get("id"))
-        signature = _deal_products_signature(deal)
-        salvo = products_cache.get(deal_id) if deal_id else None
-        if isinstance(salvo, dict) and isinstance(salvo.get("products"), list):
-            deal["products_entities"] = salvo["products"]
-            reaproveitados += 1
-            if salvo.get("signature") != signature:
-                products_cache[deal_id] = {"signature": signature, "products": salvo["products"]}
-                products_cache_changed = True
+        products = deal.get("products_entities")
+        if not isinstance(products, list):
             continue
-        try:
-            consultas_agendor += 1
-            r = requests.get(f"{AGENDOR_BASE}/deals/{deal['id']}/products", headers=HEADERS, timeout=15)
-            products_http_status[str(r.status_code)] = products_http_status.get(str(r.status_code), 0) + 1
-            if r.status_code == 200:
-                falhas_consecutivas = 0
-                products = r.json().get("data", [])
-                if not isinstance(products, list):
-                    products = []
-                deal["products_entities"] = products
-                if deal_id:
-                    products_cache[deal_id] = {"signature": signature, "products": products}
-                    products_cache_changed = True
-            else:
-                falhas_consecutivas += 1
-                print(f"[products-cache] HTTP {r.status_code} na consulta de produtos (sem payload); falhas_consecutivas={falhas_consecutivas}", flush=True)
-        except Exception as e:
-            falhas_consecutivas += 1
-            print(f"Erro produtos {deal['id']}: {type(e).__name__}: {str(e)[:140]}", flush=True)
-        # Checkpoint progressivo: reinicios durante as consultas nao perdem
-        # todos os produtos ja obtidos. Evita repetir centenas de GETs.
-        if products_cache_changed and consultas_agendor > 0 and consultas_agendor % 10 == 0:
-            _salvar_products_cache(products_cache)
-            products_cache_changed = False
-            print(f"[products-cache] checkpoint consultas={consultas_agendor} entradas={len(products_cache)}", flush=True)
-        time.sleep(float(os.environ.get("AGENDOR_PRODUCTS_PACE_SECONDS", "1.50")))
-    if products_cache_changed:
+        disponiveis += 1
+        salvo = products_cache.get(deal_id)
+        signature = _deal_products_signature(deal)
+        if isinstance(salvo, dict) and salvo.get("products") == products:
+            reaproveitados += 1
+            continue
+        products_cache[deal_id] = {"signature": signature, "products": products}
+    if disponiveis:
         _salvar_products_cache(products_cache)
-    if enriquecer_produtos:
-        print(f"[products-cache] elegiveis={len(won_recent)} reaproveitados={reaproveitados} consultas_agendor={consultas_agendor} http_status={products_http_status}", flush=True)
-        _registrar_validacao_operacional(
-            elegiveis=len(won_recent),
-            reaproveitados=reaproveitados,
-            consultas_agendor=consultas_agendor,
-        )
+    print(f"[products-cache] pela_lista negocios_com_produtos_disponiveis={disponiveis} "
+          f"elegiveis={len(won_recent)} reaproveitados={reaproveitados} "
+          "consultas_adicionais=0", flush=True)
+    # Nao usar uma taxa artificial de reutilizacao para liberar retroativo:
+    # validacao operacional exige verificacoes especificas da integracao RD.
+
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # Desativado: endpoint /deals/{id}/history retorna 404 na API v3 do Agendor
