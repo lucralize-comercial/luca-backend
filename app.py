@@ -2385,7 +2385,7 @@ def rd_retroativo_aplicar():
 # ── RD Station: reprocessamento isolado de 1 negócio ──────────────────────────
 RD_RETRO_SINGLE_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
 
-def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True):
+def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=False):
     """Revalida e preenche somente campos RD vazios de um deal com match seguro."""
     token = _rd_obter_access_token()
     rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -2503,6 +2503,46 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True):
         if valor is not None and str(valor).strip()
         and _rd_valor_atual(custom_final, slug) in (None, "", [], {})
     }
+    if diagnostico:
+        # Diagnóstico estritamente de leitura. Não expõe contato ou payload RD.
+        campos = {}
+        for slug, valor in desejados.items():
+            atual = _rd_valor_atual(custom_final, slug)
+            rd_disponivel = valor is not None and bool(str(valor).strip())
+            preenchido = atual not in (None, "", [], {})
+            campos[slug] = {
+                "rd_disponivel": rd_disponivel,
+                "agendor_preenchido": preenchido,
+                "preenchimento_pendente": rd_disponivel and not preenchido,
+                "motivo": ("sem_valor_rd" if not rd_disponivel else
+                           "ja_preenchido" if preenchido else "pronto_para_preencher"),
+            }
+        # Consulta endpoint documentado das opções selecionáveis.
+        origem_opcao = {"encontrada": False, "id": None, "campo_encontrado": False}
+        try:
+            r_campos = requests.get(
+                f"{AGENDOR_BASE}/custom_fields/deals", headers=HEADERS, timeout=15)
+            r_campos.raise_for_status()
+            for campo in (r_campos.json().get("data") or []):
+                if campo.get("identifier") != "origem_do_negocio":
+                    continue
+                origem_opcao["campo_encontrado"] = True
+                for opcao in (campo.get("options") or []):
+                    if str(opcao.get("name") or "").strip() == str(origem or "").strip():
+                        origem_opcao.update(encontrada=True, id=opcao.get("id"))
+                        break
+                break
+        except requests.RequestException:
+            origem_opcao["consulta_indisponivel"] = True
+        resultado.update(
+            status="diagnostico_somente_leitura",
+            motivo="sem_escrita",
+            origem_do_negocio=origem,
+            campos=campos,
+            opcao_agendor=origem_opcao,
+        )
+        return resultado
+
     if not atualizar:
         resultado.update(status="ja_preenchido", motivo="nenhum_campo_rd_vazio_com_valor")
         return resultado
@@ -2517,6 +2557,22 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True):
                      campos_atualizados=list(atualizar), motivo="match_seguro")
     print(f"[rd-retro-single] ATUALIZADO {json.dumps(resultado, ensure_ascii=False)}", flush=True)
     return resultado
+
+@app.route("/rd/retroativo/diagnostico/<int:deal_id>", methods=["GET"])
+def rd_retroativo_diagnostico_deal(deal_id):
+    """Diagnóstico autenticado e somente leitura; nunca modifica negócios."""
+    if not AGENDAR_API_KEY:
+        return jsonify({"status": "indisponivel"}), 503
+    if request.headers.get("X-API-Key", "") != AGENDAR_API_KEY:
+        return jsonify({"status": "nao_autorizado"}), 401
+    try:
+        return jsonify(_rd_retro_single_processar(
+            deal_id, aplicar_limite_dias=False, diagnostico=True)), 200
+    except Exception as e:
+        print(f"[rd-diagnostico] deal={deal_id} erro={type(e).__name__}", flush=True)
+        return jsonify({"status": "erro", "deal_id": deal_id,
+                        "tipo": type(e).__name__}), 502
+
 
 @app.route("/rd/retroativo/aplicar/<int:deal_id>", methods=["POST"])
 def rd_retroativo_aplicar_deal(deal_id):
