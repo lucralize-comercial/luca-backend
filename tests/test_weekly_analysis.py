@@ -152,6 +152,41 @@ class WeeklyAnalysisTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertNotIn("sensitive internal error", response.get_data(as_text=True))
 
+    def test_controlled_execution_rejects_unconfirmed_or_unauthorized(self):
+        from reports_service import app as module
+        with patch.object(module, "REPORT_TEST_KEY", "secret"):
+            client = module.app.test_client()
+            self.assertEqual(client.post("/reports/semanal/executar").status_code, 401)
+            self.assertEqual(client.post(
+                "/reports/semanal/executar", headers={"X-API-Key": "secret"}
+            ).status_code, 400)
+
+    def test_controlled_execution_is_cost_guarded_and_no_send(self):
+        from reports_service import app as module
+        presentation = {
+            "titulo": "ACOMPANHAMENTO COMERCIAL",
+            "periodo": {"inicio": "2026-10-01", "fim": "2026-10-07"},
+            "cards": [
+                {"titulo": "Leads", "valor": 58, "comparacao": "↓ 25,6%", "anterior": 78},
+                {"titulo": "Reuniões", "valor": 7, "comparacao": "↓ 12,5%", "anterior": 8},
+                {"titulo": "Perdidos", "valor": 49, "comparacao": "↓ 51,5%", "anterior": 101},
+            ],
+            **ANALISE,
+        }
+        report = {"apresentacao": presentation,
+                  "ia": {"modelo": "mock", "uso": {"input_tokens": 3}}}
+        headers = {"X-API-Key": "secret", "X-Confirm-Execution": "EXECUTAR_SEMANAL"}
+        with patch.object(module, "REPORT_TEST_KEY", "secret"), \
+             patch.object(module, "_weekly_last_run", None), \
+             patch.object(module, "gerar_relatorio_semanal", return_value=report) as gerar:
+            client = module.app.test_client()
+            first = client.post("/reports/semanal/executar", headers=headers)
+            second = client.post("/reports/semanal/executar", headers=headers)
+            self.assertEqual(first.status_code, 200)
+            self.assertFalse(first.json["sent"])
+            self.assertEqual(second.status_code, 429)
+            gerar.assert_called_once_with(usar_ia=True)
+
     def test_ten_days_inclusive(self):
         results = _open_pipeline([{
             "dealStage": {"name": "Follow-up"},
