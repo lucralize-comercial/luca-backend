@@ -20,8 +20,8 @@ def _items(values: Any, *, ordered: bool = False) -> str:
 def renderizar_semanal_html(apresentacao: dict[str, Any]) -> str:
     """Retorna uma página completa; escapa todo conteúdo originado da IA."""
     cards = apresentacao.get("cards") or []
-    if len(cards) != 3:
-        raise ValueError("A apresentação semanal exige exatamente três cards.")
+    if len(cards) != 4:
+        raise ValueError("A apresentação semanal exige exatamente quatro cards.")
     periodo = apresentacao.get("periodo") or {}
     cards_html = "".join(
         '<article class="metric"><div class="metric-title">{}</div>'
@@ -44,7 +44,7 @@ def renderizar_semanal_html(apresentacao: dict[str, Any]) -> str:
 main{{max-width:950px;margin:auto;background:#fff;padding:42px;border-radius:18px;box-shadow:0 6px 25px #12223b12}}
 header{{border-bottom:1px solid #e7ebf0;padding-bottom:24px;margin-bottom:24px}}
 h1{{font-size:24px;letter-spacing:.03em;margin:0 0 8px}}
-.period{{color:#697386;font-size:14px}}.cards{{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:20px 0 30px}}
+.period{{color:#697386;font-size:14px}}.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:20px 0 30px}}
 .metric{{background:#f4f6f9;border-radius:12px;padding:20px}}
 .metric-title,.previous{{color:#667084;font-size:13px}}
 .metric-value{{font-size:38px;font-weight:750;margin:9px 0}}
