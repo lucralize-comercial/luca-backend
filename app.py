@@ -1233,6 +1233,13 @@ def _ler_validacao_operacional():
 
 def fetch_deals():
     print("Buscando negocios do Agendor...", flush=True)
+    # Snapshot antes da publicação progressiva: sem isso, a leitura posterior
+    # de cache["deals"] só encontra as páginas novas sem produtos enriquecidos.
+    produtos_snapshot = {
+        str(d.get("id")): d.get("products_entities")
+        for d in (cache.get("deals") or [])
+        if d.get("id") is not None and isinstance(d.get("products_entities"), list)
+    }
     all_deals = []
     page = 1
     total_count = None
@@ -1261,11 +1268,7 @@ def fetch_deals():
     # então depender só dele fazia os produtos desaparecerem após uma nova carga.
     products_cache = _carregar_products_cache()
     print(f"[products-cache] carregado arquivo={AGENDOR_PRODUCTS_CACHE_FILE} entradas={len(products_cache)}", flush=True)
-    produtos_anteriores = {
-        str(d.get("id")): d.get("products_entities")
-        for d in (cache.get("deals") or [])
-        if d.get("id") is not None and "products_entities" in d
-    }
+    produtos_anteriores = produtos_snapshot
     for deal in all_deals:
         deal_id = str(deal.get("id")) if deal.get("id") is not None else None
         produtos = produtos_anteriores.get(deal_id) if deal_id else None
