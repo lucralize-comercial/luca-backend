@@ -1728,7 +1728,12 @@ def _rd_resolver_origem_id(identificador):
         if time.monotonic() - ultima < RD_ORIGENS_CACHE_TTL:
             return None
         _rd_origens_cache["misses"][nome] = time.monotonic()
-    opcoes = _rd_opcoes_origem(force=True)
+    try:
+        opcoes = _rd_opcoes_origem(force=True)
+    except Exception:
+        with _rd_origens_cache_lock:
+            _rd_origens_cache["misses"].pop(nome, None)
+        raise
     return opcoes.get(nome)
 
 
