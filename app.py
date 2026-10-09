@@ -1345,6 +1345,7 @@ def fetch_deals():
 
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cache["_rd_annual_audit_ready"] = True
     # Processamento único de UTMs elegíveis, limitado ao cohort validado.
     _rd_utm_backfill_iniciar()
     # Desativado: endpoint /deals/{id}/history retorna 404 na API v3 do Agendor
@@ -2719,7 +2720,7 @@ def _rd_audit_2026():
                 os.fsync(fh.fileno())
             os.replace(tmp,_RD_AUDIT_FILE)
         if "ids" not in state:
-            if not cache.get("deals") or not cache.get("updated_at"):
+            if not cache.get("_rd_annual_audit_ready"):
                 return
             ids=[]
             for d in cache["deals"]:
