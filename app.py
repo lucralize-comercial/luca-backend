@@ -3767,6 +3767,10 @@ def buscar_pessoa_e_negocio(phone):
             if attempt < 2:
                 time.sleep(3)
     if not pessoas:
+        # Se a consulta falhou após todas as tentativas, não presumir pessoa
+        # inexistente: criar outra pessoa/negócio aqui causaria duplicidade.
+        if 'r' not in locals() or r.status_code != 200:
+            raise RuntimeError("Agendor: busca de pessoas indisponivel; criacao bloqueada")
         return None, None
 
     # IMPORTANTE: GET /deals?personId=X ignora o filtro e devolve negócios de
@@ -3788,6 +3792,8 @@ def buscar_pessoa_e_negocio(phone):
                       f"person={person.get('id')}: {e}", flush=True)
                 if attempt < 2:
                     time.sleep(3)
+        if 'r2' not in locals() or r2.status_code != 200:
+            raise RuntimeError("Agendor: busca de negocios indisponivel; criacao bloqueada")
         deals_comercial = [
             d for d in deals
             if ((d.get("dealStage") or {}).get("funnel") or {}).get("id") == FUNIL_COMERCIAL_ID
@@ -3937,6 +3943,22 @@ def criar_negocio_funil_comercial(person_id, nome: str):
     ETAPA_NOVO_LEAD_ID = 2835663
     titulo = f"{nome_final} - via Luca (WhatsApp)"
     try:
+        # Releitura imediatamente antes do POST. As integrações do RD e do
+        # Agendor podem criar um negócio enquanto o Luca está qualificando.
+        r_existentes = requests.get(
+            f"{AGENDOR_BASE}/people/{person_id}/deals", headers=HEADERS, timeout=15)
+        r_existentes.raise_for_status()
+        negocios_ativos = [
+            d for d in (r_existentes.json().get("data") or [])
+            if ((d.get("dealStage") or {}).get("funnel") or {}).get("id") == FUNIL_COMERCIAL_ID
+            and not d.get("wonAt") and not d.get("lostAt")
+        ]
+        if negocios_ativos:
+            existente = sorted(
+                negocios_ativos, key=lambda d: d.get("startTime") or "", reverse=True)[0]
+            print(f"[crm] Criação evitada: negócio comercial ativo já existe para pessoa={person_id}"
+                  f" deal={existente.get('id')}", flush=True)
+            return existente
         payload_deal = {
             "title": titulo,
             "dealStageId": ETAPA_NOVO_LEAD_ID,
