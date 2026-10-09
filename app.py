@@ -2692,6 +2692,87 @@ def rd_retroativo_aplicar_deal(deal_id):
                         "erro": f"{type(e).__name__}: {str(e)[:300]}"}), 502
 
 
+
+# Auditoria de 01/01 a 31/08/2026. GET apenas; persistida entre reinicios.
+_RD_AUDIT_FILE="/data/rd_jan_aug_2026.json"
+_RD_AUDIT_MUTEX=threading.Lock()
+def _rd_audit_2026():
+    if not _RD_AUDIT_MUTEX.acquire(blocking=False):
+        return
+    lock=None
+    try:
+        lock=_rd_retro_auto_process_lock()
+        if lock is None:
+            return
+        try:
+            with open(_RD_AUDIT_FILE,encoding="utf-8") as fh:
+                state=json.load(fh)
+        except FileNotFoundError:
+            state={}
+        if state.get("status")=="concluido":
+            return
+        def save():
+            tmp=_RD_AUDIT_FILE+".tmp"
+            with open(tmp,"w",encoding="utf-8") as fh:
+                json.dump(state,fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp,_RD_AUDIT_FILE)
+        if "ids" not in state:
+            if not cache.get("deals") or not cache.get("updated_at"):
+                return
+            ids=[]
+            for d in cache["deals"]:
+                if ((d.get("dealStage") or {}).get("funnel") or {}).get("id") != FUNIL_COMERCIAL_ID:
+                    continue
+                dt=_rd_parse_iso(d.get("startTime"))
+                if dt is None:
+                    continue
+                if dt.tzinfo is None:
+                    dt=dt.replace(tzinfo=timezone.utc)
+                if datetime(2026,1,1,tzinfo=timezone.utc)<=dt.astimezone(timezone.utc)<datetime(2026,9,1,tzinfo=timezone.utc):
+                    ids.append(int(d["id"]))
+            state={"status":"executando","ids":ids,"cursor":0,
+                   "resultado":{"processados":0,"recuperaveis":0,"sem_match":0,"ja_preenchidos":0,"erros":0}}
+            save()
+            print(f"[rd-audit-2026] inicio candidatos={len(ids)} somente_GET=true",flush=True)
+        ids=state["ids"]
+        start=int(state["cursor"])
+        for i in range(start,min(start+50,len(ids))):
+            try:
+                data=_rd_retro_single_processar(ids[i],aplicar_limite_dias=False,diagnostico=True)
+                campos=data.get("campos") or {}
+                if any(v.get("preenchimento_pendente") for v in campos.values()):
+                    state["resultado"]["recuperaveis"]+=1
+                elif campos:
+                    state["resultado"]["ja_preenchidos"]+=1
+                else:
+                    state["resultado"]["sem_match"]+=1
+            except requests.RequestException as ex:
+                state["resultado"]["erros"]+=1
+                save()
+                print(f"[rd-audit-2026] pausa_api cursor={i}/{len(ids)} erro={type(ex).__name__}",flush=True)
+                return
+            except Exception as ex:
+                state["resultado"]["erros"]+=1
+                print(f"[rd-audit-2026] erro item tipo={type(ex).__name__}",flush=True)
+            state["cursor"]=i+1
+            state["resultado"]["processados"]+=1
+            save()
+            time.sleep(2.0)
+        if state["cursor"]==len(ids):
+            state["status"]="concluido"
+            save()
+        print(f"[rd-audit-2026] status={state['status']} progresso={state['cursor']}/{len(ids)} resultado={json.dumps(state['resultado'])}",flush=True)
+    except Exception as ex:
+        print(f"[rd-audit-2026] falha={type(ex).__name__}",flush=True)
+    finally:
+        if lock is not None:
+            import fcntl
+            fcntl.flock(lock.fileno(),fcntl.LOCK_UN)
+            lock.close()
+        _RD_AUDIT_MUTEX.release()
+
 # ── RD Station: recuperação única e delimitada de UTMs históricas ──────────
 # Escopo fixo: coorte do dry-run de 08/10, 250 negócios e até 40 novas gravações.
 # Não criar, excluir, mesclar nem movimentar negócios.
@@ -7935,7 +8016,9 @@ scheduler.add_job(verificar_perdidos_d10_travados_safe, "interval", hours=3, id=
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "date", run_date=datetime.now() + timedelta(minutes=2), id="reconciliar_perdidos_d10_inicial")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.add_job(_rd_retro_auto_retomar_se_necessario, "interval", minutes=5, id="rd_retro_auto_retomada")
+scheduler.add_job(_rd_audit_2026, "interval", minutes=20, id="rd_2026_readonly_audit")
 scheduler.add_job(_rd_retro_auto_retomar_se_necessario, "date", run_date=datetime.now() + timedelta(minutes=10), id="rd_retro_auto_retomada_inicial")
+scheduler.add_job(_rd_audit_2026, "date", run_date=datetime.now() + timedelta(minutes=12), id="rd_2026_readonly_audit_inicial")
 scheduler.start()
 
 if __name__ == "__main__":
