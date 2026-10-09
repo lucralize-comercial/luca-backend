@@ -3752,6 +3752,7 @@ def buscar_pessoa_e_negocio(phone):
     e isso já causou falha real no fluxo (reunião/link não gerados)."""
     phone_clean = phone.replace("+", "").replace(" ", "").strip()
     pessoas = []
+    pessoas_consulta_ok = False
     for attempt in range(3):
         try:
             r = requests.get(f"{AGENDOR_BASE}/people", headers=HEADERS,
@@ -3760,6 +3761,7 @@ def buscar_pessoa_e_negocio(phone):
                 raise requests.exceptions.HTTPError(f"429 buscando pessoa phone={phone_clean}")
             r.raise_for_status()
             pessoas = r.json().get("data", [])
+            pessoas_consulta_ok = True
             break
         except Exception as e:
             print(f"[buscar_pessoa_e_negocio] Tentativa {attempt+1}/3 falhou (pessoas) "
@@ -3769,7 +3771,7 @@ def buscar_pessoa_e_negocio(phone):
     if not pessoas:
         # Se a consulta falhou após todas as tentativas, não presumir pessoa
         # inexistente: criar outra pessoa/negócio aqui causaria duplicidade.
-        if 'r' not in locals() or r.status_code != 200:
+        if not pessoas_consulta_ok:
             raise RuntimeError("Agendor: busca de pessoas indisponivel; criacao bloqueada")
         return None, None
 
@@ -3778,6 +3780,7 @@ def buscar_pessoa_e_negocio(phone):
     # filtra corretamente.
     for person in pessoas:
         deals = []
+        deals_consulta_ok = False
         for attempt in range(3):
             try:
                 r2 = requests.get(f"{AGENDOR_BASE}/people/{person.get('id')}/deals",
@@ -3786,13 +3789,14 @@ def buscar_pessoa_e_negocio(phone):
                     raise requests.exceptions.HTTPError(f"429 buscando deals person={person.get('id')}")
                 r2.raise_for_status()
                 deals = r2.json().get("data", [])
+                deals_consulta_ok = True
                 break
             except Exception as e:
                 print(f"[buscar_pessoa_e_negocio] Tentativa {attempt+1}/3 falhou (deals) "
                       f"person={person.get('id')}: {e}", flush=True)
                 if attempt < 2:
                     time.sleep(3)
-        if 'r2' not in locals() or r2.status_code != 200:
+        if not deals_consulta_ok:
             raise RuntimeError("Agendor: busca de negocios indisponivel; criacao bloqueada")
         deals_comercial = [
             d for d in deals
