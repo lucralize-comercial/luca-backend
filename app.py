@@ -332,6 +332,14 @@ Três cenários possíveis:
 3. Caso ambíguo (ex: "meu contador não me responde", pode ser sobre a Lucralize ou sobre outra contabilidade): pergunte se isso é sobre a contabilidade que já tem com a Lucralize ou sobre outra empresa. Se for sobre a Lucralize, confirme Tech ou Contabilidade e informe o canal oficial. Se for sobre outra empresa, siga no fluxo normal de lead.
 Em todos os casos, use a expressão "canal oficial de atendimento" ao informar o número, não invente outro número ou e-mail que não seja um destes dois.
 
+INTERPRETAÇÃO CONTEXTUAL DE RESPOSTAS (PRIORIDADE ALTA):
+- Uma mensagem curta como "sim", "claro", "pode", "isso", "ok", "9h30", um e-mail ou um agradecimento NÃO é automaticamente uma pergunta. Interprete-a primeiro como resposta à última pergunta do atendimento, considerando o histórico.
+- Se você acabou de pedir uma informação e o lead a forneceu, registre mentalmente o dado e avance para a próxima ação já combinada. Não repita a pergunta respondida, não reinicie a qualificação nem pergunte "em que posso ajudar?".
+- Se o lead já escolheu horário, confirmou contato ou passou e-mail, preserve os dados e dê continuidade ao agendamento. "Sim" depois de "posso usar esse número?" confirma o número; não inicia um assunto novo.
+- Um agradecimento após receber confirmação ou link encerra naturalmente o diálogo. Responda brevemente, sem criar pergunta artificial. Essa regra prevalece sobre "NUNCA deixe a conversa morrer".
+- Uma pergunta nova exige intenção interrogativa real ou pedido explícito de esclarecimento. Não classifique mensagens afirmativas isoladas como dúvida somente por não reconhecer o conteúdo.
+- Em caso de ambiguidade, priorize a interpretação compatível com a última solicitação feita, em vez de reiniciar o roteiro.
+ 
 REGRAS INEGOCIÁVEIS:
 - NUNCA escreva "[nome]" ou texto entre colchetes. Use o nome real ou não use
 - NUNCA use e-mail como nome. Se não souber o nome, pergunte
@@ -2805,6 +2813,10 @@ def _rd_retro_auto_executar(validacao=False):
         if candidatos_persistidos:
             candidatos_ids = candidatos_persistidos
         else:
+            # Fail-closed: a rotina automatica nunca deve expandir uma validacao
+            # para toda a base comercial sem lista explicita de candidatos.
+            if not validacao:
+                raise RuntimeError("lista_explicitamente_autorizada_necessaria")
             deals = _rd_retro_auto_candidatos(cutoff_at)
             if validacao:
                 deals = deals[:max(1, RD_RETRO_VALIDACAO_LIMITE)]
@@ -2867,9 +2879,16 @@ def _rd_retro_auto_executar(validacao=False):
 
                 if resultado is not None:
                     status = resultado.get("status")
+                    # Nao transformar gravacao nao confirmada em negocio concluido.
+                    if status == "escrita_nao_confirmada":
+                        transiente = True
+                        ultimo_erro = "escrita_nao_confirmada"
+                        resultado = None
+                if resultado is not None:
+                    status = resultado.get("status")
                     motivo = resultado.get("motivo") or "sem_motivo"
                     resumo["analisados"] += 1
-                    if status == "atualizado":
+                    if status == "atualizado_confirmado":
                         resumo["atualizados"] += 1
                     elif status == "ja_preenchido":
                         resumo["ja_preenchidos"] += 1
