@@ -116,7 +116,7 @@ HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 # por processo como margem operacional, pois outras integrações podem compartilhar a cota.
 # Cooldown global reduz tempestades de 429.
 # Pode ser afinado no Railway sem novo deploy.
-_AGENDOR_MIN_INTERVAL = float(os.environ.get("AGENDOR_MIN_INTERVAL", "1.25"))
+_AGENDOR_MIN_INTERVAL = float(os.environ.get("AGENDOR_MIN_INTERVAL", "2.25"))
 _AGENDOR_RATE_LOCK = threading.Lock()
 _AGENDOR_LAST_REQUEST_AT = 0.0
 _AGENDOR_COOLDOWN_UNTIL = 0.0
@@ -1251,9 +1251,12 @@ def fetch_deals():
     all_deals = []
     page = 1
     total_count = None
+    paginas_completas = True
     while True:
         data = fetch_page(page)
         if data is None:
+            paginas_completas = False
+            print(f"[fetch_deals] pagina={page} indisponivel; preservando cache anterior, sem backfill", flush=True)
             break
         page_deals = data.get("data", [])
         if total_count is None:
@@ -1270,7 +1273,11 @@ def fetch_deals():
         page += 1
         # O limitador central já aplica AGENDOR_MIN_INTERVAL. Mantemos uma
         # margem adicional entre páginas para reduzir rajadas no startup.
-        time.sleep(float(os.environ.get("AGENDOR_DEALS_PAGE_PACE_SECONDS", "1.25")))
+        time.sleep(float(os.environ.get("AGENDOR_DEALS_PAGE_PACE_SECONDS", "2.5")))
+    if not paginas_completas:
+        # Fail-closed: paginação incompleta não pode ser usada como coorte
+        # histórica e não deve ser publicada como snapshot completo.
+        return
     # Preserva produtos conhecidos do cache em memória e reidrata também
     # pelo cache persistente. O cache progressivo acima substitui cache["deals"],
     # então depender só dele fazia os produtos desaparecerem após uma nova carga.
@@ -1346,9 +1353,12 @@ def fetch_deals():
     # t1 = threading.Timer(5.0, fetch_history_job)
     # t1.daemon = True
     # t1.start()
-    t2 = threading.Timer(10.0, fetch_tasks_job)
-    t2.daemon = True
-    t2.start()
+    # Não lançar consulta pesada de tarefas enquanto o backfill histórico
+    # estiver ativo: ambos disputam a mesma cota de API do Agendor.
+    if _rd_utm_backfill_ler().get("status") not in ("executando",):
+        t2 = threading.Timer(10.0, fetch_tasks_job)
+        t2.daemon = True
+        t2.start()
 
 def fetch_deals_safe():
     global fetch_running
