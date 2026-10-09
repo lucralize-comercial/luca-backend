@@ -1338,6 +1338,8 @@ def fetch_deals():
 
     cache["deals"] = all_deals
     cache["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Processamento único de UTMs elegíveis, limitado ao cohort validado.
+    _rd_utm_backfill_iniciar()
     # Desativado: endpoint /deals/{id}/history retorna 404 na API v3 do Agendor
     # (não existe mais), e o dashboard nunca consome /history-cache. Mantido o
     # código de fetch_history_job intacto abaixo, caso a Agendor reative o endpoint.
@@ -2430,7 +2432,7 @@ def rd_retroativo_aplicar():
 # ── RD Station: reprocessamento isolado de 1 negócio ──────────────────────────
 RD_RETRO_SINGLE_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
 
-def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=False):
+def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=False, campos_permitidos=None):
     """Revalida e preenche somente campos RD vazios de um deal com match seguro."""
     token = _rd_obter_access_token()
     rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -2545,7 +2547,8 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=Fa
     atualizar = {
         slug: str(valor).strip()
         for slug, valor in desejados.items()
-        if valor is not None and str(valor).strip()
+        if (campos_permitidos is None or slug in campos_permitidos)
+        and valor is not None and str(valor).strip()
         and _rd_valor_atual(custom_final, slug) in (None, "", [], {})
     }
     if diagnostico:
@@ -2678,6 +2681,159 @@ def rd_retroativo_aplicar_deal(deal_id):
         return jsonify({"status": "erro", "deal_id": deal_id,
                         "erro": f"{type(e).__name__}: {str(e)[:300]}"}), 502
 
+
+# ── RD Station: recuperação única e delimitada de UTMs históricas ──────────
+# Escopo fixo: coorte do dry-run de 08/10, 250 negócios e até 40 novas gravações.
+# Não criar, excluir, mesclar nem movimentar negócios.
+RD_UTM_BACKFILL_FILE = os.environ.get(
+    "RD_UTM_BACKFILL_FILE", "/data/rd_utm_backfill_20261009.json")
+RD_UTM_BACKFILL_INICIO = datetime(2026, 9, 8, 20, 47, 37, tzinfo=timezone.utc)
+RD_UTM_BACKFILL_FIM = datetime(2026, 10, 8, 20, 47, 37, tzinfo=timezone.utc)
+RD_UTM_BACKFILL_MAX_CANDIDATOS = 250
+RD_UTM_BACKFILL_MAX_ATUALIZACOES = 40
+RD_UTM_BACKFILL_CONFIRMADOS = {
+    45954284, 45937429, 45923229, 45917292, 45877587,
+    45862611, 45862557, 45861700, 45859962, 45859844,
+    45859484, 45858672, 45857053, 45856938, 45856416,
+}
+
+def _rd_utm_backfill_ler():
+    try:
+        with open(RD_UTM_BACKFILL_FILE, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+        return obj if isinstance(obj, dict) else {}
+    except FileNotFoundError:
+        return {}
+
+def _rd_utm_backfill_salvar(obj):
+    os.makedirs(os.path.dirname(RD_UTM_BACKFILL_FILE), exist_ok=True)
+    temp = RD_UTM_BACKFILL_FILE + ".tmp"
+    with open(temp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(temp, RD_UTM_BACKFILL_FILE)
+
+def _rd_utm_backfill_executar():
+    # O mesmo lock usado pelo retroativo existente impede duas escritas concorrentes.
+    fh = _rd_retro_auto_process_lock()
+    if fh is None:
+        return
+    try:
+        estado = _rd_utm_backfill_ler()
+        if estado.get("status") in ("concluido", "limite_atingido", "bloqueado"):
+            return
+        if not estado.get("candidatos_ids"):
+            if _rd_retro_auto_carregar().get("status") in (
+                "executando", "aguardando_retomada", "erro_retomavel"
+            ):
+                print("[rd-utm-backfill] bloqueado por retroativo existente ativo", flush=True)
+                return
+            elegiveis = []
+            for deal in list(cache.get("deals") or []):
+                if (deal.get("dealStage") or {}).get("funnel", {}).get("id") != FUNIL_COMERCIAL_ID:
+                    continue
+                dt = _rd_parse_iso(deal.get("startTime"))
+                if not dt:
+                    continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.astimezone(timezone.utc)
+                if RD_UTM_BACKFILL_INICIO <= dt <= RD_UTM_BACKFILL_FIM:
+                    elegiveis.append(deal)
+            elegiveis.sort(
+                key=lambda d: _rd_parse_iso(d.get("startTime"))
+                or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            if len(elegiveis) < RD_UTM_BACKFILL_MAX_CANDIDATOS:
+                print(f"[rd-utm-backfill] aguarda cache completo candidatos={len(elegiveis)}", flush=True)
+                return
+            selecionados = elegiveis[:RD_UTM_BACKFILL_MAX_CANDIDATOS]
+            ids = [int(d["id"]) for d in selecionados if d.get("id")]
+            if len(ids) != RD_UTM_BACKFILL_MAX_CANDIDATOS:
+                print("[rd-utm-backfill] abortado: IDs ausentes no cache", flush=True)
+                return
+            estado = {
+                "status": "executando",
+                "candidatos_ids": ids,
+                "concluidos": sorted(RD_UTM_BACKFILL_CONFIRMADOS),
+                "resultados": {},
+                "atualizados": 0,
+                "max_atualizacoes": RD_UTM_BACKFILL_MAX_ATUALIZACOES,
+            }
+            _rd_utm_backfill_salvar(estado)
+            print(f"[rd-utm-backfill] iniciado candidatos={len(ids)}"
+                  f" anteriores={len(RD_UTM_BACKFILL_CONFIRMADOS)}", flush=True)
+
+        concluidos = set(int(x) for x in estado.get("concluidos", []))
+        candidatos = [int(x) for x in estado.get("candidatos_ids", [])]
+        # Fail closed se checkpoint não preservar o escopo original.
+        if len(candidatos) != 250 or len(set(candidatos)) != 250:
+            raise ValueError("checkpoint fora do limite de 250")
+        atualizados = int(estado.get("atualizados") or 0)
+        for deal_id in candidatos:
+            if deal_id in concluidos:
+                continue
+            if atualizados >= RD_UTM_BACKFILL_MAX_ATUALIZACOES:
+                estado["status"] = "limite_atingido"
+                break
+            try:
+                resposta = _rd_retro_single_processar(
+                    deal_id, aplicar_limite_dias=False,
+                    campos_permitidos={"origem", "campanha"},
+                )
+            except Exception as exc:
+                # Não reprocessar em laço apertado quando a API falhar.
+                estado["ultimo_erro"] = type(exc).__name__
+                _rd_utm_backfill_salvar(estado)
+                print(f"[rd-utm-backfill] pausa por erro deal={deal_id} tipo={type(exc).__name__}", flush=True)
+                return
+            status = resposta.get("status")
+            if status == "escrita_nao_confirmada":
+                estado["status"] = "bloqueado"
+                estado["ultimo_erro"] = "escrita_nao_confirmada"
+                _rd_utm_backfill_salvar(estado)
+                print(f"[rd-utm-backfill] bloqueado: escrita nao confirmada deal={deal_id}", flush=True)
+                return
+            if status == "atualizado_confirmado":
+                atualizados += 1
+            concluidos.add(deal_id)
+            estado["atualizados"] = atualizados
+            estado["concluidos"] = sorted(concluidos)
+            estado.setdefault("resultados", {})[str(deal_id)] = {
+                "status": status,
+                "campos_confirmados": resposta.get("campos_confirmados", []),
+                "motivo": resposta.get("motivo"),
+            }
+            _rd_utm_backfill_salvar(estado)
+            if len(concluidos) % 20 == 0:
+                print(f"[rd-utm-backfill] progresso={len(concluidos)}/250"
+                      f" novos={atualizados}", flush=True)
+            time.sleep(2.0)
+        else:
+            estado["status"] = "concluido"
+        _rd_utm_backfill_salvar(estado)
+        print(f"[rd-utm-backfill] final status={estado['status']}"
+              f" novos={atualizados} analisados={len(concluidos)}/250", flush=True)
+    except Exception as exc:
+        print(f"[rd-utm-backfill] erro controle={type(exc).__name__}", flush=True)
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+
+def _rd_utm_backfill_iniciar():
+    estado = _rd_utm_backfill_ler()
+    if estado.get("status") in ("concluido", "limite_atingido", "bloqueado"):
+        return
+    threading.Thread(
+        target=_rd_utm_backfill_executar, daemon=True,
+        name="rd-utm-backfill-unico",
+    ).start()
 
 # ── RD Station: retroativo automático, retomável e de baixa prioridade ────────
 RD_RETRO_AUTO_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
