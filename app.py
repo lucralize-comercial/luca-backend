@@ -2443,7 +2443,7 @@ def rd_retroativo_aplicar():
 # ── RD Station: reprocessamento isolado de 1 negócio ──────────────────────────
 RD_RETRO_SINGLE_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
 
-def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=False, campos_permitidos=None):
+def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=False, campos_permitidos=None, janela_segundos=20):
     """Revalida e preenche somente campos RD vazios de um deal com match seguro."""
     token = _rd_obter_access_token()
     rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -2522,18 +2522,23 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=Fa
         if dt_rd.tzinfo is None:
             dt_rd = dt_rd.replace(tzinfo=timezone.utc)
         diff = abs((dt_deal.astimezone(timezone.utc) - dt_rd.astimezone(timezone.utc)).total_seconds())
-        if diff <= 20:
+        if diff <= janela_segundos:
             plausiveis.append((diff, dados))
 
     plausiveis.sort(key=lambda x: x[0])
     if not plausiveis:
-        resultado["motivo"] = "sem_match_temporal_ate_20s"
+        resultado["motivo"] = f"sem_match_temporal_ate_{janela_segundos}s"
         return resultado
-    if len(plausiveis) > 1 and abs(plausiveis[1][0] - plausiveis[0][0]) < 1:
+    if len(plausiveis) > 1:
         resultado["motivo"] = "match_ambiguo"
         return resultado
 
     diff, dados = plausiveis[0]
+    if janela_segundos > 20:
+        data_evento = _rd_parse_iso(dados.get('data_conversao'))
+        if data_evento is None or data_evento.astimezone(timezone.utc) > dt_deal.astimezone(timezone.utc):
+            resultado['motivo'] = 'conversao_posterior_ao_negocio'
+            return resultado
     origem = _rd_mapear_origem_negocio(dados.get("identificador"))
     resultado["identificador_rd"] = dados.get("identificador")
     resultado["diferenca_seg"] = round(diff, 1)
@@ -2872,7 +2877,7 @@ def _rd_utm_backfill_executar():
                 break
             try:
                 resposta = _rd_retro_single_processar(
-                    deal_id, aplicar_limite_dias=False,
+                    deal_id, aplicar_limite_dias=False, janela_segundos=900,
                     campos_permitidos={"origem", "campanha"},
                 )
             except Exception as exc:
@@ -8032,6 +8037,9 @@ def _rd_jan26_pontual():
                 st = json.load(fh)
         except FileNotFoundError:
             st = {"resultados": {}, "status": "executando"}
+        if st.get("versao") != "janela_900s_v1":
+            # Reprocessar apenas os tres IDs do lote anterior.
+            st = {"resultados": {}, "status": "executando", "versao": "janela_900s_v1"}
         if st.get("status") == "concluido":
             return
         for deal_id in _RD_JAN26_IDS:
