@@ -8037,6 +8037,9 @@ def _rd_jan26_pontual():
                 st = json.load(fh)
         except FileNotFoundError:
             st = {"resultados": {}, "status": "executando"}
+        if st.get("versao") != "janela_900s_v1":
+            # Reprocessar apenas os tres IDs do lote anterior.
+            st = {"resultados": {}, "status": "executando", "versao": "janela_900s_v1"}
         if st.get("status") == "concluido":
             return
         for deal_id in _RD_JAN26_IDS:
