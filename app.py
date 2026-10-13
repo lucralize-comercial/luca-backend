@@ -8110,7 +8110,7 @@ def _rd_origin_apply_batch():
             os.replace(tmp, _RD_ORIGIN_FILE)
         processed = 0
         for deal_id, esperado in _RD_ORIGIN_CANDIDATES.items():
-            if str(deal_id) in state["results"]:
+            if str(deal_id) in state["results"] and not (state["results"][str(deal_id)].get("status") == "bloqueado" and state["results"][str(deal_id)].get("motivo") in ("fora_funil_comercial", "saiu_funil_antes_escrita")):
                 continue
             if processed >= 15:
                 break
@@ -8156,6 +8156,8 @@ def _rd_origin_apply_batch():
         persist()
         from collections import Counter
         counts = dict(Counter(x.get("status") for x in state["results"].values()))
+        motivos = dict(Counter(x.get("motivo") for x in state["results"].values() if x.get("status") == "bloqueado"))
+        print(f"[rd-origin-2025] motivos_bloqueio={json.dumps(motivos, ensure_ascii=False)}", flush=True)
         print(f"[rd-origin-2025] status={state['status']} processados={len(state['results'])}/{len(_RD_ORIGIN_CANDIDATES)} totais={counts}", flush=True)
     finally:
         import fcntl
