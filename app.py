@@ -2443,7 +2443,7 @@ def rd_retroativo_aplicar():
 # ── RD Station: reprocessamento isolado de 1 negócio ──────────────────────────
 RD_RETRO_SINGLE_CONFIRM = "CONFIRMAR_RETROATIVO_RD"
 
-def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=False, campos_permitidos=None, janela_segundos=20):
+def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=False, campos_permitidos=None, janela_segundos=20, permitir_funil_historico=False):
     """Revalida e preenche somente campos RD vazios de um deal com match seguro."""
     token = _rd_obter_access_token()
     rd_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -2459,7 +2459,7 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=Fa
     deal = r_deal.json().get("data") or r_deal.json()
 
     stage = deal.get("dealStage") or {}
-    if ((stage.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
+    if not permitir_funil_historico and ((stage.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
         resultado["motivo"] = "fora_funil_comercial"
         return resultado
 
@@ -2547,7 +2547,7 @@ def _rd_retro_single_processar(deal_id, aplicar_limite_dias=True, diagnostico=Fa
     r_final.raise_for_status()
     deal_final = r_final.json().get("data") or r_final.json()
     stage_final = deal_final.get("dealStage") or {}
-    if ((stage_final.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
+    if not permitir_funil_historico and ((stage_final.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID:
         resultado["motivo"] = "saiu_funil_antes_escrita"
         return resultado
 
@@ -8110,14 +8110,14 @@ def _rd_origin_apply_batch():
             os.replace(tmp, _RD_ORIGIN_FILE)
         processed = 0
         for deal_id, esperado in _RD_ORIGIN_CANDIDATES.items():
-            if str(deal_id) in state["results"]:
+            if str(deal_id) in state["results"] and not (state["results"][str(deal_id)].get("status") == "bloqueado" and state["results"][str(deal_id)].get("motivo") in ("fora_funil_comercial", "saiu_funil_antes_escrita")):
                 continue
             if processed >= 15:
                 break
             try:
                 leitura = _rd_retro_single_processar(
                     deal_id, aplicar_limite_dias=False, diagnostico=True,
-                    janela_segundos=900, campos_permitidos={"origem_do_negocio"})
+                    janela_segundos=900, campos_permitidos={"origem_do_negocio"}, permitir_funil_historico=True)
                 if leitura.get("status") != "diagnostico_somente_leitura":
                     result = {"status": "bloqueado", "motivo": leitura.get("motivo")}
                 elif leitura.get("origem_do_negocio") != esperado:
@@ -8129,7 +8129,7 @@ def _rd_origin_apply_batch():
                 else:
                     gravacao = _rd_retro_single_processar(
                         deal_id, aplicar_limite_dias=False, janela_segundos=900,
-                        campos_permitidos={"origem_do_negocio"})
+                        campos_permitidos={"origem_do_negocio"}, permitir_funil_historico=True)
                     result = {
                         "status": gravacao.get("status"),
                         "motivo": gravacao.get("motivo"),
@@ -8141,7 +8141,7 @@ def _rd_origin_apply_batch():
                 state["results"][str(deal_id)] = result
                 processed += 1
                 persist()
-                print(f"[rd-origin-2025] {processed}/15 id={deal_id} status={result['status']}", flush=True)
+                print(f"[rd-origin-2025] {processed}/15 id={deal_id} status={result['status']} motivo={result.get('motivo')}", flush=True)
                 time.sleep(3)
             except requests.RequestException as exc:
                 # Retomar o mesmo ID na proxima rodada; nao o marcar como avaliado.
@@ -8156,6 +8156,8 @@ def _rd_origin_apply_batch():
         persist()
         from collections import Counter
         counts = dict(Counter(x.get("status") for x in state["results"].values()))
+        motivos = dict(Counter(x.get("motivo") for x in state["results"].values() if x.get("status") == "bloqueado"))
+        print(f"[rd-origin-2025] motivos_bloqueio={json.dumps(motivos, ensure_ascii=False)}", flush=True)
         print(f"[rd-origin-2025] status={state['status']} processados={len(state['results'])}/{len(_RD_ORIGIN_CANDIDATES)} totais={counts}", flush=True)
     finally:
         import fcntl
