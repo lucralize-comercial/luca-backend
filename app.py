@@ -8017,9 +8017,67 @@ scheduler.add_job(verificar_perdidos_d10_travados_safe, "interval", hours=3, id=
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "date", run_date=datetime.now() + timedelta(minutes=2), id="reconciliar_perdidos_d10_inicial")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
 scheduler.add_job(_rd_retro_auto_retomar_se_necessario, "interval", minutes=5, id="rd_retro_auto_retomada")
+
+# Revalidacao pontual: tres casos antigos com origem vazia. Os outros tres
+# pertencem ao mesmo contato e estao excluidos para evitar atribuicao ambigua.
+_RD_JAN26_IDS = (39127902, 39034435, 39027078)
+_RD_JAN26_RESULT_FILE = "/data/rd_jan26_pontual.json"
+def _rd_jan26_pontual():
+    lock = _rd_retro_auto_process_lock()
+    if lock is None:
+        return
+    try:
+        try:
+            with open(_RD_JAN26_RESULT_FILE, encoding="utf-8") as fh:
+                st = json.load(fh)
+        except FileNotFoundError:
+            st = {"resultados": {}, "status": "executando"}
+        if st.get("status") == "concluido":
+            return
+        for deal_id in _RD_JAN26_IDS:
+            if str(deal_id) in st["resultados"]:
+                continue
+            try:
+                # Rotina existente exige o match de ate 20 segundos, verifica
+                # funil, contato e campos frescos e confirma a persistencia.
+                r = _rd_retro_single_processar(
+                    deal_id, aplicar_limite_dias=False,
+                    campos_permitidos={"origem_do_negocio", "origem", "campanha",
+                                      "grupo_de_anuncio", "anuncio", "meta_ads_source_id"})
+                st["resultados"][str(deal_id)] = {
+                    "status": r.get("status"), "motivo": r.get("motivo"),
+                    "campos_confirmados": r.get("campos_confirmados", []),
+                }
+            except requests.RequestException as exc:
+                print(f"[rd-jan26] pausa deal={deal_id} erro={type(exc).__name__}", flush=True)
+                return
+            st["status"] = "executando"
+            tmp = _RD_JAN26_RESULT_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(st, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, _RD_JAN26_RESULT_FILE)
+            print(f"[rd-jan26] deal={deal_id} status={st['resultados'][str(deal_id)]['status']}", flush=True)
+            time.sleep(3)
+        st["status"] = "concluido"
+        tmp = _RD_JAN26_RESULT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(st, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, _RD_JAN26_RESULT_FILE)
+        print(f"[rd-jan26] concluido resultados={json.dumps(st['resultados'])}", flush=True)
+    finally:
+        import fcntl
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
 scheduler.add_job(_rd_audit_2026, "interval", minutes=20, id="rd_2026_readonly_audit")
 scheduler.add_job(_rd_retro_auto_retomar_se_necessario, "date", run_date=datetime.now() + timedelta(minutes=10), id="rd_retro_auto_retomada_inicial")
 scheduler.add_job(_rd_audit_2026, "date", run_date=datetime.now() + timedelta(minutes=12), id="rd_2026_readonly_audit_inicial")
+scheduler.add_job(_rd_jan26_pontual, "interval", minutes=20, id="rd_jan26_pontual_interval")
+scheduler.add_job(_rd_jan26_pontual, "date", run_date=datetime.now() + timedelta(minutes=3), id="rd_jan26_pontual_first")
 scheduler.start()
 
 if __name__ == "__main__":
