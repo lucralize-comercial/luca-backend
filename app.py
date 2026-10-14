@@ -104,6 +104,50 @@ def validar_agendar_api_key() -> bool:
               "qualquer requisição é aceita", flush=True)
         return True
     return request.headers.get("X-API-Key", "") == AGENDAR_API_KEY
+
+
+def exigir_chave_admin():
+    """Rotas administrativas (refresh/reset): NÃO tem fail-open — mesmo padrão
+    das rotas /rd/retroativo/*. Sem AGENDAR_API_KEY configurada a rota fica
+    indisponível (503); com chave errada ou ausente, 401. Retorna None quando
+    autorizado, ou a resposta Flask pronta pra devolver quando negado."""
+    if not AGENDAR_API_KEY:
+        return jsonify({"status": "indisponivel", "mensagem": "AGENDAR_API_KEY não configurada"}), 503
+    recebida = request.headers.get("X-API-Key", "")
+    if not hmac.compare_digest(recebida.encode("utf-8"), AGENDAR_API_KEY.encode("utf-8")):
+        return jsonify({"status": "nao_autorizado"}), 401
+    return None
+
+
+# Chave opcional na URL dos webhooks do RD Station e do Agendor (deal-created).
+# Variáveis NOVAS e independentes do WEBHOOK_SECRET: enquanto não estiverem
+# definidas no Railway, o comportamento é o de sempre (aceita tudo). Ordem
+# segura de ativação: 1) cadastrar a URL com ?chave=VALOR no RD/Agendor;
+# 2) só depois definir a variável correspondente no Railway.
+RD_WEBHOOK_SECRET = os.environ.get("RD_WEBHOOK_SECRET", "")
+AGENDOR_DEAL_CREATED_SECRET = os.environ.get("AGENDOR_DEAL_CREATED_SECRET", "")
+
+def validar_chave_url_opcional(segredo: str) -> bool:
+    if not segredo:
+        return True
+    recebida = request.args.get("chave", "")
+    return hmac.compare_digest(recebida.encode("utf-8"), segredo.encode("utf-8"))
+
+
+def _mascarar_email(email) -> str:
+    """ana.silva@empresa.com -> a***@empresa.com (só pra logs)."""
+    email = str(email or "")
+    if "@" not in email:
+        return "***" if email else ""
+    usuario, dominio = email.split("@", 1)
+    return f"{usuario[:1]}***@{dominio}"
+
+def _mascarar_telefone(telefone) -> str:
+    """+55 (31) 99999-1234 -> ***1234 (só pra logs)."""
+    digitos = re.sub(r"\D", "", str(telefone or ""))
+    return f"***{digitos[-4:]}" if digitos else ""
+
+
 AGENDOR_BASE = "https://api.agendor.com.br/v3"
 HEADERS = {"Authorization": f"Token {AGENDOR_TOKEN}"}
 
@@ -1399,6 +1443,9 @@ def usage_stats():
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
+    negado = exigir_chave_admin()
+    if negado:
+        return negado
     if fetch_running:
         return jsonify({"status": "running"}), 202
     scheduler.add_job(fetch_deals_safe, "date", id="fetch_manual", replace_existing=True)
@@ -1406,6 +1453,9 @@ def refresh():
 
 @app.route("/refresh-tasks", methods=["POST"])
 def refresh_tasks():
+    negado = exigir_chave_admin()
+    if negado:
+        return negado
     t = threading.Thread(target=fetch_tasks_job)
     t.daemon = True
     t.start()
@@ -1419,6 +1469,9 @@ def refresh_followup():
     Continua respeitando as checagens internas da função (FOLLOWUP_ATIVOS
     e o horário de envio 8h-20h BRT) — só antecipa a execução, não ignora
     as travas de segurança."""
+    negado = exigir_chave_admin()
+    if negado:
+        return negado
     t = threading.Thread(target=verificar_followup_dias_silencio_safe)
     t.daemon = True
     t.start()
@@ -1427,6 +1480,9 @@ def refresh_followup():
 @app.route("/reset-fetch", methods=["POST"])
 def reset_fetch():
     global fetch_running, history_running
+    negado = exigir_chave_admin()
+    if negado:
+        return negado
     fetch_running = False
     history_running = False
     return jsonify({"status": "ok"})
@@ -1840,7 +1896,7 @@ def _rd_buscar_pessoas(email, telefone_norm):
                 if pessoa.get("id"):
                     encontradas[pessoa["id"]] = pessoa
         except Exception as e:
-            print(f"[rd-match] Falha buscando pessoa por {campo}={valor!r}: {e}", flush=True)
+            print(f"[rd-match] Falha buscando pessoa por {campo}: {e}", flush=True)
     return list(encontradas.values())
 
 
@@ -3496,7 +3552,10 @@ def _rd_correlacionar_e_enriquecer(dados):
 
         candidatos = list({c["deal_id"]: c for c in candidatos if c.get("deal_id")}.values())
         candidatos.sort(key=lambda c: c["diferenca_seg"] if c["diferenca_seg"] is not None else 10**12)
-        print(f"[rd-match] identificador={dados['identificador']!r} candidatos={json.dumps(candidatos, ensure_ascii=False, default=str)}", flush=True)
+        # Sem "nome" (título do negócio) nem "descricao": trazem dados do lead.
+        candidatos_log = [{k: c.get(k) for k in ("deal_id", "person_id", "startTime", "diferenca_seg")}
+                          for c in candidatos]
+        print(f"[rd-match] identificador={dados['identificador']!r} candidatos={json.dumps(candidatos_log, ensure_ascii=False, default=str)}", flush=True)
 
         if len(candidatos) == 1:
             escolhido = candidatos[0]
@@ -3520,6 +3579,10 @@ def rd_webhook():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp, 200
 
+    if not validar_chave_url_opcional(RD_WEBHOOK_SECRET):
+        print("[auth] /rd/webhook rejeitado — chave da URL ausente ou incorreta", flush=True)
+        return jsonify({"error": "não autorizado"}), 401
+
     try:
         body = request.get_json(silent=True)
         if body is None:
@@ -3528,7 +3591,12 @@ def rd_webhook():
         print("[rd-webhook] ========================================", flush=True)
         print(f"[rd-webhook] recebido_em_brt={datetime.utcnow() - timedelta(hours=3)}", flush=True)
         print(f"[rd-webhook] content_type={request.content_type}", flush=True)
-        print(f"[rd-webhook] payload={json.dumps(body, ensure_ascii=False, default=str)[:12000]}", flush=True)
+        # O payload bruto traz nome, e-mail e telefone dos leads: não vai pro
+        # log. Registra só o formato (tipo, chaves de topo e nº de leads).
+        _leads_log = body.get("leads") if isinstance(body, dict) else None
+        print(f"[rd-webhook] payload tipo={type(body).__name__} "
+              f"chaves={list(body.keys())[:10] if isinstance(body, dict) else []} "
+              f"leads={len(_leads_log) if isinstance(_leads_log, list) else 0}", flush=True)
 
         leads = body.get("leads") if isinstance(body, dict) else None
         if not isinstance(leads, list):
@@ -3539,8 +3607,8 @@ def rd_webhook():
                 continue
             dados = _rd_extrair_lead(lead)
             print(
-                f"[rd-webhook] identificador={dados['identificador']!r} email={dados['email']!r} "
-                f"telefone={dados['telefone']!r} data_conversao={dados['data_conversao']!r} "
+                f"[rd-webhook] identificador={dados['identificador']!r} email={_mascarar_email(dados['email'])!r} "
+                f"telefone={_mascarar_telefone(dados['telefone'])!r} data_conversao={dados['data_conversao']!r} "
                 f"utms={{source:{dados['utm_source']!r}, campaign:{dados['utm_campaign']!r}, "
                 f"term:{dados['utm_term']!r}, content:{dados['utm_content']!r}, id:{dados['utm_id']!r}}}",
                 flush=True
@@ -3560,6 +3628,9 @@ def rd_webhook():
 
 @app.route("/agendor/deal-created", methods=["POST"])
 def agendor_deal_created():
+    if not validar_chave_url_opcional(AGENDOR_DEAL_CREATED_SECRET):
+        print("[auth] /agendor/deal-created rejeitado — chave da URL ausente ou incorreta", flush=True)
+        return jsonify({"error": "não autorizado"}), 401
     try:
         body = request.get_json(force=True) or {}
         deal = body.get("deal") or body.get("data") or {}
@@ -3721,20 +3792,87 @@ def history_cache_route():
         "processed": history_cache["total_processed"], "target": history_cache["total_target"]
     })
 
+# /chat alimenta o simulador público (agente-luca, GitHub Pages), que não envia
+# chave. Por isso NÃO exige autenticação, mas deixou de repassar o corpo cru à
+# Anthropic: modelo, prompt de sistema e teto de tokens são definidos aqui; do
+# cliente só se aceita o histórico de mensagens (validado) e um max_tokens
+# (limitado). Há também limite de requisições por IP e de tamanho do corpo.
+CHAT_MAX_BYTES_CORPO = 64 * 1024
+CHAT_MAX_MENSAGENS = 40
+CHAT_MAX_CHARS_MENSAGEM = 2000
+CHAT_MAX_TOKENS_TETO = 400
+CHAT_MAX_TOKENS_PADRAO = 300
+CHAT_RATE_MAX_POR_MINUTO = int(os.environ.get("CHAT_RATE_MAX_POR_MINUTO", "20"))
+_chat_rate = {}
+_chat_rate_lock = threading.Lock()
+
+def _ip_cliente() -> str:
+    # Atrás do proxy do Railway, o último item de X-Forwarded-For é o que o
+    # próprio proxy acrescentou (os anteriores podem ser forjados pelo cliente).
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[-1].strip() or "desconhecido"
+    return request.remote_addr or "desconhecido"
+
+def _chat_dentro_do_limite(ip: str) -> bool:
+    agora = time.time()
+    with _chat_rate_lock:
+        recentes = [t for t in _chat_rate.get(ip, []) if agora - t < 60]
+        if len(recentes) >= CHAT_RATE_MAX_POR_MINUTO:
+            _chat_rate[ip] = recentes
+            return False
+        recentes.append(agora)
+        _chat_rate[ip] = recentes
+        if len(_chat_rate) > 5000:  # evita crescer sem limite
+            for chave in [k for k, v in _chat_rate.items() if not v or agora - v[-1] >= 60]:
+                _chat_rate.pop(chave, None)
+    return True
+
+def _validar_mensagens_chat(messages):
+    """Retorna a lista limpa [{role, content}] ou None se inválida."""
+    if not isinstance(messages, list) or not (1 <= len(messages) <= CHAT_MAX_MENSAGENS):
+        return None
+    limpas = []
+    for m in messages:
+        if not isinstance(m, dict):
+            return None
+        role, content = m.get("role"), m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            return None
+        content = content.strip()
+        if not content or len(content) > CHAT_MAX_CHARS_MENSAGEM:
+            return None
+        limpas.append({"role": role, "content": content})
+    if limpas[0]["role"] != "user":
+        return None
+    return limpas
+
 @app.route("/chat", methods=["POST"])
 def chat():
     if not ANTHROPIC_API_KEY:
         return jsonify({"error": "ANTHROPIC_API_KEY nao configurada"}), 500
+    if not _chat_dentro_do_limite(_ip_cliente()):
+        return jsonify({"error": "Muitas requisições. Tente de novo em instantes."}), 429
+    if (request.content_length or 0) > CHAT_MAX_BYTES_CORPO:
+        return jsonify({"error": "Corpo da requisição muito grande"}), 413
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON inválido"}), 400
+    messages = _validar_mensagens_chat(payload.get("messages"))
+    if messages is None:
+        return jsonify({"error": "messages inválido"}), 400
+    max_tokens = payload.get("max_tokens")
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+        max_tokens = CHAT_MAX_TOKENS_PADRAO
+    max_tokens = min(max_tokens, CHAT_MAX_TOKENS_TETO)
     try:
-        payload = request.get_json()
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-            json=payload, timeout=30
-        )
-        return jsonify(r.json()), r.status_code
+        # tentativas=1: não prende o worker em retries; tipo="outro": não
+        # mistura o uso do simulador com o do atendimento real em USAGE_STATS.
+        texto = call_claude(messages, max_tokens=max_tokens, tentativas=1, tipo="outro")
+        return jsonify({"content": [{"type": "text", "text": texto}]}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[chat] Erro ao consultar o modelo: {type(e).__name__}", flush=True)
+        return jsonify({"error": "Falha ao consultar o modelo"}), 502
 def send_agendorchat_message(conversation_id: int, text: str):
     """Envia resposta do Luca de volta ao lead via API do AgendorChat.
     Adiciona uma marca invisível no final (LUCA_MARKER) — ver comentário
@@ -4041,7 +4179,7 @@ def criar_negocio_funil_comercial(person_id, nome: str):
         verdade) — em vez disso, tenta de novo com um sufixo sequencial
         limpo: "(1)", "(2)", "(3)"... pegando o primeiro número livre."""
     nome_final = nome or "Lead via Luca (WhatsApp)"
-    ETAPA_NOVO_LEAD_ID = 2835663
+    SEQUENCIA_NOVO_LEAD = 1  # posição de "Novo Lead" no Funil Comercial (a API usa posição, não ID)
     titulo = f"{nome_final} - via Luca (WhatsApp)"
     try:
         # Releitura imediatamente antes do POST. As integrações do RD e do
@@ -4060,9 +4198,14 @@ def criar_negocio_funil_comercial(person_id, nome: str):
             print(f"[crm] Criação evitada: negócio comercial ativo já existe para pessoa={person_id}"
                   f" deal={existente.get('id')}", flush=True)
             return existente
+        # Campos documentados em POST /people/{id}/deals: "funnel" (ID do funil)
+        # e "dealStage" (posição da etapa no funil). "dealStageId" não existe
+        # na API v3; antes o negócio só caía em Novo Lead por ser a 1ª etapa do
+        # funil padrão da conta.
         payload_deal = {
             "title": titulo,
-            "dealStageId": ETAPA_NOVO_LEAD_ID,
+            "funnel": FUNIL_COMERCIAL_ID,
+            "dealStage": SEQUENCIA_NOVO_LEAD,
         }
         rd = requests.post(f"{AGENDOR_BASE}/people/{person_id}/deals",
                             headers={**HEADERS, "Content-Type": "application/json"},
@@ -4543,7 +4686,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                     sequencia_alvo = idx_alvo + 1  # API espera a posição (1-indexed) dentro do funil, não o ID global
                     r5 = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}/stage",
                                        headers={**HEADERS, "Content-Type": "application/json"},
-                                       json={"dealStage": sequencia_alvo}, timeout=15)
+                                       json={"dealStage": sequencia_alvo, "funnel": FUNIL_COMERCIAL_ID}, timeout=15)
                     print(f"[crm] Etapa -> 'Reunião agendada' deal={deal_id} status={r5.status_code} body={r5.text[:200]}", flush=True)
                 else:
                     print(f"[crm] Etapa não movida — atual={etapa_atual_id} já é igual/posterior a 'Reunião agendada' "
@@ -6766,7 +6909,7 @@ def mover_novos_leads_para_1contato():
 
             r = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}/stage",
                               headers={**HEADERS, "Content-Type": "application/json"},
-                              json={"dealStage": SEQUENCIA_1_CONTATO}, timeout=15)
+                              json={"dealStage": SEQUENCIA_1_CONTATO, "funnel": FUNIL_COMERCIAL_ID}, timeout=15)
             print(f"[novo_lead] Movido pra 1º Contato (D0) deal={deal_id} status={r.status_code}", flush=True)
             movidos += 1
         except Exception as e:
@@ -7123,7 +7266,7 @@ def mover_etapa_funil_comercial(deal_id: int, etapa_alvo_id: int, permitir_recuo
     sequencia_alvo = idx_alvo + 1  # API espera a posição 1-indexed dentro do funil
     r = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}/stage",
                       headers={**HEADERS, "Content-Type": "application/json"},
-                      json={"dealStage": sequencia_alvo}, timeout=15)
+                      json={"dealStage": sequencia_alvo, "funnel": FUNIL_COMERCIAL_ID}, timeout=15)
     # O log mostra os dois números: o ID pretendido (etapa_alvo_id) e a
     # posição de verdade que foi enviada (sequencia_alvo) — antes só
     # mostrava o ID, o que mascarou o bug real da lista incompleta
