@@ -1072,8 +1072,10 @@ def fetch_page(page):
     return None
 
 
-def buscar_deal_fresco(deal_id):
+def buscar_deal_fresco(deal_id, com_custom_fields=False):
     """Busca o negócio direto na API (não confia em cache), com retry —
+    (com_custom_fields=True inclui customFields na resposta; sem isso a API
+    não os devolve.)
     a chamada simples sem retry falhava com 429 na página do Agendor,
     devolvendo corpo vazio e um erro confuso de JSON ('Expecting value')
     em vez de um 429 claro. Usada em vários pontos que precisam da etapa
@@ -1084,7 +1086,9 @@ def buscar_deal_fresco(deal_id):
     vez de fixo em 3s, mesmo padrão das outras funções de retry."""
     for attempt in range(3):
         try:
-            r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS, timeout=15)
+            r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}", headers=HEADERS,
+                             params=({"withCustomFields": "true"} if com_custom_fields else None),
+                             timeout=15)
             if r.status_code == 429:
                 raise requests.exceptions.HTTPError(f"429 na busca do deal={deal_id}")
             r.raise_for_status()
@@ -5536,9 +5540,9 @@ def agendorchat_webhook():
                             motivo_lower = motivo.lower()
                             if "not a whatsapp user" in motivo_lower or "não é um usuário" in motivo_lower \
                                or "not registered" in motivo_lower or "sem whatsapp" in motivo_lower:
-                                marcar_negocio_perdido(deal["id"], LOSS_REASON_SEM_WHATSAPP)
+                                marcar_perdido_d10_com_validacoes(deal["id"], LOSS_REASON_SEM_WHATSAPP)
                             else:
-                                marcar_negocio_perdido(deal["id"], LOSS_REASON_CONTATO_INVALIDO)
+                                marcar_perdido_d10_com_validacoes(deal["id"], LOSS_REASON_CONTATO_INVALIDO)
                             send_private_note(conversation_id,
                                 f"⚠️ Mensagem não entregue (número inválido/sem WhatsApp). Motivo: {motivo}. "
                                 f"Movido para 'Perdido - sem retorno (D10)' para verificação manual. {marcador_falha}")
@@ -6611,17 +6615,35 @@ def marcador_existe(msgs, marcador: str) -> bool:
     return any(marcador in (m.get("content") or "") for m in msgs)
 
 
-def espelho_crm(deal_id, texto):
-    """Registro-espelho no negócio (tipo WhatsApp) para auditoria no CRM."""
+def espelho_crm(deal_id, texto, tentativas=3):
+    """Registro-espelho no negócio (tipo WhatsApp) para auditoria no CRM.
+
+    Confere o resultado: antes, qualquer resposta (inclusive 429/5xx) era só
+    logada e a tarefa ficava sem ser criada, sem retry — e a reconciliação do
+    D10 depende dessa tarefa. Agora repete (2s, 4s) em 429/5xx. Em exceção
+    de rede (ex: timeout) NÃO repete, porque a tarefa pode já ter sido criada
+    e repetir geraria duplicata. Retorna True se criou (200/201)."""
     if not deal_id:
-        return
-    try:
-        r = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
-                          headers={**HEADERS, "Content-Type": "application/json"},
-                          json={"text": texto, "type": "whatsapp"}, timeout=15)
-        print(f"[lembrete] Espelho CRM deal={deal_id} status={r.status_code}", flush=True)
-    except Exception as e:
-        print(f"[lembrete] Erro no espelho CRM deal={deal_id}: {e}", flush=True)
+        return False
+    for tentativa in range(1, tentativas + 1):
+        try:
+            r = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                              headers={**HEADERS, "Content-Type": "application/json"},
+                              json={"text": texto, "type": "whatsapp"}, timeout=15)
+            print(f"[lembrete] Espelho CRM deal={deal_id} status={r.status_code}", flush=True)
+            if r.status_code in (200, 201):
+                return True
+            if r.status_code not in (429, 500, 502, 503, 504):
+                print(f"[lembrete] Espelho CRM NÃO criado deal={deal_id} status={r.status_code} "
+                      f"body={r.text[:200]}", flush=True)
+                return False
+        except Exception as e:
+            print(f"[lembrete] Erro no espelho CRM deal={deal_id}: {e}", flush=True)
+            return False
+        if tentativa < tentativas:
+            time.sleep(2 ** tentativa)  # 2s, 4s
+    print(f"[lembrete] Espelho CRM NÃO criado após {tentativas} tentativas deal={deal_id}", flush=True)
+    return False
 
 
 def processar_lembrete(task, tipo, due):
@@ -7458,8 +7480,121 @@ def marcar_perdido_sem_contato(deal_id: int, end_time: str = None) -> bool:
     etapa que já é testado e confiável em produção (mover_etapa_funil_comercial),
     em vez de um endpoint/payload que nunca foi validado."""
     ok = mover_etapa_funil_comercial(deal_id, ETAPA_PERDIDO_SEM_CONTATO)
-    marcar_negocio_perdido(deal_id, LOSS_REASON_SEM_RETORNO, end_time=end_time)
-    return ok
+    if not ok:
+        # Sem estar de fato na etapa D10 não formaliza a perda (regra de
+        # [gestor]: a perda acontece "nessa etapa", com as validações abaixo).
+        return False
+    # True só quando o negócio ficou formalmente PERDIDO; se a origem ainda
+    # não estiver preenchida, ele fica na etapa D10 e a reconciliação (a cada
+    # 3h) conclui quando o preenchimento automático acontecer.
+    return marcar_perdido_d10_com_validacoes(
+        deal_id, LOSS_REASON_SEM_RETORNO, end_time=end_time) == "perdido"
+
+
+# ── Perda na etapa D10: validações antes de marcar como perdido ───────────────
+# Regras de [gestor] (14/10/2026):
+# 1) Para dar o negócio como PERDIDO, "Origem do negócio" já deve estar
+#    preenchida (o preenchimento agora é automático). Se não estiver, o negócio
+#    fica na etapa D10, ainda em andamento, e é reavaliado na próxima rodada.
+# 2) Ao chegar nessa etapa sem reunião agendada, o campo "Reunião agendada
+#    por" recebe a opção "N/A" (nunca sobrescreve um valor já preenchido).
+ORIGEM_NEGOCIO_SLUG = "origem_do_negocio"
+NA_REUNIAO_TTL_OK = 900      # 15 min: campo e opção N/A encontrados
+NA_REUNIAO_TTL_FALHA = 300   # 5 min: não encontrados / erro (tenta de novo logo)
+_na_reuniao_cache = {"at": 0.0, "dados": None}
+
+
+def _campo_preenchido(custom, slug) -> bool:
+    valor = _rd_valor_atual(custom or {}, slug)
+    return valor not in (None, "", [], {})
+
+
+def resolver_opcao_na_agendada_por() -> dict:
+    """Devolve {"key": identificador do campo 'Reunião agendada por',
+    "na_id": id da opção 'N/A'}, ou {} se não achar. Cache em memória."""
+    agora = time.monotonic()
+    dados = _na_reuniao_cache["dados"]
+    if dados is not None:
+        ttl = NA_REUNIAO_TTL_OK if (dados.get("key") and dados.get("na_id")) else NA_REUNIAO_TTL_FALHA
+        if agora - _na_reuniao_cache["at"] < ttl:
+            return dados
+    dados = {}
+    try:
+        r = requests.get(f"{AGENDOR_BASE}/custom_fields/deals", headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        for campo in (r.json().get("data") or []):
+            if "agendada por" not in (campo.get("name") or "").lower():
+                continue
+            chave = campo.get("identifier") or campo.get("key") or campo.get("slug")
+            na_id = None
+            for opt in (campo.get("options") or campo.get("values") or []):
+                if (opt.get("name") or opt.get("value") or "").strip().lower() == "n/a":
+                    na_id = opt.get("id")
+                    break
+            dados = {"key": chave, "na_id": na_id}
+            break
+    except Exception as e:
+        print(f"[perda-d10] Erro ao resolver campo/opção N/A: {e}", flush=True)
+    _na_reuniao_cache.update(at=agora, dados=dados)
+    return dados
+
+
+def deal_tem_reuniao(deal_id) -> bool:
+    """True se há tarefa do tipo Reunião no negócio (a API de tarefas só olha
+    os últimos 30 dias). Em erro ou dúvida devolve True: é o lado seguro, pois
+    significa NÃO marcar 'N/A'."""
+    try:
+        date_gt = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+        r = requests.get(f"{AGENDOR_BASE}/deals/{deal_id}/tasks", headers=HEADERS,
+                         params={"updatedDateGt": date_gt, "per_page": 100}, timeout=15)
+        if r.status_code != 200:
+            return True
+        return any(normalize_tipo(t.get("type")) == "Reunião" for t in (r.json().get("data") or []))
+    except Exception as e:
+        print(f"[perda-d10] Erro ao checar reunião do negócio {deal_id}: {e}", flush=True)
+        return True
+
+
+def preencher_reuniao_agendada_por_na(deal_id, custom) -> bool:
+    """Marca 'Reunião agendada por' = N/A quando o campo está vazio e o negócio
+    não tem reunião. Melhor esforço: se o campo ou a opção N/A não existirem,
+    só avisa no log e NÃO bloqueia a perda."""
+    campo = resolver_opcao_na_agendada_por()
+    chave, na_id = campo.get("key"), campo.get("na_id")
+    if not chave or not na_id:
+        print("[perda-d10] AVISO: campo 'Reunião agendada por' ou opção 'N/A' não encontrados "
+              "— não preenchido", flush=True)
+        return False
+    if _campo_preenchido(custom, chave):
+        return False
+    if deal_tem_reuniao(deal_id):
+        print(f"[perda-d10] Negócio tem reunião (ou não foi possível confirmar) — "
+              f"'Reunião agendada por' mantido deal={deal_id}", flush=True)
+        return False
+    try:
+        r = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}",
+                         headers={**HEADERS, "Content-Type": "application/json"},
+                         json={"customFields": {chave: na_id}}, timeout=15)
+        print(f"[perda-d10] 'Reunião agendada por'=N/A deal={deal_id} status={r.status_code}", flush=True)
+        return r.status_code < 300
+    except Exception as e:
+        print(f"[perda-d10] Erro ao gravar N/A deal={deal_id}: {e}", flush=True)
+        return False
+
+
+def marcar_perdido_d10_com_validacoes(deal_id, loss_reason_id, end_time=None) -> str:
+    """Aplica as regras acima e, só então, marca o negócio como perdido.
+    Retorna "perdido", "aguardando_origem" (nada foi perdido; tenta de novo
+    depois) ou "falha"."""
+    fresco = buscar_deal_fresco(deal_id, com_custom_fields=True)
+    if not fresco:
+        return "falha"
+    custom = fresco.get("customFields") or {}
+    preencher_reuniao_agendada_por_na(deal_id, custom)
+    if not _campo_preenchido(custom, ORIGEM_NEGOCIO_SLUG):
+        print(f"[perda-d10] Origem do negócio ainda vazia — perda adiada deal={deal_id}", flush=True)
+        return "aguardando_origem"
+    return "perdido" if marcar_negocio_perdido(deal_id, loss_reason_id, end_time=end_time) else "falha"
 
 
 def _data_gt_para_tasks_d10(deal: dict) -> str:
@@ -7538,6 +7673,71 @@ def data_historica_d10_da_task(deal: dict) -> str:
     return iso_utc
 
 
+MOVIMENTOS_MAX_PAGINAS = 80  # 80 x 100 eventos; teto de segurança
+
+
+def datas_entrada_d10_pelo_historico(ids, desde) -> dict:
+    """Plano B para a data de encerramento quando o negócio está na etapa D10
+    mas NÃO tem a tarefa 'Follow-up automático (D10)' (ex: a criação da tarefa
+    falhou). Usa GET /deals/movements_history (documentado: lista as mudanças
+    de etapa num intervalo de até 30 dias) e devolve, por negócio, o momento
+    da movimentação MAIS RECENTE para a etapa D10, em ISO UTC.
+
+    Fail-closed: erro em qualquer página => {} (ninguém é fechado sem data
+    real). Negócio sem evento no intervalo simplesmente não entra no
+    resultado e continua sendo pulado."""
+    ids = {int(i) for i in ids}
+    if not ids:
+        return {}
+    agora = datetime.now(timezone.utc)
+    if desde.tzinfo is None:
+        desde = desde.replace(tzinfo=timezone.utc)
+    inicio = max(desde - timedelta(days=1), agora - timedelta(days=29))
+    dias = min(30, max(1, (agora - inicio).days + 2))
+    achados = {}
+    pagina = 1
+    while pagina <= MOVIMENTOS_MAX_PAGINAS:
+        try:
+            r = requests.get(
+                f"{AGENDOR_BASE}/deals/movements_history", headers=HEADERS,
+                params={"since": inicio.strftime("%Y-%m-%dT%H:%M:%SZ"), "days_interval": dias,
+                        "per_page": 100, "page": pagina},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                print(f"[reconcile-d10] movements_history status={r.status_code} página={pagina} "
+                      f"body={r.text[:200]} — sem data pelo histórico nesta rodada", flush=True)
+                return {}
+            eventos = r.json().get("data") or []
+        except Exception as e:
+            print(f"[reconcile-d10] Erro em movements_history página={pagina}: {e}", flush=True)
+            return {}
+        for ev in eventos:
+            try:
+                if ev.get("event_type") != "stage_changed":
+                    continue
+                if (ev.get("deal_stage") or {}).get("id") != ETAPA_PERDIDO_SEM_CONTATO:
+                    continue
+                deal_ev = (ev.get("deal") or {}).get("id")
+                if deal_ev is None or int(deal_ev) not in ids:
+                    continue
+                quando = datetime.fromisoformat(str(ev.get("updated_at")).replace("Z", "+00:00"))
+                if quando.tzinfo is None:
+                    quando = quando.replace(tzinfo=timezone.utc)
+                if int(deal_ev) not in achados or quando > achados[int(deal_ev)]:
+                    achados[int(deal_ev)] = quando
+            except Exception:
+                continue  # evento mal formado: ignora só ele
+        if len(eventos) < 100:
+            break
+        pagina += 1
+    else:
+        print(f"[reconcile-d10] movements_history atingiu o teto de {MOVIMENTOS_MAX_PAGINAS} páginas; "
+              f"resultado pode estar incompleto", flush=True)
+    return {did: dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            for did, dt in achados.items()}
+
+
 def executar_reconciliacao_perdidos_d10() -> dict:
     """Corrige negócios travados em Perdido - sem retorno (D10).
 
@@ -7546,12 +7746,15 @@ def executar_reconciliacao_perdidos_d10() -> dict:
     - está exatamente em Perdido - sem retorno (D10);
     - status formal ainda é Em andamento;
     - o GET fresco confirma novamente etapa e status;
-    - existe task do próprio negócio com texto 'Follow-up automático (D10)';
-    - essa task possui createdAt válido.
+    - existe task do próprio negócio com texto 'Follow-up automático (D10)',
+      com createdAt válido; OU (plano B, 14/10/2026) não existe essa task mas
+      GET /deals/movements_history mostra a movimentação real para a etapa D10.
 
-    Quando validado, createdAt da PRIMEIRA task D10 vira endTime, o status é
-    marcado como lost e o motivo 2.1 Sem Retorno do Lead é associado. lostAt
-    continua controlado pelo Agendor e registra o momento da correção.
+    Quando validado, createdAt da PRIMEIRA task D10 (ou, no plano B, o momento
+    da movimentação para a D10) vira endTime, o status é marcado como lost e o
+    motivo 2.1 Sem Retorno do Lead é associado. lostAt continua controlado pelo
+    Agendor e registra o momento da correção. Também exige origem preenchida e
+    marca 'Reunião agendada por' = N/A (ver marcar_perdido_d10_com_validacoes).
 
     Se qualquer evidência faltar, NÃO altera o negócio.
     """
@@ -7560,6 +7763,7 @@ def executar_reconciliacao_perdidos_d10() -> dict:
         "candidatos": 0,
         "corrigidos": 0,
         "pulados_sem_task_d10": 0,
+        "pulados_sem_origem": 0,
         "falhas": 0,
         "detalhes": [],
     }
@@ -7571,11 +7775,34 @@ def executar_reconciliacao_perdidos_d10() -> dict:
         and (d.get("dealStatus") or {}).get("id") == 1
     ]
     resultado["candidatos"] = len(candidatos)
+    resultado["corrigidos_por_historico"] = 0
+    sem_task = []  # (deal_id, startTime) sem tarefa D10: tentam o plano B depois do loop
+
+    def _concluir(deal_id, end_time, fonte):
+        estado = marcar_perdido_d10_com_validacoes(deal_id, LOSS_REASON_SEM_RETORNO, end_time=end_time)
+        if estado == "perdido":
+            resultado["corrigidos"] += 1
+            if fonte == "historico_movimentacao":
+                resultado["corrigidos_por_historico"] += 1
+            resultado["detalhes"].append({
+                "deal_id": deal_id,
+                "status": "corrigido",
+                "endTime": end_time,
+                "fonte": fonte,
+            })
+        elif estado == "aguardando_origem":
+            resultado["pulados_sem_origem"] += 1
+            resultado["detalhes"].append({"deal_id": deal_id, "status": "aguardando_origem"})
+        else:
+            resultado["falhas"] += 1
+            resultado["detalhes"].append({"deal_id": deal_id, "status": "falha_atualizacao"})
+        # Evita rajada de chamadas na API se houver vários travados.
+        time.sleep(0.4)
 
     for deal_cache in candidatos:
         deal_id = deal_cache.get("id")
         try:
-            fresco = buscar_deal_fresco(deal_id)
+            fresco = buscar_deal_fresco(deal_id, com_custom_fields=True)
             if not fresco:
                 resultado["falhas"] += 1
                 resultado["detalhes"].append({"deal_id": deal_id, "status": "falha_busca"})
@@ -7594,26 +7821,19 @@ def executar_reconciliacao_perdidos_d10() -> dict:
                 })
                 continue
 
+            # Chegou (ou está) na etapa D10: sem reunião, 'Reunião agendada
+            # por' vira N/A — mesmo nos negócios sem task D10 (ex: arrastados
+            # à mão), que seguem sem ser perdidos automaticamente.
+            preencher_reuniao_agendada_por_na(deal_id, fresco.get("customFields"))
+
             end_time = data_historica_d10_da_task(fresco)
             if not end_time:
-                resultado["pulados_sem_task_d10"] += 1
-                resultado["detalhes"].append({"deal_id": deal_id, "status": "sem_task_d10_confiavel"})
+                # Sem a tarefa D10: tenta o plano B (histórico de movimentação)
+                # depois do loop, numa única consulta para todos.
+                sem_task.append((deal_id, fresco.get("startTime")))
                 continue
 
-            ok = marcar_negocio_perdido(deal_id, LOSS_REASON_SEM_RETORNO, end_time=end_time)
-            if ok:
-                resultado["corrigidos"] += 1
-                resultado["detalhes"].append({
-                    "deal_id": deal_id,
-                    "status": "corrigido",
-                    "endTime": end_time,
-                })
-            else:
-                resultado["falhas"] += 1
-                resultado["detalhes"].append({"deal_id": deal_id, "status": "falha_atualizacao"})
-
-            # Evita rajada de chamadas na API se houver vários travados.
-            time.sleep(0.4)
+            _concluir(deal_id, end_time, "task_d10")
         except Exception as e:
             resultado["falhas"] += 1
             resultado["detalhes"].append({
@@ -7622,6 +7842,40 @@ def executar_reconciliacao_perdidos_d10() -> dict:
                 "erro": str(e)[:200],
             })
             print(f"[reconcile-d10] Erro deal={deal_id}: {e}", flush=True)
+
+    # Plano B: negócios na D10 sem tarefa D10. A data de encerramento vem da
+    # movimentação REAL para a etapa D10 (documentada no Agendor); se ela não
+    # for encontrada, o negócio continua pulado, como antes.
+    if sem_task:
+        desde = datetime.now(timezone.utc)
+        for _, st in sem_task:
+            try:
+                dt_st = datetime.fromisoformat(str(st).replace("Z", "+00:00"))
+                if dt_st.tzinfo is None:
+                    dt_st = dt_st.replace(tzinfo=timezone.utc)
+                desde = min(desde, dt_st)
+            except Exception:
+                desde = datetime.now(timezone.utc) - timedelta(days=29)
+                break
+        datas = {}
+        try:
+            datas = datas_entrada_d10_pelo_historico([d for d, _ in sem_task], desde)
+        except Exception as e:
+            print(f"[reconcile-d10] Erro no plano B (histórico): {e}", flush=True)
+        for deal_id, _ in sem_task:
+            try:
+                end_time = datas.get(int(deal_id))
+                if not end_time:
+                    resultado["pulados_sem_task_d10"] += 1
+                    resultado["detalhes"].append({"deal_id": deal_id, "status": "sem_task_d10_confiavel"})
+                    continue
+                print(f"[reconcile-d10] Sem tarefa D10; data pela movimentação deal={deal_id} "
+                      f"endTime={end_time}", flush=True)
+                _concluir(deal_id, end_time, "historico_movimentacao")
+            except Exception as e:
+                resultado["falhas"] += 1
+                resultado["detalhes"].append({"deal_id": deal_id, "status": "erro", "erro": str(e)[:200]})
+                print(f"[reconcile-d10] Erro (plano B) deal={deal_id}: {e}", flush=True)
 
     print(f"[reconcile-d10] Finalizado: {resultado}", flush=True)
     return resultado
