@@ -8507,7 +8507,7 @@ def _rd_origin_apply_batch():
             os.replace(tmp, _RD_ORIGIN_FILE)
         processed = 0
         for deal_id, esperado in _RD_ORIGIN_CANDIDATES.items():
-            if str(deal_id) in state["results"] and not (state["results"][str(deal_id)].get("status") == "bloqueado" and state["results"][str(deal_id)].get("motivo") in ("fora_funil_comercial", "saiu_funil_antes_escrita")):
+            if str(deal_id) in state["results"] and not (state["results"][str(deal_id)].get("status") == "bloqueado" and state["results"][str(deal_id)].get("motivo") in ("fora_funil_comercial", "saiu_funil_antes_escrita", "origem_rd_divergente", "opcao_origem_inexistente")):
                 continue
             if processed >= 15:
                 break
@@ -8517,8 +8517,8 @@ def _rd_origin_apply_batch():
                     janela_segundos=900, campos_permitidos={"origem_do_negocio"}, permitir_funil_historico=True)
                 if leitura.get("status") != "diagnostico_somente_leitura":
                     result = {"status": "bloqueado", "motivo": leitura.get("motivo")}
-                elif leitura.get("origem_do_negocio") != esperado:
-                    result = {"status": "bloqueado", "motivo": "origem_rd_divergente"}
+                elif _rd_mapear_origem_negocio(leitura.get("origem_do_negocio")) != _rd_mapear_origem_negocio(esperado):
+                    result = {"status": "bloqueado", "motivo": "origem_rd_divergente", "origem_esperada": esperado, "origem_rd_obtida": leitura.get("origem_do_negocio")}
                 elif not (leitura.get("campos") or {}).get("origem_do_negocio", {}).get("preenchimento_pendente"):
                     result = {"status": "ja_preenchido_ou_sem_valor"}
                 elif not (leitura.get("opcao_agendor") or {}).get("encontrada"):
