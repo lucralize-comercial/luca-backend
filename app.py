@@ -8496,7 +8496,15 @@ def _rd_origin_apply_batch():
                 state = json.load(fd)
         except FileNotFoundError:
             state = {"status": "executando", "results": {}, "version": 1}
-        if state.get("status") == "concluido":
+        # Uma unica nova avaliacao dos bloqueios por versao de criterio.
+        retry_version = 2
+        pendentes_revisao = any(
+            r.get("status") == "bloqueado"
+            and r.get("motivo") in ("fora_funil_comercial", "saiu_funil_antes_escrita", "origem_rd_divergente", "opcao_origem_inexistente")
+            and r.get("retry_version") != retry_version
+            for r in state.get("results", {}).values()
+        )
+        if state.get("status") == "concluido" and not pendentes_revisao:
             return
         def persist():
             tmp = _RD_ORIGIN_FILE + ".tmp"
@@ -8507,7 +8515,13 @@ def _rd_origin_apply_batch():
             os.replace(tmp, _RD_ORIGIN_FILE)
         processed = 0
         for deal_id, esperado in _RD_ORIGIN_CANDIDATES.items():
-            if str(deal_id) in state["results"] and not (state["results"][str(deal_id)].get("status") == "bloqueado" and state["results"][str(deal_id)].get("motivo") in ("fora_funil_comercial", "saiu_funil_antes_escrita", "origem_rd_divergente", "opcao_origem_inexistente")):
+            anterior = state["results"].get(str(deal_id), {})
+            revisavel = (
+                anterior.get("status") == "bloqueado"
+                and anterior.get("motivo") in ("fora_funil_comercial", "saiu_funil_antes_escrita", "origem_rd_divergente", "opcao_origem_inexistente")
+                and anterior.get("retry_version") != retry_version
+            )
+            if anterior and not revisavel:
                 continue
             if processed >= 15:
                 break
@@ -8535,6 +8549,8 @@ def _rd_origin_apply_batch():
                     # Nunca marcar sucesso sem confirmacao de leitura apos PUT.
                     if result["status"] == "atualizado_confirmado" and "origem_do_negocio" not in result["campos"]:
                         result = {"status": "escrita_nao_confirmada"}
+                if result.get("status") == "bloqueado":
+                    result["retry_version"] = retry_version
                 state["results"][str(deal_id)] = result
                 processed += 1
                 persist()
