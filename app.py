@@ -8165,9 +8165,9 @@ def _rd_origin_apply_batch():
         fh.close()
 
 scheduler.add_job(_rd_jan26_pontual, "interval", minutes=20, id="rd_jan26_pontual_interval")
-scheduler.add_job(_rd_origin_apply_batch, "interval", minutes=20, id="rd_origin_2025_2026_batch")
+# HISTORICO RD PAUSADO: scheduler.add_job(_rd_origin_apply_batch, "interval", minutes=20, id="rd_origin_2025_2026_batch")
 scheduler.add_job(_rd_jan26_pontual, "date", run_date=datetime.now() + timedelta(minutes=3), id="rd_jan26_pontual_first")
-scheduler.add_job(_rd_origin_apply_batch, "date", run_date=datetime.now() + timedelta(minutes=10), id="rd_origin_2025_2026_first")
+# HISTORICO RD PAUSADO: scheduler.add_job(_rd_origin_apply_batch, "date", run_date=datetime.now() + timedelta(minutes=10), id="rd_origin_2025_2026_first")
 scheduler.start()
 
 if __name__ == "__main__":
