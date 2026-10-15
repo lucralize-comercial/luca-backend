@@ -8364,9 +8364,44 @@ def limpar_memoria_conversas_inativas_safe():
 # SCHEDULER + MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _resumo_comercial_outubro_log():
+    """Somente agregados: sem tokens, contatos ou qualquer chamada adicional a API."""
+    inicio, fim = "2026-10-01", "2026-10-16"
+    deals = cache.get("deals") or []
+    tasks = tasks_cache.get("data") or []
+    if not deals or not tasks or not cache.get("updated_at") or not tasks_cache.get("updated_at"):
+        print("[comercial-outubro] aguardando_caches_deals_tasks", flush=True)
+        return
+    leads = {str(d.get("id")) for d in deals
+             if d.get("id") is not None and inicio <= str(d.get("startTime") or "")[:10] < fim}
+    reunioes = {}
+    sem_data = 0
+    for t in tasks:
+        if str(t.get("type") or "").strip().lower() not in ("reunião", "reuniao", "meeting"):
+            continue
+        criada = str(t.get("createdAt") or "")
+        if not criada:
+            sem_data += 1
+            continue
+        if inicio <= criada[:10] < fim:
+            reunioes[str(t.get("id") or "sem_id_"+str(len(reunioes)))] = t
+    print("[comercial-outubro] " + json.dumps({
+        "periodo": "2026-10-01 a 2026-10-15",
+        "leads_criados": len(leads),
+        "reunioes_criadas": len(reunioes),
+        "tarefas_reuniao_sem_createdAt": sem_data,
+        "cache_deals_at": cache.get("updated_at"),
+        "cache_tasks_at": tasks_cache.get("updated_at"),
+        "total_deals_cache": len(deals),
+        "total_tasks_cache": len(tasks),
+        "observacao": "reunioes sao tarefas criadas no periodo, nao realizadas"
+    }, ensure_ascii=False), flush=True)
+
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
 scheduler.add_job(fetch_tasks_job, "interval", hours=2, id="tasks_recorrente")
+scheduler.add_job(_resumo_comercial_outubro_log, "interval", minutes=15, id="resumo_comercial_outubro_logs")
 scheduler.add_job(varredura_lembretes_safe, "interval", minutes=15, id="lembretes_reuniao")
 def log_resumo_usage():
     """Imprime no log um resumo do consumo de tokens acumulado até agora
