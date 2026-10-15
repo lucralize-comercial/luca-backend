@@ -4592,7 +4592,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                                     if m.get("role") == "user"
                                 ).lower()
                                 campanha_6x1 = bool(
-                                    re.search(r"(?:escala\\s*6\\s*[x×/]\\s*1|fim da escala 6x1)", historico_6x1)
+                                    re.search(r"(?:escala\s*6\s*[x×/]\s*1|fim da escala 6x1)", historico_6x1)
                                     and ("consultoria" in historico_6x1 or "guia" in historico_6x1)
                                 )
                                 empresa_6x1 = str(d.get("empresa_nome") or "").strip()
