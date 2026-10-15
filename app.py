@@ -8398,10 +8398,58 @@ def _resumo_comercial_outubro_log():
     }, ensure_ascii=False), flush=True)
 
 
+
+def _relatorio_coortes_comerciais_log():
+    """Coortes por data de criacao do negocio; leitura dos caches, sem chamadas API."""
+    deals = cache.get("deals") or []
+    tasks = tasks_cache.get("data") or []
+    if not deals or not tasks or not cache.get("updated_at") or not tasks_cache.get("updated_at"):
+        print("[coortes-comerciais] aguardando_caches", flush=True)
+        return
+    rows = {}
+    for periodo, inicio, fim in (
+        ("setembro", "2026-09-01", "2026-10-01"),
+        ("outubro_ate_15", "2026-10-01", "2026-10-16"),
+    ):
+        cohort = {
+            str(d.get("id")): d for d in deals
+            if d.get("id") is not None and inicio <= str(d.get("startTime") or "")[:10] < fim
+        }
+        reuniao_ids = set()
+        tarefas_coorte = 0
+        for t in tasks:
+            if str(t.get("type") or "").strip().lower() not in ("reunião", "reuniao", "meeting"):
+                continue
+            deal = t.get("deal") or {}
+            did = str(deal.get("id") if isinstance(deal, dict) else deal)
+            if did in cohort:
+                reuniao_ids.add(did)
+                tarefas_coorte += 1
+        ganhos = {
+            did for did, d in cohort.items()
+            if d.get("wonAt") or (d.get("dealStatus") or {}).get("id") == 2
+        }
+        rows[periodo] = {
+            "leads": len(cohort),
+            "leads_com_reuniao_no_cache": len(reuniao_ids),
+            "tarefas_de_reuniao_no_cache": tarefas_coorte,
+            "ganhos_da_coorte": len(ganhos),
+            "ganhos_com_reuniao_no_cache": len(ganhos & reuniao_ids),
+        }
+    print("[coortes-comerciais] " + json.dumps({
+        "base": rows,
+        "cache_deals_at": cache.get("updated_at"),
+        "cache_tasks_at": tasks_cache.get("updated_at"),
+        "nota": "reunioes vinculadas aos mesmos negocios, independente da data da reuniao; setembro pode estar incompleto porque tarefas so abrangem ultimos 30 dias"
+    }, ensure_ascii=False), flush=True)
+
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(fetch_deals_safe, "interval", hours=1, id="fetch_recorrente")
 scheduler.add_job(fetch_tasks_job, "interval", hours=2, id="tasks_recorrente")
 scheduler.add_job(_resumo_comercial_outubro_log, "interval", minutes=15, id="resumo_comercial_outubro_logs")
+scheduler.add_job(_relatorio_coortes_comerciais_log, "interval", minutes=15, id="relatorio_coortes_comerciais")
+scheduler.add_job(_relatorio_coortes_comerciais_log, "date", run_date=datetime.now() + timedelta(minutes=2), id="relatorio_coortes_inicial")
 scheduler.add_job(varredura_lembretes_safe, "interval", minutes=15, id="lembretes_reuniao")
 def log_resumo_usage():
     """Imprime no log um resumo do consumo de tokens acumulado até agora
