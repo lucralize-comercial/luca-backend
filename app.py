@@ -8413,7 +8413,9 @@ def _relatorio_coortes_comerciais_log():
     ):
         cohort = {
             str(d.get("id")): d for d in deals
-            if d.get("id") is not None and inicio <= str(d.get("startTime") or "")[:10] < fim
+            if d.get("id") is not None
+            and str(((d.get("dealStage") or {}).get("funnel") or {}).get("id")) == str(FUNIL_COMERCIAL_ID)
+            and inicio <= str(d.get("startTime") or "")[:10] < fim
         }
         reuniao_ids = set()
         tarefas_coorte = 0
@@ -8437,6 +8439,7 @@ def _relatorio_coortes_comerciais_log():
             "ganhos_com_reuniao_no_cache": len(ganhos & reuniao_ids),
         }
     print("[coortes-comerciais] " + json.dumps({
+        "funil_id": FUNIL_COMERCIAL_ID,
         "base": rows,
         "cache_deals_at": cache.get("updated_at"),
         "cache_tasks_at": tasks_cache.get("updated_at"),
