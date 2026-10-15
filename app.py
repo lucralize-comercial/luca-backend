@@ -1002,7 +1002,7 @@ def create_teams_meeting(lead_name: str, lead_email: str, start_iso: str,
         "isOnlineMeeting": True,
         "onlineMeetingProvider": "teamsForBusiness",
     }
-    url = f"https://graph.microsoft.com/v1.0/users/{TEAMS_ORGANIZADOR}/events"
+    url = f"https://graph.microsoft.com/v1.0/users/{'evertonsilva@lucralize.com.br' if campanha_6x1 else TEAMS_ORGANIZADOR}/events"
     r = requests.post(url, headers=headers, json=payload, timeout=20)
     r.raise_for_status()
     evento = r.json()
