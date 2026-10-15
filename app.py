@@ -370,7 +370,7 @@ CTA CAMPANHA ESCALA 6X1 — EXCLUSIVO LUCRALIZE CONTABILIDADE (EXCEÇÃO PRIORIT
 Se o contato mencionar o guia da Lucralize sobre o fim da escala 6x1 ou pedir consultoria relativa à escala 6x1, reconheça imediatamente o CTA como uma solicitação de consultoria da LUCRALIZE CONTABILIDADE, com participação das equipes Contábil e Jurídica. Este fluxo NÃO é um serviço da Lucralize Tech.
 REGRA ESPECIAL: atenda e conduza o agendamento NESTE CANAL tanto para clientes atuais da Lucralize quanto para novos leads. Mesmo que o contato diga "já sou cliente", NÃO envie a mensagem padrão de canais oficiais de atendimento; a exceção da campanha 6x1 prevalece sobre a regra CLIENTE JÁ EXISTENTE. Não pergunte se é Tech ou Contabilidade para decidir o encaminhamento deste CTA.
 Exemplo de resposta: "Claro! A consultoria sobre a escala 6x1 é conduzida pelas equipes Contábil e Jurídica da Lucralize Contabilidade. Vamos organizar seu atendimento por aqui. Como posso te chamar e qual é o nome da sua empresa?"
-Colete os dados necessários (nome, empresa, e-mail e preferência de dia/horário) sem qualificação genérica longa. Identifique no resumo da conversa "CTA Guia escala 6x1 — Lucralize Contabilidade — Consultoria Contábil + Jurídica"; preserve esse contexto no registro do CRM. Não afirme que uma alteração legal já está aprovada e não ofereça parecer jurídico definitivo no chat.
+Colete os dados necessários (nome, empresa, e-mail e preferência de dia/horário) sem qualificação genérica longa. Confirme expressamente o nome da empresa para constar no título da reunião do Teams. O organizador será evertonsilva@lucralize.com.br e as cópias serão ronaldojunior@lucralize.com.br, luizsantos@lucralize.com.br e guilherme@perdomo.adv.br; o título será "Consultoria Contábil + Jurídica (Escala 6x1) - [nome da empresa]" (hífen simples, sem travessão longo). Identifique no resumo da conversa "CTA Guia escala 6x1 — Lucralize Contabilidade — Consultoria Contábil + Jurídica"; preserve esse contexto no registro do CRM. Não afirme que uma alteração legal já está aprovada e não ofereça parecer jurídico definitivo no chat.
 O Teams padrão NÃO garante a presença conjunta das equipes Contábil e Jurídica. Até que os participantes da consultoria específica sejam configurados e a disponibilidade conjunta confirmada, registre a preferência e informe que a equipe confirmará a reunião. Não crie convite padrão nem afirme que ambos participarão de reunião já confirmada sem validação.
 
 CLIENTE JÁ EXISTENTE (REGRA GERAL; EXCETO CTA DA CONSULTORIA ESCALA 6X1 DA LUCRALIZE CONTABILIDADE):
@@ -934,7 +934,8 @@ def extrair_emails(texto: str) -> list:
 
 
 def create_teams_meeting(lead_name: str, lead_email: str, start_iso: str,
-                          linha_negocio: str = "contabilidade", duracao_min: int = 30) -> dict:
+                          linha_negocio: str = "contabilidade", duracao_min: int = 30,
+                          campanha_6x1: bool = False, empresa_nome: str = "") -> dict:
     """Cria a reunião de verdade no Teams via Microsoft Graph, com:
       - Organizador: TEAMS_ORGANIZADOR ([especialista], por padrão)
       - Convidados em cópia: TEAMS_COPIA (só [gestor], por padrão — Luiz
@@ -976,14 +977,22 @@ def create_teams_meeting(lead_name: str, lead_email: str, start_iso: str,
     # bloqueia a criação da reunião por causa disso)
     attendees = [{"emailAddress": {"address": email, "name": lead_name},
                   "type": "required"} for email in emails_lead]
-    for email_copia in TEAMS_COPIA:
+    # A campanha escala 6x1 tem convidados próprios; reuniões comuns permanecem inalteradas.
+    copias = (
+        ["ronaldojunior@lucralize.com.br", "luizsantos@lucralize.com.br", "guilherme@perdomo.adv.br"]
+        if campanha_6x1 else TEAMS_COPIA
+    )
+    for email_copia in copias:
         attendees.append({"emailAddress": {"address": email_copia}, "type": "optional"})
 
     inicio = datetime.strptime(start_iso[:19], "%Y-%m-%dT%H:%M:%S")
     fim = inicio + timedelta(minutes=duracao_min)
 
     nome_linha = "Lucralize Tech" if linha_negocio == "tech" else "Lucralize Contabilidade"
-    subject = f"Videochamada {nome_linha} - {(lead_name or '').strip()}"
+    subject = (
+        f"Consultoria Contábil + Jurídica (Escala 6x1) - {empresa_nome.strip()}"
+        if campanha_6x1 else f"Videochamada {nome_linha} - {(lead_name or '').strip()}"
+    )
 
     payload = {
         "subject": subject,
@@ -4578,7 +4587,25 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                                 linha_negocio = detectar_linha_negocio(d.get("segmento", ""))
                                 nome_reuniao = d.get("nome") or contact_name or "Lead"
                                 start_teams = dt_local.strftime("%Y-%m-%dT%H:%M:%S")
-                                resultado_teams = create_teams_meeting(nome_reuniao, email_lead, start_teams, linha_negocio)
+                                historico_6x1 = " ".join(
+                                    m.get("content", "") for m in conv.get("messages", [])
+                                    if m.get("role") == "user"
+                                ).lower()
+                                campanha_6x1 = bool(
+                                    re.search(r"(?:escala\\s*6\\s*[x×/]\\s*1|fim da escala 6x1)", historico_6x1)
+                                    and ("consultoria" in historico_6x1 or "guia" in historico_6x1)
+                                )
+                                empresa_6x1 = str(d.get("empresa_nome") or "").strip()
+                                if campanha_6x1 and not empresa_6x1:
+                                    requer_validacao_time = True
+                                    motivo_validacao = "consultoria 6x1 sem nome da empresa para o convite"
+                                    resultado_teams = {}
+                                else:
+                                    resultado_teams = create_teams_meeting(
+                                        nome_reuniao, email_lead, start_teams,
+                                        "contabilidade" if campanha_6x1 else linha_negocio,
+                                        campanha_6x1=campanha_6x1, empresa_nome=empresa_6x1
+                                    )
                                 teams_join_url = resultado_teams.get("join_url")
                                 if teams_join_url:
                                     texto_reuniao += f"\nLink da reunião (Teams): {teams_join_url}\n{reuniao_real_marcador}"
@@ -4937,6 +4964,7 @@ NUNCA invente, deduza ou chute um valor plausível; vazio é sempre melhor que u
 {{
   "nome": "",
   "segmento": "",
+  "empresa_nome": "",
   "empresa_situacao": "",
   "faturamento_aproximado": "",
   "contador_atual": "",
@@ -4956,6 +4984,7 @@ NUNCA invente, deduza ou chute um valor plausível; vazio é sempre melhor que u
 }}
 
 Campos de DADOS DO LEAD (extração direta, factual):
+"empresa_nome" = razão social ou nome fantasia da empresa, SOMENTE se o contato informar explicitamente; não usar o nome da pessoa como substituto.
 "empresa_situacao" = se o lead já tem CNPJ aberto ou vai abrir (ex: "Já possui CNPJ", "Vai abrir novo CNPJ", "Segundo CNPJ").
 "faturamento_aproximado" = valor ou faixa que o lead mencionou (ex: "~R$8mil/mês"). Só se ele disse um número, nunca estime.
 "contador_atual" = "Sim" ou "Não" se o lead mencionou ter contador atualmente; inclua o motivo de troca só se ele disse explicitamente (ex: "Sim, mas contador demora pra responder").
