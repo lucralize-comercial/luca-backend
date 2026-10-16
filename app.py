@@ -6935,7 +6935,35 @@ def mover_novos_leads_para_1contato():
                 continue
             telefone = telefone_da_pessoa(person_id)
             if not telefone:
-                print(f"[novo_lead] Pulado — sem telefone person={person_id} deal={deal_id}", flush=True)
+                # Telefone ausente: confirmar na API diretamente antes de encerrar.
+                # telefone_da_pessoa retorna "" tambem em 429/timeout; isso NAO comprova dado invalido.
+                try:
+                    rp = requests.get(f"{AGENDOR_BASE}/people/{person_id}", headers=HEADERS, timeout=15)
+                    rp.raise_for_status()
+                    contato = ((rp.json().get("data") or {}).get("contact") or {})
+                    campos = [contato.get(k) for k in ("whatsapp", "mobile", "work")]
+                    # So encerra quando os tres campos estao efetivamente vazios.
+                    # Numeros malformados ou incompletos precisam de verificacao humana.
+                    sem_telefone_confirmado = not any(str(v).strip() for v in campos if v is not None)
+                except Exception as e:
+                    print(f"[novo_lead] Sem telefone nao confirmado (API indisponivel) deal={deal_id}: {e}", flush=True)
+                    continue
+                if not sem_telefone_confirmado:
+                    print(f"[novo_lead] Telefone presente mas inutilizavel; revisao manual deal={deal_id}", flush=True)
+                    continue
+                fresco = buscar_deal_fresco(deal_id)
+                if ((fresco.get("dealStage") or {}).get("id") != ETAPA_NOVO_LEAD_ID
+                        or fresco.get("wonAt") or fresco.get("lostAt")
+                        or (fresco.get("dealStatus") or {}).get("id") in (2, 3)):
+                    print(f"[novo_lead] Sem telefone; status ou etapa mudou, nao encerrar deal={deal_id}", flush=True)
+                    continue
+                # Encerramento irreversivel apenas com dado comprovadamente ausente.
+                # Primeiro marca perdido com o motivo; em seguida registra a etapa final.
+                if marcar_negocio_perdido(deal_id, LOSS_REASON_CONTATO_INVALIDO):
+                    mover_etapa_funil_comercial(deal_id, ETAPA_PERDIDO_SEM_CONTATO)
+                    print(f"[novo_lead] Contato sem telefone: perdido motivo=2.4 deal={deal_id}", flush=True)
+                else:
+                    print(f"[novo_lead] Falha ao encerrar contato sem telefone deal={deal_id}", flush=True)
                 continue
             conv = conversa_do_telefone(telefone)
             if not conv:
