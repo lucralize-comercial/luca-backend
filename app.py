@@ -3673,6 +3673,12 @@ def agendor_deal_created():
         # Se veio do RD Station, não preenche origem
         if "Criado automaticamente pela integração com RD Station" in description:
             print(f"[deal-created] IGNORADO — origem RD Station, deal={deal_id}", flush=True)
+            # Negócio importado pelo RD: o lead ainda não escreveu, então a saudação
+            # inicial (template) é enviada pelo Luca. Desligado por padrão
+            # (BOAS_VINDAS_LUCA_ATIVO); roda em segundo plano para responder rápido.
+            if _flag("BOAS_VINDAS_LUCA_ATIVO", "false"):
+                threading.Thread(target=_boas_vindas_rd_em_segundo_plano,
+                                 args=(deal_id,), daemon=True).start()
             return jsonify({"status": "ignored", "reason": "rd_station"}), 200
 
         # Se já tem origem preenchida, não sobrescreve
@@ -5199,6 +5205,13 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                 if remote_history:
                     conv["messages"] = remote_history
                     print(f"[history] Histórico atualizado após delay: {len(remote_history)} msgs conv={conversation_id}", flush=True)
+                # Só afirma que "uma saudação já foi enviada" se existe mesmo uma
+                # mensagem do lado do atendimento no histórico. Sem a automação, o lead
+                # que escreve primeiro NÃO recebe saudação: aí o Luca se apresenta
+                # normalmente. Se o histórico remoto não veio (falha de API), mantém
+                # o comportamento de antes (assume que a saudação existe).
+                ha_saudacao_previa = (not remote_history) or any(
+                    m.get("role") == "assistant" for m in conv["messages"])
                 # Injeta instrução para não repetir o que o template já disse
                 # Se o template de boas-vindas ficou como ÚLTIMO turno (acontece
                 # quando o lead manda só 1 mensagem e não escreve de novo durante
@@ -5213,9 +5226,9 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                 # turno "user" de verdade.
                 if conv["messages"] and conv["messages"][-1]["role"] == "assistant":
                     conv["messages"].pop()
-                if conv["messages"] and conv["messages"][-1]["role"] == "user":
+                if ha_saudacao_previa and conv["messages"] and conv["messages"][-1]["role"] == "user":
                     conv["messages"][-1]["content"] = (
-                        "[ATENÇÃO: Um template de boas-vindas já foi enviado automaticamente pelo sistema antes desta resposta. "
+                        "[ATENÇÃO: Uma saudação de boas-vindas já foi enviada antes desta resposta. "
                         "NÃO repita a saudação nem se apresente novamente. "
                         "Responda diretamente à mensagem do lead, continuando de onde o template parou.]\n\n"
                         + conv["messages"][-1]["content"]
@@ -5573,8 +5586,13 @@ def agendorchat_webhook():
                         and f":{msg_id}]" in (m.get("content") or "")
                         for m in msgs
                     )
-                    if not eh_saudacao_nativa and not veio_do_followup:
-                        print(f"[msg_falhou] Ignorado — mensagem não veio da saudação nativa nem do "
+                    veio_das_boas_vindas = any(
+                        f"[luca:boas_vindas_msg:{msg_id}]" in (m.get("content") or "")
+                        for m in msgs
+                    )
+                    if not eh_saudacao_nativa and not veio_do_followup and not veio_das_boas_vindas:
+                        print(f"[msg_falhou] Ignorado — mensagem não veio da saudação nativa, das "
+                              f"boas-vindas nem do "
                               f"follow-up do Luca (provavelmente de outro serviço, ex: CCT Automação) "
                               f"conv={conversation_id} msg={msg_id}", flush=True)
                         return jsonify({}), 200
@@ -6536,6 +6554,188 @@ def conversa_do_telefone(phone):
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))  # 2s, 4s — corrigido 27/08, era fixo em 3s
     return None
+
+
+# ── Saudação inicial enviada pelo Luca (leads importados pelo RD) ─────────────
+# Antes, a saudação saía pela automação nativa do Agendor ("quando o negócio
+# chegar a 1. Novo Lead"), que também disparava quando o lead escrevia primeiro
+# (o lead recebia duas mensagens). Com a automação retirada, o Luca envia o
+# template de boas-vindas SÓ para negócios criados pela importação do RD (lead
+# ainda não escreveu: fora da janela de 24h, só template da Meta). Lead que
+# escreve primeiro é respondido pelo Luca com mensagem livre.
+# TUDO DESLIGADO por padrão:
+#   BOAS_VINDAS_LUCA_ATIVO=true          liga o recurso
+#   BOAS_VINDAS_MODO_OBSERVACAO=false    padrão "true": só registra no log o que
+#                                        faria, sem criar contato/conversa nem enviar
+RD_DESCRICAO_MARCA = "Criado automaticamente pela integração com RD Station"
+BOAS_VINDAS_TEMPLATE = os.environ.get("BOAS_VINDAS_TEMPLATE", "boas_vindas_primeiro_contato")
+BOAS_VINDAS_ATRASO_SEGUNDOS = int(os.environ.get("BOAS_VINDAS_ATRASO_SEGUNDOS", "20"))
+# Usado só se o template aprovado não trouxer o próprio texto na listagem. Deve
+# ser IGUAL ao aprovado na Meta. Ao trocar de template, troque junto
+# BOAS_VINDAS_TEMPLATE (nome) e BOAS_VINDAS_TEXTO (texto, com {{1}} no lugar do
+# nome; "\n" vira quebra de linha). O padrão abaixo é o da automação atual.
+BOAS_VINDAS_TEXTO_PADRAO = (
+    os.environ.get("BOAS_VINDAS_TEXTO", "").replace("\\n", "\n")
+    or "Oi, {{1}}, tudo bem?\n\n"
+       "Eu sou um especialista em contabilidade para desenvolvedores e recebi o seu contato.\n\n"
+       "Podemos falar por aqui?"
+)
+_boas_vindas_lock = threading.Lock()
+_boas_vindas_em_andamento = set()
+
+
+def _telefone_e164(phone) -> str:
+    digitos = re.sub(r"\D", "", str(phone or ""))
+    if len(digitos) in (10, 11):  # sem DDI: assume Brasil
+        digitos = "55" + digitos
+    return "+" + digitos if digitos else ""
+
+
+def _primeiro_nome(nome_completo) -> str:
+    partes = str(nome_completo or "").strip().split()
+    return partes[0].capitalize() if partes else ""
+
+
+def _texto_boas_vindas(tpl, nome):
+    """Texto completo do template com o nome. Prefere o que o próprio template
+    traz; só cai no texto padrão se a listagem não trouxer o corpo."""
+    for chave in ("content", "body", "text"):
+        v = tpl.get(chave)
+        if isinstance(v, str) and "{{1}}" in v:
+            return v.replace("{{1}}", nome), f"template.{chave}"
+    for comp in (tpl.get("components") or []):
+        if (isinstance(comp, dict) and str(comp.get("type") or "").upper() == "BODY"
+                and isinstance(comp.get("text"), str) and "{{1}}" in comp["text"]):
+            return comp["text"].replace("{{1}}", nome), "template.components"
+    return BOAS_VINDAS_TEXTO_PADRAO.replace("{{1}}", nome), "texto_padrao"
+
+
+def obter_conversa_boas_vindas(phone, nome, criar):
+    """Devolve (conversa_id, criada). Reaproveita contato e conversa existentes
+    na caixa de entrada oficial; só cria se `criar=True`. Levanta exceção em
+    qualquer erro de API: falha NUNCA vira "não existe" (evita duplicar contato
+    ou conversa). Fluxo documentado no Postman do Agendor Chat: contatos/search
+    -> contacts -> contactable_inboxes (traz o source_id certo da caixa) ->
+    conversations."""
+    e164 = _telefone_e164(phone)
+    base = f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}"
+    h = {"api_access_token": AGENDORCHAT_TOKEN, "Content-Type": "application/json"}
+    contact_id = None
+    for q in (e164, e164.lstrip("+")):
+        r = requests.get(f"{base}/contacts/search", headers=h, params={"q": q}, timeout=15)
+        r.raise_for_status()
+        contatos = r.json().get("payload") or []
+        if contatos:
+            contact_id = contatos[0].get("id")
+            break
+    if contact_id:
+        r = requests.get(f"{base}/contacts/{contact_id}/conversations", headers=h, timeout=15)
+        r.raise_for_status()
+        convs = [c for c in (r.json().get("payload") or [])
+                 if str(c.get("inbox_id")) == str(AGENDORCHAT_INBOX_ID)]
+        if convs:
+            return sorted(convs, key=lambda c: c.get("id") or 0)[-1]["id"], False
+    if not criar:
+        return None, False
+    if not contact_id:
+        r = requests.post(f"{base}/contacts", headers=h,
+                          json={"name": nome, "phone_number": e164}, timeout=15)
+        r.raise_for_status()
+        j = r.json() or {}
+        payload = j.get("payload") or {}
+        contact_id = ((payload.get("contact") or {}).get("id") or payload.get("id") or j.get("id"))
+        if not contact_id:
+            raise RuntimeError("Agendor Chat não devolveu o id do contato criado")
+    r = requests.get(f"{base}/contacts/{contact_id}/contactable_inboxes", headers=h, timeout=15)
+    r.raise_for_status()
+    source_id = next((i.get("source_id") for i in (r.json().get("payload") or [])
+                      if str((i.get("inbox") or {}).get("id")) == str(AGENDORCHAT_INBOX_ID)), None)
+    if not source_id:
+        raise RuntimeError("Caixa de entrada oficial indisponível para este contato")
+    r = requests.post(f"{base}/conversations", headers=h,
+                      json={"source_id": source_id, "inbox_id": int(AGENDORCHAT_INBOX_ID),
+                            "contact_id": contact_id}, timeout=20)
+    r.raise_for_status()
+    j = r.json() or {}
+    conv_id = j.get("id") or (j.get("payload") or {}).get("id")
+    if not conv_id:
+        raise RuntimeError("Agendor Chat não devolveu o id da conversa criada")
+    return conv_id, True
+
+
+def enviar_boas_vindas_rd(deal_id) -> str:
+    """Envia a saudação inicial (template) a um negócio criado pela importação
+    do RD. Devolve um código curto do que aconteceu (usado em log e testes)."""
+    if not _flag("BOAS_VINDAS_LUCA_ATIVO", "false"):
+        return "desligado"
+    with _boas_vindas_lock:
+        if deal_id in _boas_vindas_em_andamento:
+            return "em_andamento"
+        _boas_vindas_em_andamento.add(deal_id)
+    try:
+        observacao = _flag("BOAS_VINDAS_MODO_OBSERVACAO", "true")
+        deal = buscar_deal_fresco(deal_id)
+        if not deal:
+            return "sem_negocio"
+        stage = deal.get("dealStage") or {}
+        if (((stage.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID
+                or stage.get("id") != ETAPA_NOVO_LEAD
+                or deal.get("wonAt") or deal.get("lostAt")
+                or (deal.get("dealStatus") or {}).get("id") in (2, 3)):
+            return "fora_do_escopo"
+        if RD_DESCRICAO_MARCA not in (deal.get("description") or ""):
+            return "nao_veio_do_rd"
+        person = deal.get("person") or {}
+        if not person.get("id"):
+            return "sem_pessoa"
+        nome = _primeiro_nome(person.get("name"))
+        if not nome:
+            return "sem_nome"
+        phone = telefone_da_pessoa(person["id"])
+        if not phone:
+            return "sem_telefone"  # a varredura de Novo Lead já trata lead sem telefone
+
+        conv_id, _criada = obter_conversa_boas_vindas(
+            phone, person.get("name") or nome, criar=not observacao)
+        if conv_id:
+            msgs = mensagens_da_conversa(conv_id)
+            if marcador_existe(msgs, f"[luca:boas_vindas:{deal_id}]"):
+                return "ja_enviada"
+            if janela_aberta(msgs):
+                return "lead_ja_escreveu"  # janela aberta: o Luca responde com mensagem livre
+        tpl = template_por_nome(BOAS_VINDAS_TEMPLATE)
+        if not tpl:
+            print(f"[boas-vindas] Template '{BOAS_VINDAS_TEMPLATE}' não encontrado/aprovado "
+                  f"deal={deal_id}", flush=True)
+            return "sem_template"
+        texto, fonte_texto = _texto_boas_vindas(tpl, nome)
+        if observacao:
+            print(f"[boas-vindas] OBSERVAÇÃO: enviaria o template '{BOAS_VINDAS_TEMPLATE}' "
+                  f"deal={deal_id} conversa={'existente' if conv_id else 'a criar'} "
+                  f"texto={fonte_texto}", flush=True)
+            return "observacao"
+        resp = enviar_template_conversa(conv_id, tpl, {"1": nome}, texto)
+        msg_id = (resp or {}).get("id")
+        # [luca:boas_vindas_msg:ID] é o que o tratamento de mensagem não entregue
+        # reconhece (mesmo papel da marca [followup:aguardando_confirmacao:...]).
+        send_private_note(conv_id,
+            f"🔁 Saudação inicial enviada via template (lead importado pelo RD). "
+            f"[luca:boas_vindas:{deal_id}] [luca:boas_vindas_msg:{msg_id}]")
+        print(f"[boas-vindas] ✅ enviada deal={deal_id} conv={conv_id} msg_id={msg_id} "
+              f"texto={fonte_texto}", flush=True)
+        return "enviada"
+    finally:
+        with _boas_vindas_lock:
+            _boas_vindas_em_andamento.discard(deal_id)
+
+
+def _boas_vindas_rd_em_segundo_plano(deal_id):
+    try:
+        time.sleep(BOAS_VINDAS_ATRASO_SEGUNDOS)  # dá tempo da pessoa e do contato existirem
+        resultado = enviar_boas_vindas_rd(deal_id)
+        print(f"[boas-vindas] deal={deal_id} resultado={resultado}", flush=True)
+    except Exception as e:
+        print(f"[boas-vindas] Erro deal={deal_id}: {type(e).__name__}: {e}", flush=True)
 
 
 def deal_tem_marca(deal_id, marcador: str) -> bool:
