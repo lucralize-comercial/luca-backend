@@ -4076,8 +4076,7 @@ def buscar_pessoa_e_negocio(phone):
 _campo_agendada_por_cache = None
 
 def resolver_campo_agendada_por():
-    """Descobre a chave do campo personalizado 'Reunião agendada por' e o ID
-    da opção 'Luca', consultando /custom_fields/deals. Cacheia em memória."""
+    """Descobre o campo 'Reunião agendada por' e as opções Luca e Liz."""
     global _campo_agendada_por_cache
     if _campo_agendada_por_cache is not None:
         return _campo_agendada_por_cache
@@ -4089,22 +4088,54 @@ def resolver_campo_agendada_por():
             if "agendada por" in nome:
                 chave = campo.get("identifier") or campo.get("key") or campo.get("slug")
                 opcao_luca = None
+                opcao_liz = None
                 for opt in (campo.get("options") or campo.get("values") or []):
-                    if (opt.get("name") or opt.get("value") or "").strip().lower() == "luca":
+                    rotulo = (opt.get("name") or opt.get("value") or "").strip().lower()
+                    if rotulo == "luca":
                         opcao_luca = opt.get("id")
-                        break
-                _campo_agendada_por_cache = {"key": chave, "luca_id": opcao_luca}
-                print(f"[crm] Campo 'agendada por' resolvido: key={chave} luca_id={opcao_luca}", flush=True)
+                    elif rotulo == "liz":
+                        opcao_liz = opt.get("id")
+                _campo_agendada_por_cache = {
+                    "key": chave,
+                    "luca_id": opcao_luca,
+                    "liz_id": opcao_liz,
+                }
+                print(
+                    f"[crm] Campo 'agendada por' resolvido: key={chave} "
+                    f"luca_id={opcao_luca} liz_id={opcao_liz}",
+                    flush=True,
+                )
                 if not chave:
-                    print("[crm] AVISO: campo 'agendada por' encontrado mas sem identifier/key/slug — não será preenchido", flush=True)
+                    print("[crm] AVISO: campo 'agendada por' encontrado mas sem identifier/key/slug", flush=True)
                 if not opcao_luca:
-                    print("[crm] AVISO: opção 'Luca' não encontrada nas options do campo — não será preenchido", flush=True)
+                    print("[crm] AVISO: opção 'Luca' não encontrada", flush=True)
+                if not opcao_liz:
+                    print("[crm] AVISO: opção 'Liz' não encontrada; lembretes entram em fail-closed", flush=True)
                 return _campo_agendada_por_cache
         print("[crm] Campo 'Reunião agendada por' não encontrado em /custom_fields/deals", flush=True)
     except Exception as e:
         print(f"[crm] Erro ao resolver campo agendada_por: {e}", flush=True)
     _campo_agendada_por_cache = {}
     return _campo_agendada_por_cache
+
+
+def reuniao_foi_agendada_pela_liz(deal_id):
+    """Retorna True para Liz, False para Luca/humano e None quando não é seguro decidir."""
+    campo = resolver_campo_agendada_por()
+    chave, liz_id = campo.get("key"), campo.get("liz_id")
+    if not chave or not liz_id:
+        return None
+    deal = buscar_deal_fresco(deal_id, com_custom_fields=True)
+    if not deal:
+        return None
+    custom = deal.get("customFields") or {}
+    atual = custom.get(chave)
+    if isinstance(atual, dict):
+        valores = [atual.get("id"), atual.get("value"), atual.get("name")]
+    else:
+        valores = [atual]
+    alvos = {str(liz_id).strip().casefold(), "liz"}
+    return any(str(v or "").strip().casefold() in alvos for v in valores)
 
 
 PADRAO_HORA_EXPLICITA = re.compile(r"\b(\d{1,2})\s?[:h]\s?(\d{2})?\b", re.IGNORECASE)
@@ -6857,6 +6888,24 @@ def varredura_lembretes():
                   f"deal={(t.get('deal') or {}).get('id')}", flush=True)
             if not negocio_permite_lembrete(t):
                 continue
+
+            deal_id = (t.get("deal") or {}).get("id")
+            if deal_id:
+                agendada_pela_liz = reuniao_foi_agendada_pela_liz(deal_id)
+                if agendada_pela_liz is None:
+                    print(
+                        f"[lembrete] Pulado — não foi possível determinar quem agendou deal={deal_id} "
+                        f"(fail-closed para evitar duplicidade)",
+                        flush=True,
+                    )
+                    continue
+                if agendada_pela_liz:
+                    print(
+                        f"[lembrete] Pulado — reunião agendada pela Liz; lembrete pertence à Liz deal={deal_id}",
+                        flush=True,
+                    )
+                    continue
+
             if 77400 <= delta <= 86400:          # 21h30 a 24h antes (2h30 de margem)
                 processar_lembrete(t, "24h", due)
             elif 900 <= delta <= 3600:            # 15 a 60 min antes
