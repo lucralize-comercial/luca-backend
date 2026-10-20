@@ -5651,72 +5651,11 @@ def agendorchat_webhook():
             print(f"[webhook] IGNORADO event={event}", flush=True)
             return jsonify({}), 200
         if message_type != "incoming":
-            # Caso real (17/08, [lead]): a automação nativa que cria o
-            # negócio + manda a saudação às vezes atrasa bastante (o
-            # negócio demora pra ser criado no Agendor), e a saudação
-            # chega no meio de uma conversa já avançada com o Luca —
-            # confuso pro lead, parece que ninguém prestou atenção nele.
-            # Não dá pra IMPEDIR o envio (é o Agendor quem manda, direto,
-            # sem passar pelo nosso código) — mas dá pra detectar e já
-            # emendar um esclarecimento rápido.
-            automation_id = (body.get("additional_attributes") or {}).get("automation_id")
-            if message_type == "outgoing" and automation_id:
-                conv_id_saudacao = (body.get("conversation") or {}).get("id")
-                if conv_id_saudacao:
-                    try:
-                        msgs_previas = mensagens_da_conversa(conv_id_saudacao)
-                        # Recência (não contagem) é o sinal certo: uma conversa
-                        # pode ter várias mensagens só que antigas — o que
-                        # importa é se o lead está falando AGORA, no meio da
-                        # correria, quando a saudação atrasada chega (caso
-                        # real: [lead], 17/08, mandando mensagem a cada 1-2
-                        # min quando a saudação chegou 9min depois do início).
-                        ultima_incoming = None
-                        for m in msgs_previas:
-                            if m.get("message_type") == 0 and not m.get("private"):
-                                ultima_incoming = m
-                        conversa_ativa_agora = False
-                        if ultima_incoming:
-                            criada = ultima_incoming.get("created_at") or 0
-                            conversa_ativa_agora = (time.time() - float(criada)) < 600  # 10 min
-
-                        # Precisa saber se o Luca já respondeu ALGUMA coisa
-                        # de verdade antes de decidir o texto. Se a saudação
-                        # atrasada cai na PRIMEIRA mensagem do lead (ainda
-                        # dentro do delay antes do Luca responder pela 1ª
-                        # vez), dizer "continue com sua última pergunta" não
-                        # faz sentido — usa um texto que só confirma o
-                        # recebimento, sem sugerir que já tinha algo rolando.
-                        #
-                        # A fonte mais confiável pra saber isso é o próprio
-                        # histórico em memória do Luca (conv["messages"]) —
-                        # só tem uma entrada "assistant" quando ele de fato
-                        # gerou e mandou uma resposta de verdade, sem risco
-                        # de confundir com a saudação automática ou mensagem
-                        # de terceiros (diferente de filtrar pela API remota,
-                        # que provou não ser confiável).
-                        conv_saudacao = conversation_histories.get(str(conv_id_saudacao))
-                        ja_teve_resposta_real_do_luca = bool(
-                            conv_saudacao and any(m.get("role") == "assistant"
-                                                   for m in conv_saudacao.get("messages", []))
-                        )
-
-                        if conversa_ativa_agora and ja_teve_resposta_real_do_luca:
-                            send_agendorchat_message(conv_id_saudacao, (
-                                "Oi de novo! Essa mensagem acima foi automática (nosso "
-                                "sistema atrasou pra registrar seu contato) — já estamos "
-                                "conversando, pode ignorar. Segue com sua última pergunta "
-                                "que eu te ajudo!"))
-                            print(f"[webhook] Saudação atrasada (meio de conversa), esclarecimento "
-                                  f"enviado conv={conv_id_saudacao}", flush=True)
-                        elif conversa_ativa_agora:
-                            send_agendorchat_message(conv_id_saudacao, (
-                                "Oi de novo! A mensagem acima foi automática — recebi sua "
-                                "pergunta certinho, só um instante que já te respondo!"))
-                            print(f"[webhook] Saudação atrasada (1º contato, sem resposta real "
-                                  f"ainda), esclarecimento enviado conv={conv_id_saudacao}", flush=True)
-                    except Exception as e:
-                        print(f"[webhook] Erro ao checar saudação atrasada conv={conv_id_saudacao}: {e}", flush=True)
+            # Removido (20/10/2026, [gestor]): aqui existia o aviso 'a mensagem acima foi
+            # automática', enviado quando a saudação nativa do Agendor chegava atrasada no
+            # meio de uma conversa. A automação foi retirada (a saudação dos leads do RD
+            # agora é enviada pelo próprio Luca), então o aviso não tem mais função e
+            # revelava a automação ao lead.
 
             # ── Corrigido 25/08 ([gestor]): mensagem humana genuína também
             # merece um follow-up de silêncio, só que com uma janela maior
