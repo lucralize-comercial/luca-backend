@@ -4017,6 +4017,32 @@ def status_reuniao_real(phone: str) -> str:
         return ""
 
 
+def _variantes_telefone_ddi(phone) -> list:
+    """Formatos alternativos do mesmo número, com e sem o DDI 55 (Brasil)."""
+    digitos = re.sub(r"\D", "", str(phone or ""))
+    if digitos.startswith("55") and len(digitos) in (12, 13):
+        variante = digitos[2:]
+    elif len(digitos) in (10, 11):
+        variante = "55" + digitos
+    else:
+        return []
+    return [variante] if variante != digitos else []
+
+
+def _pessoa_tem_telefone(pessoa, alvo11) -> bool:
+    """True se algum telefone da pessoa termina nos mesmos 10 últimos dígitos do
+    número procurado (ignora DDI e formatação). Exige ao menos 10 dígitos."""
+    contato = (pessoa or {}).get("contact") or {}
+    alvo = re.sub(r"\D", "", str(alvo11 or ""))[-10:]
+    if len(alvo) < 10:
+        return False
+    for campo in ("whatsapp", "mobile", "work", "fax"):
+        digitos = re.sub(r"\D", "", str(contato.get(campo) or ""))
+        if len(digitos) >= 10 and digitos[-10:] == alvo:
+            return True
+    return False
+
+
 def buscar_pessoa_e_negocio(phone):
     """Localiza a pessoa pelo telefone e o negócio mais recente dela DENTRO
     DO FUNIL COMERCIAL (ignora negócios de outros funis, ex: Reativação,
@@ -4032,23 +4058,42 @@ def buscar_pessoa_e_negocio(phone):
     SEGUNDA pessoa, a função nunca achava, tentava criar um negócio novo,
     e isso já causou falha real no fluxo (reunião/link não gerados)."""
     phone_clean = phone.replace("+", "").replace(" ", "").strip()
-    pessoas = []
-    pessoas_consulta_ok = False
-    for attempt in range(3):
-        try:
-            r = requests.get(f"{AGENDOR_BASE}/people", headers=HEADERS,
-                             params={"phone": phone_clean}, timeout=15)
-            if r.status_code == 429:
-                raise requests.exceptions.HTTPError(f"429 buscando pessoa phone={phone_clean}")
-            r.raise_for_status()
-            pessoas = r.json().get("data", [])
-            pessoas_consulta_ok = True
-            break
-        except Exception as e:
-            print(f"[buscar_pessoa_e_negocio] Tentativa {attempt+1}/3 falhou (pessoas) "
-                  f"phone={phone_clean}: {e}", flush=True)
-            if attempt < 2:
-                time.sleep(3)
+
+    def _buscar(tel):
+        for attempt in range(3):
+            try:
+                r = requests.get(f"{AGENDOR_BASE}/people", headers=HEADERS,
+                                 params={"phone": tel}, timeout=15)
+                if r.status_code == 429:
+                    raise requests.exceptions.HTTPError(f"429 buscando pessoa phone={tel}")
+                r.raise_for_status()
+                return r.json().get("data", []), True
+            except Exception as e:
+                print(f"[buscar_pessoa_e_negocio] Tentativa {attempt+1}/3 falhou (pessoas) "
+                      f"phone={tel}: {e}", flush=True)
+                if attempt < 2:
+                    time.sleep(3)
+        return [], False
+
+    pessoas, pessoas_consulta_ok = _buscar(phone_clean)
+    # Fallback (20/10/2026): o Chat entrega o número COM DDI (+5531...), mas o Agendor
+    # pode ter o telefone SEM o 55 (ex: "(31) 66666-6666"), e a busca por um formato
+    # não acha o outro. Só roda quando a busca normal não achou ninguém, então o que
+    # funciona hoje não muda. Só aceita pessoa cujo telefone realmente termine nos
+    # mesmos 11 dígitos, para não pegar a pessoa errada.
+    if not pessoas and pessoas_consulta_ok:
+        alvo11 = re.sub(r"\D", "", phone_clean)[-11:]
+        for variante in _variantes_telefone_ddi(phone_clean):
+            lista, ok = _buscar(variante)
+            if not ok:
+                pessoas_consulta_ok = False  # falha na API não vira "pessoa inexistente"
+                break
+            lista = [p for p in lista if _pessoa_tem_telefone(p, alvo11)]
+            if lista:
+                pessoas = lista
+                print(f"[buscar_pessoa_e_negocio] Pessoa achada com a variante de DDI "
+                      f"({variante}) para phone={phone_clean}", flush=True)
+                break
     if not pessoas:
         # Se a consulta falhou após todas as tentativas, não presumir pessoa
         # inexistente: criar outra pessoa/negócio aqui causaria duplicidade.
