@@ -6674,6 +6674,17 @@ def enviar_boas_vindas_rd(deal_id) -> str:
             f"[luca:boas_vindas:{deal_id}] [luca:boas_vindas_msg:{msg_id}]")
         print(f"[boas-vindas] ✅ enviada deal={deal_id} conv={conv_id} msg_id={msg_id} "
               f"texto={fonte_texto}", flush=True)
+        # Move para "1º Contato (D0)" na hora. A varredura de Novo Lead faz isso, mas
+        # lê o cache de negócios, que só atualiza de hora em hora: o negócio recém
+        # criado só era movido até ~1h depois. A função só avança (nunca rebaixa) e
+        # confere a etapa FRESCA, então chamar duas vezes é inofensivo. Mesma flag da
+        # varredura, para você continuar controlando se o Luca move etapas.
+        if _flag("MOVER_NOVOS_LEADS_ATIVO", "false"):
+            try:
+                movido = mover_etapa_funil_comercial(deal_id, ETAPA_1_CONTATO)
+                print(f"[boas-vindas] etapa 1º Contato (D0) deal={deal_id} movido={movido}", flush=True)
+            except Exception as e:
+                print(f"[boas-vindas] Erro ao mover etapa deal={deal_id}: {type(e).__name__}: {e}", flush=True)
         return "enviada"
     finally:
         with _boas_vindas_lock:
