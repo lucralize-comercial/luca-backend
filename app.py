@@ -427,9 +427,11 @@ AGENDORCHAT_BASE       = "https://chat.agendor.com.br/api/v1"
 # um segundo, conectado via canal "Connector" pra teste, no qual o Luca
 # NUNCA deve interagir. Lista separada por vírgula via env var, caso mais
 # inboxes precisem ser excluídos no futuro.
+LIZ_INBOX_ID_EXCLUSIVO = int(os.environ.get("LIZ_INBOX_ID_EXCLUSIVO", "2283"))
 INBOXES_IGNORADOS = {
     int(i.strip()) for i in os.environ.get("INBOXES_IGNORADOS", "").split(",") if i.strip()
 }
+INBOXES_IGNORADOS.add(LIZ_INBOX_ID_EXCLUSIVO)
 
 # Criado 02/09 ([gestor]): gatilho pra demonstrações ao vivo (ex: QR Code em
 # apresentação) — o Luca conversa 100% normal, mas a conversa NUNCA vira
