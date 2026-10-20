@@ -471,11 +471,28 @@ FRAGMENTOS_TEMPLATE_LUCA = [
     "recapitulando as duas ferramentas que te mandei",
     "Você ainda está por aí?",
     "acho que peguei você num momento ruim",
+    "Meu nome é Luca, aqui da Lucralize",  # saudação inicial luca_boas_vindas_01
 ]
 
 
 def eh_conteudo_de_template_luca(content: str) -> bool:
     return any(frag in (content or "") for frag in FRAGMENTOS_TEMPLATE_LUCA)
+
+
+_RE_ID_MSG_LUCA = re.compile(r"\[luca:boas_vindas_msg:(\d+)\]")
+
+
+def ids_mensagens_do_luca(msgs) -> set:
+    """Ids das mensagens que o próprio Luca enviou como saudação inicial. A nota
+    privada que ele deixa na conversa traz [luca:boas_vindas_msg:ID]; isso vale
+    mesmo que o texto do template mude (o texto estático em
+    FRAGMENTOS_TEMPLATE_LUCA é só um reforço). Sem isso, a saudação era lida como
+    "humano escreveu agora" e o Luca se calava por 1 hora quando o lead respondia."""
+    ids = set()
+    for m in msgs or []:
+        for achado in _RE_ID_MSG_LUCA.findall(m.get("content") or ""):
+            ids.add(int(achado))
+    return ids
 
 
 def eh_assignee_bot(assignee: dict) -> bool:
@@ -3531,12 +3548,20 @@ def _rd_enriquecer_deal(deal_id, dados):
         return False
 
 
+# Esperas (s) entre as tentativas de achar o negócio criado pela integração do RD.
+# Eram 6 tentativas em ~5 min; em 20/10/2026 o Agendor levou 13 min para criar o
+# negócio de um lead, o Luca já tinha desistido e o lead ficou sem saudação nem
+# origem. Agora são 12 tentativas em ~23 min, cobrindo a janela de 20 min usada
+# para aceitar o negócio (diferença entre a conversão no RD e a criação).
+RD_MATCH_ESPERAS = (10, 20, 30, 60, 90, 90, 120, 120, 180, 180, 240, 240)
+
+
 def _rd_correlacionar_e_enriquecer(dados):
     """Localiza candidato inequívoco e, somente então, enriquece o negócio."""
-    for tentativa, espera in enumerate((10, 20, 30, 60, 90, 90), start=1):
+    for tentativa, espera in enumerate(RD_MATCH_ESPERAS, start=1):
         time.sleep(espera)
         pessoas = _rd_buscar_pessoas(dados["email"], dados["telefone_norm"])
-        print(f"[rd-match] tentativa={tentativa}/6 pessoas_encontradas={len(pessoas)}", flush=True)
+        print(f"[rd-match] tentativa={tentativa}/{len(RD_MATCH_ESPERAS)} pessoas_encontradas={len(pessoas)}", flush=True)
 
         candidatos = []
         dt_rd = _rd_parse_iso(dados["data_conversao"])
@@ -6791,7 +6816,10 @@ def humano_realmente_respondeu(conversation_id: int) -> bool:
                    and (m.get("content") or "").strip()
                    and not (m.get("additional_attributes") or {}).get("automation_id")
                    and "Em breve um de nossos consultores dará andamento" not in (m.get("content") or "")]
+        ids_luca = ids_mensagens_do_luca(msgs)
         for m in dialogo:
+            if m.get("id") in ids_luca:
+                continue  # saudação enviada pelo próprio Luca
             if m.get("message_type") == 1:
                 sender = m.get("sender") or {}
                 if sender.get("type") != "user":
@@ -6844,7 +6872,10 @@ def segundos_desde_ultima_intervencao_humana(conversation_id: int):
                    and not (m.get("additional_attributes") or {}).get("automation_id")
                    and "Em breve um de nossos consultores dará andamento" not in (m.get("content") or "")]
         ultima_humana_em = None
+        ids_luca = ids_mensagens_do_luca(msgs)
         for m in dialogo:
+            if m.get("id") in ids_luca:
+                continue  # saudação enviada pelo próprio Luca
             if m.get("message_type") == 1:
                 sender = m.get("sender") or {}
                 if sender.get("type") != "user":
