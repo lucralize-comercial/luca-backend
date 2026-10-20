@@ -6841,6 +6841,31 @@ def humano_realmente_respondeu(conversation_id: int) -> bool:
         return True  # fail-safe: em erro, assume que respondeu (nunca atropela atendimento humano)
 
 
+_RE_ATRIBUIDO_A = re.compile(r"^\s*Atribuído a (?P<nome>.+?) por ", re.IGNORECASE)
+
+
+def tipo_evento_atribuicao(content):
+    """Classifica o aviso de sistema de atribuição da conversa no Agendor Chat:
+    "bot" (atribuída ao usuário do Luca), "ninguem" (desatribuída), "humano"
+    (atribuída a outra pessoa ou a si mesma) ou None (não é aviso de atribuição).
+    Textos reais: "Atribuído a Luca por Ronaldo Cassimiro", "Atendimento não
+    atribuído por Ronaldo Cassimiro", "Ronaldo Cassimiro atribuiu a si mesmo
+    esse atendimento"."""
+    texto = (content or "").strip()
+    if not texto:
+        return None
+    baixo = texto.lower()
+    if "não atribuído" in baixo or "não atribuída" in baixo or "nao atribuido" in baixo:
+        return "ninguem"
+    if "atribuiu a si mesm" in baixo:
+        return "humano"
+    achado = _RE_ATRIBUIDO_A.match(texto)
+    if achado:
+        nome = achado.group("nome").strip()
+        return "bot" if eh_assignee_bot({"name": nome, "available_name": nome}) else "humano"
+    return None
+
+
 def segundos_desde_ultima_intervencao_humana(conversation_id: int):
     """Retorna quantos segundos faziam desde a ÚLTIMA mensagem humana genuína
     (mesmo esquema de detecção de humano_realmente_respondeu), ou None se
@@ -6892,6 +6917,23 @@ def segundos_desde_ultima_intervencao_humana(conversation_id: int):
                 if not eh_assignee_bot(sender):
                     ultima_humana_em = m.get("created_at") or ultima_humana_em
         if ultima_humana_em is None:
+            return None
+        # Devolução ao Luca (20/10/2026): se, DEPOIS da última mensagem humana, a
+        # conversa foi atribuída ao usuário do Luca ou ficou sem atribuição, isso é
+        # um sinal explícito de que o humano passou a bola, e a janela de 1h não vale
+        # mais. Vale o último aviso de atribuição: se depois disso alguém assumiu
+        # (ou se atribuiu a si mesmo), o humano volta a ter a prioridade.
+        ultimo_evento = None
+        for m in msgs:
+            if m.get("message_type") != 2:
+                continue
+            tipo = tipo_evento_atribuicao(m.get("content"))
+            ts = float(m.get("created_at") or 0)
+            if tipo and ts > float(ultima_humana_em) and (ultimo_evento is None or ts >= ultimo_evento[0]):
+                ultimo_evento = (ts, tipo)
+        if ultimo_evento and ultimo_evento[1] in ("bot", "ninguem"):
+            print(f"[handoff] Conversa devolvida ao Luca ({ultimo_evento[1]}) depois da última "
+                  f"mensagem humana conv={conversation_id}", flush=True)
             return None
         return time.time() - float(ultima_humana_em)
     except Exception as e:
