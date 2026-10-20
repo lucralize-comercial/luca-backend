@@ -3589,6 +3589,18 @@ def _rd_correlacionar_e_enriquecer(dados):
             escolhido = candidatos[0]
             print(f"[rd-match] MATCH_OK deal={escolhido['deal_id']} person={escolhido['person_id']} diferenca_seg={escolhido['diferenca_seg']}", flush=True)
             _rd_enriquecer_deal(escolhido["deal_id"], dados)
+            # Saudação inicial do Luca (desligada por padrão): este é o ponto que
+            # comprovadamente dispara a cada lead do RD. O aviso de "negócio criado"
+            # do Agendor nunca chegou à rota /agendor/deal-created, então ela sozinha
+            # não serve de gatilho. Chamar de novo pelas duas rotas é seguro: há trava
+            # por negócio e marca na conversa que impedem o envio duplicado.
+            if _flag("BOAS_VINDAS_LUCA_ATIVO", "false"):
+                try:
+                    print(f"[boas-vindas] deal={escolhido['deal_id']} "
+                          f"resultado={enviar_boas_vindas_rd(escolhido['deal_id'])}", flush=True)
+                except Exception as e:
+                    print(f"[boas-vindas] Erro deal={escolhido['deal_id']}: "
+                          f"{type(e).__name__}: {e}", flush=True)
             return
         if len(candidatos) > 1:
             print(f"[rd-match] AMBIGUO — {len(candidatos)} negócios plausíveis; nada será alterado", flush=True)
