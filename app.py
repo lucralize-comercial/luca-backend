@@ -5759,6 +5759,10 @@ def agendorchat_webhook():
                 # guard, string vazia tendia a ligar o timer de 4h à toa.
                 if not eh_mensagem_do_bot and not eh_generico_ou_automatico and content_out.strip():
                     conv_id_humano = (body.get("conversation") or {}).get("id")
+                    if conv_id_humano:
+                        # O que a pessoa escreveu não entra na memória do Luca: na próxima resposta
+                        # ele relê o histórico real (continuidade do atendimento).
+                        marcar_recarregar_historico(conv_id_humano)
                     if conv_id_humano and mensagem_precisa_resposta(content_out):
                         conv_key_humano = str(conv_id_humano)
                         conv_humano = conversation_histories.setdefault(conv_key_humano, {
@@ -5943,12 +5947,23 @@ def agendorchat_webhook():
                 conv["phone"] = contact_phone
 
         # ── Se memória está vazia, busca histórico real do AgendorChat ────────
-        if not conv["messages"] and not conv.get("skip_remote_fetch"):
+        # Continuidade (CONTINUIDADE_ATENDIMENTO_ATIVO): depois de um follow-up ou de uma mensagem
+        # humana, a memória do Luca está desatualizada (não tem o que a pessoa escreveu nem a
+        # cobrança que ele mesmo mandou). Relê o histórico real. Se a busca falhar, segue com a
+        # memória atual, como antes.
+        recarregar = conv_key in _conversas_recarregar_historico and _continuidade_ativa()
+        _conversas_recarregar_historico.discard(conv_key)
+        continuidade_ctx = False
+        if (not conv["messages"] or recarregar) and not conv.get("skip_remote_fetch"):
             remote_history = fetch_conversation_history(conversation_id)
             if remote_history:
-                print(f"[history] Recuperados {len(remote_history)} msgs da conv={conversation_id}", flush=True)
+                print(f"[history] Recuperados {len(remote_history)} msgs da conv={conversation_id}"
+                      f"{' (continuidade)' if recarregar else ''}", flush=True)
+                if recarregar:
+                    remote_history = _sem_mensagem_atual(remote_history, message_text)
+                    continuidade_ctx = True
                 conv["messages"] = remote_history
-            else:
+            elif not conv["messages"]:
                 # Sem histórico remoto: injeta saudação inicial
                 conv["messages"].append({
                     "role":    "assistant",
@@ -5968,7 +5983,11 @@ def agendorchat_webhook():
 
         # ── Monta mensagem do lead com contexto de retomada se necessário ────
         user_content = message_text
-        if retomada_ctx:
+        if continuidade_ctx:
+            # Substitui o aviso de "saudação curta" abaixo: aqui o histórico já foi relido por inteiro.
+            user_content = TEXTO_CONTINUIDADE + message_text
+            retomada_ctx = True  # no histórico guardado fica só o texto do lead, sem a instrução
+        elif retomada_ctx:
             saudacao = saudacao_atual()
             retomada = (
                 "[O lead ficou ausente por " + str(int(elapsed_minutes // 60)) + "h e voltou, mandando apenas uma saudação curta. "
@@ -6403,6 +6422,179 @@ def _flag(nome: str, padrao: str) -> bool:
     return os.environ.get(nome, padrao).strip().lower() in ("1", "true", "sim", "on")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Follow-ups de silêncio por cenário + continuidade do atendimento
+#
+# Cada lead cai em UM cenário, definido por quem falou por último e por o lead
+# já ter escrito alguma vez. No mesmo silêncio só uma dessas mensagens sai:
+#   A) o Luca mandou só a saudação (template) e o lead NUNCA escreveu
+#        -> reforço da saudação, FOLLOWUP_A_MINUTOS depois (padrão 2h)
+#   B) o lead escreveu e o Luca respondeu por último
+#        -> "Você ainda está por aí?", FOLLOWUP_B_MINUTOS depois (padrão 1h)
+#   C) um humano escreveu por último
+#        -> "acho que peguei você num momento ruim", FOLLOWUP_C_MINUTOS depois (padrão 3h)
+# Nenhum dos três tem limite de horário: a mensagem responde a algo que o lead
+# acabou de fazer (formulário ou conversa). Todos conferem a janela de 24h.
+#
+# Tudo nasce DESLIGADO (sem a flag, o comportamento é exatamente o de antes):
+#   FOLLOWUP_CENARIOS_ATIVO          liga prazos novos, sem limite de horário,
+#                                     exclusividade e o reforço A
+#   CONTINUIDADE_ATENDIMENTO_ATIVO   quando o lead volta depois de um follow-up
+#                                     ou de uma mensagem humana, o Luca relê o
+#                                     histórico real e continua do ponto em que parou
+# ═════════════════════════════════════════════════════════════════════════════
+def _cenarios_ativos() -> bool:
+    return _flag("FOLLOWUP_CENARIOS_ATIVO", "false")
+
+
+def _continuidade_ativa() -> bool:
+    return _flag("CONTINUIDADE_ATENDIMENTO_ATIVO", "false")
+
+
+FOLLOWUP_A_MINUTOS = int(os.environ.get("FOLLOWUP_A_MINUTOS", "120"))
+FOLLOWUP_B_MINUTOS = int(os.environ.get("FOLLOWUP_B_MINUTOS", "60"))
+FOLLOWUP_C_MINUTOS = int(os.environ.get("FOLLOWUP_C_MINUTOS", "180"))
+# Depois disso o D1 (que só vem 1 dia depois da saudação) já assumiu: o reforço não sai mais.
+FOLLOWUP_A_LIMITE_HORAS = 20
+# Texto livre só vale dentro das 24h depois de o lead escrever, e quem nunca escreveu não tem
+# essa janela: o reforço do cenário A é um TEMPLATE. Sem o template aprovado ele não envia nada.
+REFORCO_SAUDACAO_TEMPLATE = os.environ.get("REFORCO_SAUDACAO_TEMPLATE", "luca_reforco_saudacao_01")
+# Usado só se a listagem do template não trouxer o corpo. Deve ser IGUAL ao aprovado na Meta
+# ({{1}} no lugar do nome; "\n" vira quebra de linha).
+REFORCO_SAUDACAO_TEXTO_PADRAO = (
+    os.environ.get("REFORCO_SAUDACAO_TEXTO", "").replace("\\n", "\n")
+    or "Oi, {{1}}! Passando só para saber se você viu minha mensagem.\n\n"
+       "Qual o melhor horário para a gente conversar hoje?"
+)
+_reforcos_saudacao = {}  # conversa -> {"enviada_em", "nome", "deal_id"}; RAM, como os demais contadores
+_reforcos_saudacao_lock = threading.Lock()
+
+
+def registrar_reforco_saudacao(conversation_id, nome, deal_id):
+    """Chamado logo depois da saudação do Luca: a varredura do cenário A passa a acompanhar a conversa."""
+    with _reforcos_saudacao_lock:
+        _reforcos_saudacao[int(conversation_id)] = {
+            "enviada_em": time.time(), "nome": nome or "", "deal_id": deal_id}
+
+
+def _texto_template_com_nome(tpl, nome, padrao):
+    """Corpo do template com o nome; cai no texto padrão se a listagem não trouxer o corpo."""
+    for chave in ("content", "body", "text"):
+        v = tpl.get(chave)
+        if isinstance(v, str) and "{{1}}" in v:
+            return v.replace("{{1}}", nome)
+    for comp in (tpl.get("components") or []):
+        if (isinstance(comp, dict) and str(comp.get("type") or "").upper() == "BODY"
+                and isinstance(comp.get("text"), str) and "{{1}}" in comp["text"]):
+            return comp["text"].replace("{{1}}", nome)
+    return padrao.replace("{{1}}", nome)
+
+
+TEXTO_CONTINUIDADE = (
+    "[CONTINUIDADE: antes desta mensagem o atendimento teve mensagens de outra pessoa da equipe e/ou "
+    "um lembrete automático seu. Leia TODO o histórico acima e continue exatamente do ponto em que a "
+    "conversa parou, como a mesma pessoa que vinha atendendo. NÃO se apresente de novo, NÃO recomece a "
+    "qualificação e NÃO repita pergunta que o lead ou a equipe já fez ou que já foi respondida (e-mail, "
+    "telefone, horário, motivo, faturamento, situação da empresa). Se havia uma pergunta ou proposta "
+    "pendente, retome-a; se o lead acabou de respondê-la, avance para o passo seguinte. Mostre que "
+    "acompanhou a conversa, sem recapitular tudo.]\n\n"
+)
+
+
+def _sem_mensagem_atual(historico, texto):
+    """Tira do fim do histórico remoto a mensagem do lead que está sendo respondida agora: o código
+    a acrescenta em seguida (com a instrução de continuidade), então sem isso ela apareceria duas vezes."""
+    if not historico or historico[-1].get("role") != "user":
+        return historico
+    t = (texto or "").strip()
+    c = (historico[-1].get("content") or "").rstrip()
+    if t and c.endswith(t):
+        resto = c[: -len(t)].rstrip()
+        if resto:
+            historico[-1] = {"role": "user", "content": resto}
+        else:
+            historico.pop()
+    return historico
+
+
+def lead_ja_escreveu(msgs) -> bool:
+    """True se o lead mandou qualquer mensagem de verdade na conversa (em qualquer momento)."""
+    return any(m.get("message_type") == 0 and not m.get("private") and (m.get("content") or "").strip()
+               for m in msgs or [])
+
+
+_conversas_recarregar_historico = set()  # fora de conversation_histories: não cria entrada de memória
+
+
+def marcar_recarregar_historico(conv_key):
+    """Faz o Luca reler o histórico real do Chat na próxima resposta (continuidade do atendimento).
+    Não faz nada se a continuidade estiver desligada."""
+    if _continuidade_ativa():
+        _conversas_recarregar_historico.add(str(conv_key))
+
+
+def verificar_reforco_saudacao():
+    """Cenário A. Varre as saudações enviadas pelo Luca; se o lead NUNCA escreveu e ninguém da
+    equipe falou depois, manda o reforço (template), uma única vez, FOLLOWUP_A_MINUTOS depois."""
+    if not _cenarios_ativos():
+        return
+    agora = time.time()
+    with _reforcos_saudacao_lock:
+        pendentes = list(_reforcos_saudacao.items())
+    for conv_id, info in pendentes:
+        decorrido = agora - info["enviada_em"]
+        if decorrido < FOLLOWUP_A_MINUTOS * 60:
+            continue
+        if decorrido > FOLLOWUP_A_LIMITE_HORAS * 3600:
+            with _reforcos_saudacao_lock:
+                _reforcos_saudacao.pop(conv_id, None)  # o D1 assume
+            continue
+        resultado = "erro"
+        try:
+            resultado = _enviar_reforco_saudacao(conv_id, info)
+        except Exception as e:
+            print(f"[reforco-saudacao] Erro conv={conv_id}: {type(e).__name__}: {e}", flush=True)
+        # Só tenta de novo na próxima varredura quando a falha foi temporária (rede/API).
+        if resultado != "erro":
+            with _reforcos_saudacao_lock:
+                _reforcos_saudacao.pop(conv_id, None)
+        print(f"[reforco-saudacao] conv={conv_id} resultado={resultado}", flush=True)
+
+
+def _enviar_reforco_saudacao(conv_id, info) -> str:
+    msgs = mensagens_da_conversa(conv_id)
+    if not msgs:
+        return "erro"  # API falhou ou conversa vazia: tenta na próxima varredura
+    if marcador_existe(msgs, "[followup:reforco_d0]"):
+        return "ja_enviado"
+    if lead_ja_escreveu(msgs):
+        return "lead_ja_escreveu"  # virou outro cenário (B)
+    if humano_realmente_respondeu(conv_id):
+        return "humano_falou"  # virou o cenário C
+    detalhe = get_conversation_details(conv_id) or {}
+    if detalhe.get("status") == "resolved":
+        return "conversa_resolvida"
+    conv_mem = conversation_histories.get(str(conv_id)) or {}
+    if conv_mem.get("followup_1h_enviado") or conv_mem.get("followup_humano_enviado"):
+        return "outro_followup_enviado"
+    tpl = template_por_nome(REFORCO_SAUDACAO_TEMPLATE)
+    if not tpl:
+        print(f"[reforco-saudacao] Template '{REFORCO_SAUDACAO_TEMPLATE}' não encontrado/aprovado — "
+              f"reforço não enviado conv={conv_id}", flush=True)
+        return "sem_template"
+    nome = info.get("nome") or ""
+    texto = _texto_template_com_nome(tpl, nome, REFORCO_SAUDACAO_TEXTO_PADRAO)
+    resp = enviar_template_conversa(conv_id, tpl, {"1": nome}, texto)
+    msg_id = (resp or {}).get("id")
+    # Mesmo marcador da saudação: assim a mensagem é reconhecida como do Luca (e não de um
+    # humano) mesmo que a listagem do Chat não traga template_params.
+    send_private_note(conv_id,
+        f"🔁 Reforço da saudação enviado (lead ainda não respondeu). "
+        f"[followup:reforco_d0] [luca:boas_vindas_msg:{msg_id}]")
+    marcar_recarregar_historico(conv_id)
+    return "enviado"
+
+
 class _SafeDict(dict):
     def __missing__(self, key):
         return ""
@@ -6744,6 +6936,8 @@ def enviar_boas_vindas_rd(deal_id) -> str:
             f"[luca:boas_vindas:{deal_id}] [luca:boas_vindas_msg:{msg_id}]")
         print(f"[boas-vindas] ✅ enviada deal={deal_id} conv={conv_id} msg_id={msg_id} "
               f"texto={fonte_texto}", flush=True)
+        if _cenarios_ativos():
+            registrar_reforco_saudacao(conv_id, nome, deal_id)  # cenário A: reforço se o lead não responder
         # Move para "1º Contato (D0)" na hora. A varredura de Novo Lead faz isso, mas
         # lê o cache de negócios, que só atualiza de hora em hora: o negócio recém
         # criado só era movido até ~1h depois. A função só avança (nunca rebaixa) e
@@ -7449,8 +7643,10 @@ def verificar_followup_1h_silencio():
         if conv.get("crm_registrado"):
             continue  # reunião já agendada com sucesso — silêncio é esperado
         elapsed = agora - aguardando_desde
-        if elapsed < 3600:
+        if elapsed < FOLLOWUP_B_MINUTOS * 60:
             continue
+        if _cenarios_ativos() and conv.get("followup_humano_enviado"):
+            continue  # um só follow-up por silêncio (o cenário C já falou)
         try:
             conversation_id = int(conv_key)
         except (TypeError, ValueError):
@@ -7500,6 +7696,7 @@ def verificar_followup_1h_silencio():
         try:
             send_agendorchat_message(conversation_id, texto)
             conv["followup_1h_enviado"] = True
+            marcar_recarregar_historico(conversation_id)  # o Luca precisa ver a própria cobrança quando o lead voltar
             print(f"[followup1h] Enviado conv={conversation_id} nome={primeiro_nome!r}", flush=True)
         except Exception as e:
             print(f"[followup1h] Erro ao enviar conv={conversation_id}: {e}", flush=True)
@@ -7521,10 +7718,12 @@ def verificar_followup_4h_silencio_humano():
     humano de verdade do que uma mensagem automática do Luca — e só dentro
     do horário comercial (8h-20h BRT, mesma janela já usada no
     followup_dias), pra não mandar isso de madrugada."""
+    cenarios = _cenarios_ativos()
     agora_brt = datetime.utcnow() - timedelta(hours=3)
-    if not (8 <= agora_brt.hour < 20):
-        return
+    if not cenarios and not (8 <= agora_brt.hour < 20):
+        return  # (com os cenários ligados não há limite de horário: ver FOLLOWUP_CENARIOS_ATIVO)
     agora = time.time()
+    prazo_segundos = FOLLOWUP_C_MINUTOS * 60 if cenarios else 14400  # cenário C: 3h; antes: 4h
     for conv_key, conv in list(conversation_histories.items()):
         if conv.get("modo_demo"):
             continue  # conversa de demonstração — nunca gera follow-up
@@ -7534,8 +7733,10 @@ def verificar_followup_4h_silencio_humano():
         if conv.get("crm_registrado"):
             continue  # reunião já agendada com sucesso — silêncio é esperado
         elapsed = agora - aguardando_desde
-        if elapsed < 14400:  # 4h
+        if elapsed < prazo_segundos:
             continue
+        if cenarios and conv.get("followup_1h_enviado"):
+            continue  # um só follow-up por silêncio (o cenário B já falou)
         try:
             conversation_id = int(conv_key)
         except (TypeError, ValueError):
@@ -7573,9 +7774,17 @@ def verificar_followup_4h_silencio_humano():
         try:
             send_agendorchat_message(conversation_id, texto)
             conv["followup_humano_enviado"] = True
+            marcar_recarregar_historico(conversation_id)  # o Luca precisa ver a cobrança e o que o humano disse
             print(f"[followup4h] Enviado conv={conversation_id} nome={primeiro_nome!r}", flush=True)
         except Exception as e:
             print(f"[followup4h] Erro ao enviar conv={conversation_id}: {e}", flush=True)
+
+
+def verificar_reforco_saudacao_safe():
+    try:
+        verificar_reforco_saudacao()
+    except Exception as e:
+        print(f"[reforco-saudacao] Erro geral na varredura: {e}", flush=True)
 
 
 def verificar_followup_4h_silencio_humano_safe():
@@ -8517,7 +8726,9 @@ def verificar_followup_dias_silencio():
         # estado aqui, já que tanto o reforço quanto o D+1 partem da mesma
         # etapa). Mensagem livre (não precisa de template Meta): como é no
         # mesmo dia, a janela de 24h do WhatsApp ainda deve estar aberta.
-        if etapa_atual_id == ETAPA_1_CONTATO:
+        # Com FOLLOWUP_CENARIOS_ATIVO o reforço passa a ser o do cenário A (verificar_reforco_saudacao):
+        # template, 2h depois da saudação, só se o lead nunca escreveu. Este bloco antigo fica desligado.
+        if etapa_atual_id == ETAPA_1_CONTATO and not _cenarios_ativos():
             start_time_raw = deal_fresco.get("startTime")
             criado_ts = None
             if start_time_raw:
@@ -8899,6 +9110,7 @@ scheduler.add_job(log_resumo_usage, "interval", hours=1, id="usage_resumo_horari
 scheduler.add_job(limpar_memoria_conversas_inativas_safe, "interval", hours=6, id="limpeza_memoria_conversas")
 scheduler.add_job(verificar_followup_1h_silencio_safe, "interval", minutes=15, id="followup_1h_silencio")
 scheduler.add_job(verificar_followup_4h_silencio_humano_safe, "interval", minutes=15, id="followup_4h_silencio_humano")
+scheduler.add_job(verificar_reforco_saudacao_safe, "interval", minutes=10, id="reforco_saudacao")
 scheduler.add_job(verificar_retomada_apos_silencio_humano_safe, "interval", minutes=15, id="retomada_apos_silencio_humano")
 scheduler.add_job(verificar_leads_parados_safe, "interval", minutes=15, id="leads_parados")
 scheduler.add_job(verificar_followup_dias_silencio_safe, "interval", hours=3, id="followup_dias_silencio")
