@@ -6517,6 +6517,80 @@ def _sem_mensagem_atual(historico, texto):
     return historico
 
 
+def _reforco_saudacao_ativo() -> bool:
+    """Reforço do cenário A (template). Flag própria: enquanto não houver template aprovado,
+    continua valendo o reforço antigo do mesmo dia (texto livre, 6h depois da criação do negócio)."""
+    return _cenarios_ativos() and _flag("REFORCO_SAUDACAO_ATIVO", "false")
+
+
+def _followup_mensagem_gerada_ativa() -> bool:
+    """Cenários B e C: em vez do texto fixo, o Luca escreve a cobrança a partir da conversa."""
+    return _cenarios_ativos() and _flag("FOLLOWUP_MENSAGEM_GERADA_ATIVO", "false")
+
+
+_FRASES_PROIBIDAS_FOLLOWUP = (
+    "ainda está por aí", "ainda esta por ai", "momento ruim", "peguei você", "peguei voce", "te peguei",
+    "desculpe", "desculpa", "incomod", "disponibilidade", "gostaria",
+)
+SYSTEM_FOLLOWUP_GERADO = (
+    "Você escreve, em português do Brasil, a mensagem curta de WhatsApp que um atendente comercial da "
+    "Lucralize mandaria agora para retomar uma conversa em que o lead parou de responder. Escreva como uma "
+    "pessoa digitando, natural, nunca como texto de roteiro. Responda SOMENTE com a mensagem."
+)
+
+
+def _validar_followup_gerado(texto):
+    """Devolve a mensagem limpa ou None se ela não passar nas regras (aí vale o texto fixo)."""
+    t = (texto or "").strip().strip('"“”').strip()
+    if not t or len(t) > 240:
+        return None
+    baixo = t.lower()
+    if "http" in baixo or "www." in baixo or "@" in t or "[" in t or "]" in t or "{" in t:
+        return None
+    if t.count("?") > 1 or t.count("!") > 1 or t.count("\n") > 2:
+        return None
+    if any(f in baixo for f in _FRASES_PROIBIDAS_FOLLOWUP):
+        return None
+    if re.search(r"[\U0001F300-\U0001FAFF☀-➿]", t):
+        return None
+    return t
+
+
+def texto_followup_gerado(conversation_id, primeiro_nome, quem_falou_por_ultimo):
+    """Cenários B ('luca') e C ('humano'): cobrança escrita a partir das últimas mensagens reais,
+    retomando a pendência. Devolve None em qualquer falha ou texto reprovado (o chamador usa o texto fixo)."""
+    try:
+        msgs = mensagens_da_conversa(conversation_id)
+        dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")
+                   and (m.get("content") or "").strip()
+                   and not (m.get("additional_attributes") or {}).get("automation_id")]
+        ultimas = dialogo[-12:]
+        if not ultimas:
+            return None
+        quem = "o Luca" if quem_falou_por_ultimo == "luca" else "uma pessoa da equipe"
+        transcript = "\n".join(
+            f"{'Lead' if m.get('message_type') == 0 else 'Atendimento'}: {(m.get('content') or '').replace(LUCA_MARKER, '').strip()}"
+            for m in ultimas)
+        prompt = (
+            f"Conversa até agora:\n\n{transcript}\n\n"
+            f"A última mensagem foi de {quem} e o lead não respondeu. Primeiro nome do lead: "
+            f"{primeiro_nome or '(desconhecido)'}.\n\nEscreva a mensagem de retomada, seguindo estas regras:\n"
+            "- 1 ou 2 frases curtas, tom de WhatsApp.\n"
+            "- Retome exatamente a pendência da última mensagem do atendimento. Mostre que acompanhou a "
+            "conversa usando o que o lead já contou, e NUNCA peça de novo algo que ele já informou.\n"
+            "- No máximo UMA pergunta, e só a que estava pendente. Pode facilitar a resposta (por exemplo, "
+            "pedir só o dia).\n"
+            "- Use o primeiro nome no máximo uma vez e não abra com cumprimento (\"Oi\", \"Olá\"): a conversa já está em andamento.\n"
+            "- Não sugira dia ou horário específico, deixe o lead escolher. Não fale de preço, desconto ou promessa.\n"
+            "- Não use: \"você ainda está por aí\", \"momento ruim\", pedido de desculpa, emoji, link.")
+        texto = call_claude([{"role": "user", "content": prompt}], max_tokens=150,
+                            system=SYSTEM_FOLLOWUP_GERADO, tentativas=2, tipo="outro")
+        return _validar_followup_gerado(texto)
+    except Exception as e:
+        print(f"[followup-gerado] Erro conv={conversation_id}: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
 def lead_ja_escreveu(msgs) -> bool:
     """True se o lead mandou qualquer mensagem de verdade na conversa (em qualquer momento)."""
     return any(m.get("message_type") == 0 and not m.get("private") and (m.get("content") or "").strip()
@@ -6536,7 +6610,7 @@ def marcar_recarregar_historico(conv_key):
 def verificar_reforco_saudacao():
     """Cenário A. Varre as saudações enviadas pelo Luca; se o lead NUNCA escreveu e ninguém da
     equipe falou depois, manda o reforço (template), uma única vez, FOLLOWUP_A_MINUTOS depois."""
-    if not _cenarios_ativos():
+    if not _reforco_saudacao_ativo():
         return
     agora = time.time()
     with _reforcos_saudacao_lock:
@@ -6936,7 +7010,7 @@ def enviar_boas_vindas_rd(deal_id) -> str:
             f"[luca:boas_vindas:{deal_id}] [luca:boas_vindas_msg:{msg_id}]")
         print(f"[boas-vindas] ✅ enviada deal={deal_id} conv={conv_id} msg_id={msg_id} "
               f"texto={fonte_texto}", flush=True)
-        if _cenarios_ativos():
+        if _reforco_saudacao_ativo():
             registrar_reforco_saudacao(conv_id, nome, deal_id)  # cenário A: reforço se o lead não responder
         # Move para "1º Contato (D0)" na hora. A varredura de Novo Lead faz isso, mas
         # lê o cache de negócios, que só atualiza de hora em hora: o negócio recém
@@ -7693,6 +7767,8 @@ def verificar_followup_1h_silencio():
             print(f"[followup1h] Pulado — janela de 24h fechada conv={conversation_id}", flush=True)
             continue
 
+        if _followup_mensagem_gerada_ativa():
+            texto = texto_followup_gerado(conversation_id, primeiro_nome, "luca") or texto  # reserva: texto fixo
         try:
             send_agendorchat_message(conversation_id, texto)
             conv["followup_1h_enviado"] = True
@@ -7771,6 +7847,8 @@ def verificar_followup_4h_silencio_humano():
             print(f"[followup4h] Pulado — janela de 24h fechada conv={conversation_id}", flush=True)
             continue
 
+        if _followup_mensagem_gerada_ativa():
+            texto = texto_followup_gerado(conversation_id, primeiro_nome, "humano") or texto  # reserva: texto fixo
         try:
             send_agendorchat_message(conversation_id, texto)
             conv["followup_humano_enviado"] = True
@@ -8728,7 +8806,7 @@ def verificar_followup_dias_silencio():
         # mesmo dia, a janela de 24h do WhatsApp ainda deve estar aberta.
         # Com FOLLOWUP_CENARIOS_ATIVO o reforço passa a ser o do cenário A (verificar_reforco_saudacao):
         # template, 2h depois da saudação, só se o lead nunca escreveu. Este bloco antigo fica desligado.
-        if etapa_atual_id == ETAPA_1_CONTATO and not _cenarios_ativos():
+        if etapa_atual_id == ETAPA_1_CONTATO and not _reforco_saudacao_ativo():
             start_time_raw = deal_fresco.get("startTime")
             criado_ts = None
             if start_time_raw:
