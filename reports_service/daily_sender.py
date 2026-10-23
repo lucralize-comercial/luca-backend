@@ -2,6 +2,8 @@
 
 Uso em cron: python -m reports_service.daily_sender
 Uso em simulação: python -m reports_service.daily_sender --dry-run
+Reenvio excepcional: python -m reports_service.daily_sender --reenvio-data AAAA-MM-DD
+(requer REPORT_REENVIO_ENABLED=true, ledger persistente e data anterior a hoje)
 
 Requer um volume persistente montado em /data, dois webhooks e uma flag de
 ativação independente. Não é importado pelo web service.
@@ -9,7 +11,7 @@ ativação independente. Não é importado pelo web service.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 import logging
 import os
@@ -109,16 +111,37 @@ def _validate_preview(preview: dict, reference_date: str):
 
 def run(*, dry_run: bool = False, now: datetime | None = None,
         ledger_path: str | None = None, session=None, verify_mount: bool = True,
-        preview_provider=None) -> dict:
+        preview_provider=None, reenvio_data: str | None = None) -> dict:
     current = (now or _now()).astimezone(BRT)
-    period = (current.date() - timedelta(days=1)).isoformat()
+    if reenvio_data:
+        try:
+            target = date.fromisoformat(reenvio_data)
+            if target.isoformat() != reenvio_data:
+                raise ValueError("Formato inesperado")
+        except ValueError as exc:
+            raise ValueError("--reenvio-data exige AAAA-MM-DD valido") from exc
+        if target >= current.date():
+            raise ValueError("Reenvio permitido apenas para dias anteriores a hoje")
+        if (current.date() - target).days > 31:
+            raise ValueError("Reenvio limitado aos ultimos 31 dias")
+        # A geracao sempre usa o dia anterior a 'now'; simular 08h no dia seguinte
+        # reconstitui corretamente todos os indicadores, incluindo mes e comparativos.
+        report_now = datetime.combine(target + timedelta(days=1),
+                                      datetime.min.time(), tzinfo=BRT).replace(hour=8)
+        period = target.isoformat()
+    else:
+        report_now = current
+        period = (current.date() - timedelta(days=1)).isoformat()
     destinations = _active_destinations()
     if not dry_run:
         if os.environ.get("REPORT_CRON_ENABLED", "false").lower() != "true":
             raise RuntimeError("Envio diário bloqueado: REPORT_CRON_ENABLED não está habilitado")
         if os.environ.get("REPORT_SEND_ENABLED", "false").lower() != "true":
             raise RuntimeError("Envio diário bloqueado: REPORT_SEND_ENABLED não está habilitado")
-        if current.hour != 8:
+        if reenvio_data:
+            if os.environ.get("REPORT_REENVIO_ENABLED", "false").lower() != "true":
+                raise RuntimeError("Reenvio excepcional bloqueado: REPORT_REENVIO_ENABLED nao habilitado")
+        elif current.hour != 8:
             raise RuntimeError("Fora da janela permitida: 08:00–08:59, America/Sao_Paulo")
         for env in destinations.values():
             if not os.environ.get(env, "").startswith("https://"):
@@ -127,9 +150,9 @@ def run(*, dry_run: bool = False, now: datetime | None = None,
     if preview_provider is None:
         from .service import gerar_preview
         preview_provider = gerar_preview
-    preview = preview_provider(now=current)
+    preview = preview_provider(now=report_now)
     _validate_preview(preview, period)
-    result = {"reference_date": period, "mode": "dry_run" if dry_run else "real", "destinations": {}}
+    result = {"reference_date": period, "mode": "dry_run" if dry_run else ("reenvio" if reenvio_data else "real"), "destinations": {}}
     if dry_run:
         for dest in destinations:
             card = montar_cartao(preview, dest)
@@ -174,9 +197,11 @@ def run(*, dry_run: bool = False, now: datetime | None = None,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Gera e valida sem enviar nem gravar no banco")
+    parser.add_argument("--reenvio-data", metavar="AAAA-MM-DD",
+                        help="Recupera data passada fora da janela normal; exige REPORT_REENVIO_ENABLED=true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    result = run(dry_run=args.dry_run)
+    result = run(dry_run=args.dry_run, reenvio_data=args.reenvio_data)
     print("REPORT_DAILY_RESULT=" + json.dumps(result, ensure_ascii=False), flush=True)
     if result.get("attention_required"):
         raise SystemExit(1)
