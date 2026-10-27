@@ -104,7 +104,7 @@ def _validate_preview(preview: dict, reference_date: str):
         raise RuntimeError("Datas dos relatórios não correspondem ao fechamento esperado")
     if sum(c["origens"].values()) != c["leads"]:
         raise RuntimeError("Total das origens não confere com Leads recebidos")
-    for key in ("leads", "reunioes", "ganhos", "perdidos", "em_andamento"):
+    for key in ("leads", "reunioes_agendadas", "agenda_de_reunioes", "ganhos", "perdidos", "em_andamento"):
         if c[key] != g["ontem"][key]:
             raise RuntimeError("Comercial e gestão não conferem em " + key)
 
