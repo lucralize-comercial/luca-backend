@@ -61,6 +61,8 @@ def conferencia_reunioes():
         seen = set()
         missing = {"createdAt": 0, "dueDate": 0}
         sample_keys = []
+        types_seen = {}
+        links_seen = {}
         page = 1
         while True:
             if page > 30:
@@ -75,6 +77,14 @@ def conferencia_reunioes():
                     continue
                 if task_id is not None:
                     seen.add(task_id)
+                kind = task.get("type") or task.get("taskType") or task.get("typeName")
+                if isinstance(kind, dict):
+                    kind = kind.get("name") or kind.get("label") or kind.get("id")
+                kind = str(kind)[:60] if kind is not None else "(sem tipo)"
+                types_seen[kind] = types_seen.get(kind, 0) + 1
+                for rel in ("deal", "dealId", "deal_id", "entity", "relatedTo", "organization", "person"):
+                    if task.get(rel) is not None:
+                        links_seen[rel] = links_seen.get(rel, 0) + 1
                 created = local_day(task.get("createdAt") or task.get("created_at"))
                 due = local_day(task.get("dueDate") or task.get("due_date"))
                 if created is None:
@@ -91,6 +101,7 @@ def conferencia_reunioes():
         return jsonify({
             "ok": True, "datas": totals, "tarefas_lidas": len(seen),
             "sem_data": missing, "campos_disponiveis": sample_keys,
+            "tipos_encontrados": types_seen, "campos_de_vinculo": links_seen,
             "observacao": "Contagem local de atividades meeting acessiveis ao token; vinculo ao Funil Comercial ainda nao validado"
         })
     except Exception:
