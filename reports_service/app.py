@@ -158,6 +158,22 @@ def auditoria_reunioes():
         return jsonify({"error":"Falha na auditoria"}),502
 
 
+@app.get("/reports/comercial/periodo/conferencia")
+def comercial_periodo_conferencia():
+    """Consulta autenticada, somente leitura, sem envio ao Teams."""
+    if not _authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        from datetime import date
+        from .period_check import conferir_periodo
+        inicio = date.fromisoformat(request.args.get("inicio", "2026-10-19"))
+        fim = date.fromisoformat(request.args.get("fim", "2026-10-27"))
+        return jsonify(conferir_periodo(inicio, fim))
+    except Exception:
+        app.logger.exception("Falha na conferencia comercial por periodo")
+        return jsonify({"error": "Conferencia incompleta; confira os logs do servico"}), 502
+
+
 @app.get("/reports/teste")
 def reports_test():
     if not _authorized():
