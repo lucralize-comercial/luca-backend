@@ -8,7 +8,7 @@ def _line(label: str, previous: int, current: int) -> str:
     return f"{label}: **{previous} | {current} {arrow} {pct}**"
 
 
-def build_gestao(y: dict, b: dict, month: dict, yesterday: date, before: date) -> tuple[str, dict]:
+def build_gestao(y: dict, b: dict, month: dict, yesterday: date, before: date, origins=None) -> tuple[str, dict]:
     text = (
         "**ACOMPANHAMENTO COMERCIAL**\n\n"
         f"**Antes de ontem ({before.strftime('%d/%m')}) | Ontem ({yesterday.strftime('%d/%m')})**\n\n"
@@ -30,4 +30,5 @@ def build_gestao(y: dict, b: dict, month: dict, yesterday: date, before: date) -
         "ontem": {"data": yesterday.isoformat(), **y},
         "antes_de_ontem": {"data": before.isoformat(), **b},
         "acumulado_mes": month,
+        "origens": origins or {},
     }
