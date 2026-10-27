@@ -27,7 +27,7 @@ def build_comercial(metrics: dict, leads_do_dia: list[dict], day: date, fields_m
         "**Origem dos leads**\n\n"
         + "".join(f"• {name}: **{count}**\n" for name, count in origins.items()) + "\n"
         + "\u200e\n\n"
-        "**Resumo do dia**\n\n"
+        + "**Resumo do dia**\n\n"
         f"Entraram **{leads} {_plural(leads, 'novo lead', 'novos leads')}** no Funil Comercial.\n"
         f"{_plural(reunioes, 'Foi registrada', 'Foram registradas')} **{reunioes} {_plural(reunioes, 'reunião', 'reuniões')}**.\n"
         f"**{ganhos} {_plural(ganhos, 'negócio foi ganho', 'negócios foram ganhos')}** e **{perdidos} {_plural(perdidos, 'foi encerrado como perdido', 'foram encerrados como perdidos')}**.\n\n"
