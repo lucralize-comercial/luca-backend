@@ -109,6 +109,55 @@ def conferencia_reunioes():
         return jsonify({"error": "Falha na consulta ao Agendor"}), 502
 
 
+@app.get("/reports/reunioes/auditoria")
+def auditoria_reunioes():
+    """Audita os campos de horario sem divulgar dados pessoais."""
+    if not _authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        from .agendor import _get
+        from datetime import datetime, date
+        from zoneinfo import ZoneInfo
+        target = date.fromisoformat(request.args.get("data", "2026-10-26"))
+        days = {target.isoformat(), (target.replace(day=target.day) if False else target).isoformat()}
+        rows = []
+        page = 1
+        while True:
+            if page > 30:
+                raise RuntimeError("Limite de paginacao excedido")
+            payload = _get("/tasks", params={"per_page":100, "page":page, "typesIn":"meeting"})
+            for task in payload.get("data") or []:
+                raw = task.get("dueDate")
+                if not raw:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(str(raw).replace("Z","+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+                    local = dt.astimezone(ZoneInfo("America/Sao_Paulo"))
+                except (ValueError, TypeError):
+                    continue
+                if raw[:10] == target.isoformat() or local.date() == target or abs((local.date()-target).days) <= 1:
+                    deal = task.get("deal")
+                    rows.append({
+                        "id":task.get("id"), "dueDate":raw,
+                        "dia_utc":dt.date().isoformat(),
+                        "dia_brasilia":local.date().isoformat(),
+                        "hora_brasilia":local.strftime("%H:%M"),
+                        "deal_id":deal.get("id") if isinstance(deal,dict) else deal,
+                        "deal_campos":sorted(deal.keys()) if isinstance(deal,dict) else [],
+                        "funil":((deal.get("dealStage") or {}).get("funnel") or {}).get("id") if isinstance(deal,dict) else None
+                    })
+            if not (payload.get("links") or {}).get("next"):
+                break
+            page += 1
+        return jsonify({"ok":True, "data":target.isoformat(), "reunioes_proximas":rows,
+                        "nota":"Auditoria de datas com +/-1 dia; nao equivale a contagem validada do funil"})
+    except Exception:
+        app.logger.exception("Erro na auditoria de reunioes")
+        return jsonify({"error":"Falha na auditoria"}),502
+
+
 @app.get("/reports/teste")
 def reports_test():
     if not _authorized():
