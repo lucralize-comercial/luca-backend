@@ -26,8 +26,8 @@ def gerar_preview(now: datetime | None = None) -> dict:
         found = meetings.get(day.isoformat(), {})
         metrics["reunioes_agendadas"] = found.get("reunioes_agendadas", 0)
         metrics["agenda_de_reunioes"] = found.get("agenda_de_reunioes", 0)
-    mes["reunioes_agendadas"] = sum(v["reunioes_agendadas"] for v in meetings.values())
-    mes["agenda_de_reunioes"] = sum(v["agenda_de_reunioes"] for v in meetings.values())
+    mes["reunioes_agendadas"] = sum(v["reunioes_agendadas"] for k, v in meetings.items() if k >= yesterday.replace(day=1).isoformat())
+    mes["agenda_de_reunioes"] = sum(v["agenda_de_reunioes"] for k, v in meetings.items() if k >= yesterday.replace(day=1).isoformat())
 
     # Origem detalhada para os dois dias comparados.
     leads_ontem = listar_leads_dia(yesterday)
