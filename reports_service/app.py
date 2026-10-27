@@ -29,6 +29,41 @@ def health():
     return jsonify({"ok": True, "service": "luca-reports", "mode": "test-no-send"})
 
 
+@app.get("/reports/reunioes/conferencia")
+def conferencia_reunioes():
+    """Consulta somente leitura; nao envia mensagens nem altera tarefas."""
+    if not _authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        from datetime import date
+        from .agendor import _bounds, _get
+        dates = request.args.get("datas", "2026-10-25,2026-10-26").split(",")
+        dates = [date.fromisoformat(d.strip()) for d in dates]
+        if len(dates) < 1 or len(dates) > 7:
+            return jsonify({"error": "Informe de 1 a 7 datas"}), 400
+        out = {}
+        for day in dates:
+            start, end = _bounds(day)
+            results = {}
+            for name, first, last in (
+                ("reunioes_agendadas", "createdAtGt", "createdAtLt"),
+                ("agenda_de_reunioes", "dueDateGt", "dueDateLt"),
+            ):
+                payload = _get("/tasks", params={
+                    "per_page": 1, "page": 1, "typesIn": "meeting",
+                    first: start, last: end,
+                })
+                meta = payload.get("meta") or {}
+                results[name] = int(meta["totalCount"]) if "totalCount" in meta else None
+                if results[name] is None:
+                    raise RuntimeError("Agendor nao devolveu totalCount para " + name)
+            out[day.isoformat()] = results
+        return jsonify({"ok": True, "criterio": "todas as reunioes visiveis ao token; conferir vinculo com funil comercial", "datas": out})
+    except Exception:
+        app.logger.exception("Falha na conferencia de reunioes")
+        return jsonify({"error": "Falha na consulta ao Agendor"}), 502
+
+
 @app.get("/reports/teste")
 def reports_test():
     if not _authorized():
