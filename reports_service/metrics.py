@@ -183,3 +183,49 @@ def reference_days(now: datetime | None = None) -> tuple[date, date]:
     yesterday = current.date() - timedelta(days=1)
     before = yesterday - timedelta(days=1)
     return yesterday, before
+
+def detailed_origin(deal: dict, fields_map=None) -> str:
+    """Origem do Negócio, sem inferir canal de outros campos."""
+    fields_map = fields_map or {}
+    custom = deal.get("customFields") or {}
+    raw = custom.get("origem_do_negocio")
+    if raw is None:
+        raw = deal.get("origem_do_negocio")
+    parts = _flatten(raw, fields_map.get("origem_do_negocio"))
+    name = next((part.strip() for part in parts if part and str(part).strip()), "")
+    return name if name else "Sem origem preenchida"
+
+
+def detailed_origins_for_day(deals: list[dict], day: date, fields_map=None) -> Counter:
+    result = Counter()
+    seen = set()
+    for deal in deals:
+        try:
+            start_day = date.fromisoformat(str(deal.get("startTime"))[:10])
+        except (ValueError, TypeError):
+            continue
+        if start_day != day:
+            continue
+        ident = deal.get("id")
+        if ident is not None and ident in seen:
+            continue
+        seen.add(ident)
+        result[detailed_origin(deal, fields_map)] += 1
+    return result
+
+
+def top_origins_comparison(before_leads, yesterday_leads, fields_map=None) -> dict:
+    """Cinco maiores origens no universo dos dois dias, depois sem origem e Outros."""
+    from collections import Counter
+    old, new = Counter(), Counter()
+    for deal in before_leads:
+        old[detailed_origin(deal, fields_map)] += 1
+    for deal in yesterday_leads:
+        new[detailed_origin(deal, fields_map)] += 1
+    common = old + new
+    common.pop("Sem origem preenchida", None)
+    top = [key for key, _ in sorted(common.items(), key=lambda pair: (-pair[1], pair[0].casefold()))[:5]]
+    labels = top + ["Sem origem preenchida", "Outros"]
+    def group(counter):
+        return {key: (counter.get(key, 0) if key != "Outros" else sum(n for name, n in counter.items() if name not in top and name != "Sem origem preenchida")) for key in labels}
+    return {"antes_de_ontem": group(old), "ontem": group(new), "categorias": labels}
