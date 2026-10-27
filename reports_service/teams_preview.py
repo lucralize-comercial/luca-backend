@@ -73,7 +73,7 @@ def montar_cartao(preview: dict[str, Any], destino: str) -> dict[str, Any]:
         ])
         # Texto narrativo compacto, sem espaços extras entre as linhas
         body[-1]["text"] += " no Funil Comercial."
-        body.append(_line("Foi registrada", f"{m['reunioes_agendadas']} reunião" if m["reunioes"] == 1 else f"{m['reunioes_agendadas']} reuniões"))
+        body.append(_line("Foi registrada", f"{m['reunioes_agendadas']} reunião" if m["reunioes_agendadas"] == 1 else f"{m['reunioes_agendadas']} reuniões"))
         body[-1]["text"] += "."
         body.append(_line("", f"{m['ganhos']} negócios foram ganhos"))
         body[-1]["text"] += f" e **{m['perdidos']} foram encerrados como perdidos**."
@@ -87,7 +87,7 @@ def montar_cartao(preview: dict[str, Any], destino: str) -> dict[str, Any]:
                            ("Em andamento:", "em_andamento")):
             body.append(_line(label, f"{b[key]} | {y[key]} {_pct(b[key], y[key])}"))
         body.append(_heading("Acumulado do mês"))
-        for label, key in (("Leads recebidos:", "leads"), ("Reuniões:", "reunioes"),
+        for label, key in (("Leads recebidos:", "leads"), ("Reuniões agendadas:", "reunioes_agendadas"), ("Agenda de reuniões:", "agenda_de_reunioes",
                            ("Ganhos:", "ganhos"), ("Perdidos:", "perdidos"),
                            ("Em andamento:", "em_andamento")):
             body.append(_line(label, str(m[key])))
