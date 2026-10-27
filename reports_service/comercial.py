@@ -7,11 +7,11 @@ def _plural(n: int, singular: str, plural: str) -> str:
     return singular if n == 1 else plural
 
 
-def build_comercial(metrics: dict, leads_do_dia: list[dict], day: date, fields_map=None) -> tuple[str, dict]:
-    origins = origins_for_day(leads_do_dia, day, fields_map)
+def build_comercial(metrics: dict, leads_do_dia: list[dict], day: date, fields_map=None, all_origins=None) -> tuple[str, dict]:
+    origins = all_origins['ontem'] if all_origins else origins_for_day(leads_do_dia, day, fields_map)
     dd = day.strftime("%d/%m/%Y")
     leads = metrics['leads']
-    reunioes = metrics['reunioes']
+    reunioes = metrics['reunioes_agendadas']
     ganhos = metrics['ganhos']
     perdidos = metrics['perdidos']
 
@@ -24,11 +24,7 @@ def build_comercial(metrics: dict, leads_do_dia: list[dict], day: date, fields_m
         f"Em andamento: **{metrics['em_andamento']}**\n\n"
         "\u200e\n\n"
         "**Origem dos leads**\n\n"
-        f"• Google Ads: **{origins['Google Ads']}**\n"
-        f"• Meta Ads: **{origins['Meta Ads']}**\n"
-        f"• Calculadora: **{origins['Calculadora']}**\n"
-        f"• WhatsApp/Site: **{origins['WhatsApp/Site']}**\n"
-        f"• Outros: **{origins['Outros']}**\n\n"
+        "".join(f"• {name}: **{count}**\\n" for name, count in origins.items()) + "\\n"
         "\u200e\n\n"
         "**Resumo do dia**\n\n"
         f"Entraram **{leads} {_plural(leads, 'novo lead', 'novos leads')}** no Funil Comercial.\n"
