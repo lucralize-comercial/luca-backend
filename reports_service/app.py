@@ -31,34 +31,68 @@ def health():
 
 @app.get("/reports/reunioes/conferencia")
 def conferencia_reunioes():
-    """Consulta somente leitura; nao envia mensagens nem altera tarefas."""
+    """Conferencia somente leitura com filtro local de datas; nao envia mensagens."""
     if not _authorized():
         return jsonify({"error": "unauthorized"}), 401
     try:
-        from datetime import date
-        from .agendor import _bounds, _get
-        dates = request.args.get("datas", "2026-10-25,2026-10-26").split(",")
-        dates = [date.fromisoformat(d.strip()) for d in dates]
-        if len(dates) < 1 or len(dates) > 7:
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+        from .agendor import _get
+
+        raw_dates = request.args.get("datas", "2026-10-25,2026-10-26").split(",")
+        days = [date.fromisoformat(value.strip()) for value in raw_dates]
+        if not 1 <= len(days) <= 7:
             return jsonify({"error": "Informe de 1 a 7 datas"}), 400
-        out = {}
-        for day in dates:
-            start, end = _bounds(day)
-            results = {}
-            for name, first, last in (
-                ("reunioes_agendadas", "createdAtGt", "createdAtLt"),
-                ("agenda_de_reunioes", "dueDateGt", "dueDateLt"),
-            ):
-                payload = _get("/tasks", params={
-                    "per_page": 1, "page": 1, "typesIn": "meeting",
-                    first: start, last: end,
-                })
-                meta = payload.get("meta") or {}
-                results[name] = int(meta["totalCount"]) if "totalCount" in meta else None
-                if results[name] is None:
-                    raise RuntimeError("Agendor nao devolveu totalCount para " + name)
-            out[day.isoformat()] = results
-        return jsonify({"ok": True, "criterio": "todas as reunioes visiveis ao token; conferir vinculo com funil comercial", "datas": out})
+
+        def local_day(value):
+            if not value:
+                return None
+            try:
+                timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+                return timestamp.astimezone(ZoneInfo("America/Sao_Paulo")).date()
+            except (ValueError, TypeError):
+                return None
+
+        # Nao confiar em createdAtGt/dueDateGt: a API pode ignorar filtros desconhecidos.
+        # Busca TODAS as atividades do tipo meeting e confere os timestamps localmente.
+        totals = {str(day): {"reunioes_agendadas": 0, "agenda_de_reunioes": 0} for day in days}
+        seen = set()
+        missing = {"createdAt": 0, "dueDate": 0}
+        sample_keys = []
+        page = 1
+        while True:
+            if page > 30:
+                raise RuntimeError("Consulta excedeu limite de 3000 atividades; nenhuma contagem parcial publicada")
+            payload = _get("/tasks", params={"per_page": 100, "page": page, "typesIn": "meeting"})
+            tasks = payload.get("data") or []
+            if page == 1 and tasks:
+                sample_keys = sorted(tasks[0].keys())
+            for task in tasks:
+                task_id = task.get("id")
+                if task_id is not None and task_id in seen:
+                    continue
+                if task_id is not None:
+                    seen.add(task_id)
+                created = local_day(task.get("createdAt") or task.get("created_at"))
+                due = local_day(task.get("dueDate") or task.get("due_date"))
+                if created is None:
+                    missing["createdAt"] += 1
+                if due is None:
+                    missing["dueDate"] += 1
+                if created is not None and str(created) in totals:
+                    totals[str(created)]["reunioes_agendadas"] += 1
+                if due is not None and str(due) in totals:
+                    totals[str(due)]["agenda_de_reunioes"] += 1
+            if not tasks or not (payload.get("links") or {}).get("next"):
+                break
+            page += 1
+        return jsonify({
+            "ok": True, "datas": totals, "tarefas_lidas": len(seen),
+            "sem_data": missing, "campos_disponiveis": sample_keys,
+            "observacao": "Contagem local de atividades meeting acessiveis ao token; vinculo ao Funil Comercial ainda nao validado"
+        })
     except Exception:
         app.logger.exception("Falha na conferencia de reunioes")
         return jsonify({"error": "Falha na consulta ao Agendor"}), 502
