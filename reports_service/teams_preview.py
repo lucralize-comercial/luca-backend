@@ -60,20 +60,20 @@ def montar_cartao(preview: dict[str, Any], destino: str) -> dict[str, Any]:
         d = _date(m["data"], "%d/%m/%Y")
         body = _base(f"RESUMO COMERCIAL — {d}")
         body.append(_heading(f"Antes de ontem ({_date(b['data'], '%d/%m')}) | Ontem ({_date(y['data'], '%d/%m')})"))
-        for label, key in (("Leads recebidos:", "leads"), ("Reuniões:", "reunioes"),
+        for label, key in (("Leads recebidos:", "leads"), ("Reuniões agendadas:", "reunioes_agendadas"), ("Agenda de reuniões:", "agenda_de_reunioes"),
                            ("Ganhos:", "ganhos"), ("Perdidos:", "perdidos"),
                            ("Em andamento:", "em_andamento")):
             body.append(_line(label, f"{b[key]} | {y[key]} {_pct(b[key], y[key])}"))
         body.append(_heading("Origem dos leads"))
-        for origin in ("Google Ads", "Meta Ads", "Calculadora", "WhatsApp/Site", "Outros"):
-            body.append(_line(f"• {origin}:", str(m["origens"][origin])))
+        for origin, value in m["origens"].items():
+            body.append(_line(f"• {origin}:", str(value)))
         body.extend([
             _heading("Resumo do dia"),
             _line("Entraram", f"{m['leads']} novos leads", True),
         ])
         # Texto narrativo compacto, sem espaços extras entre as linhas
         body[-1]["text"] += " no Funil Comercial."
-        body.append(_line("Foi registrada", f"{m['reunioes']} reunião" if m["reunioes"] == 1 else f"{m['reunioes']} reuniões"))
+        body.append(_line("Foi registrada", f"{m['reunioes_agendadas']} reunião" if m["reunioes"] == 1 else f"{m['reunioes']} reuniões"))
         body[-1]["text"] += "."
         body.append(_line("", f"{m['ganhos']} negócios foram ganhos"))
         body[-1]["text"] += f" e **{m['perdidos']} foram encerrados como perdidos**."
