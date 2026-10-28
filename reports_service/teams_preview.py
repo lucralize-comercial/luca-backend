@@ -87,7 +87,7 @@ def montar_cartao(preview: dict[str, Any], destino: str) -> dict[str, Any]:
                            ("Em andamento:", "em_andamento")):
             body.append(_line(label, f"{b[key]} | {y[key]} {_pct(b[key], y[key])}"))
         body.append(_heading("Acumulado do mês"))
-        for label, key in (("Leads recebidos:", "leads"), ("Reuniões agendadas:", "reunioes_agendadas"), ("Agenda de reuniões:", "agenda_de_reunioes",
+        for label, key in (("Leads recebidos:", "leads"), ("Reuniões agendadas:", "reunioes_agendadas"), ("Agenda de reuniões:", "agenda_de_reunioes"),
                            ("Ganhos:", "ganhos"), ("Perdidos:", "perdidos"),
                            ("Em andamento:", "em_andamento")):
             body.append(_line(label, str(m[key])))
