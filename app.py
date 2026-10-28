@@ -5725,6 +5725,9 @@ def agendorchat_webhook():
                             send_private_note(conversation_id,
                                 f"⚠️ Mensagem não entregue (número inválido/sem WhatsApp). Motivo: {motivo}. "
                                 f"Negócio já teve contato real antes, etapa mantida — verificar manualmente. {marcador_falha}")
+                else:
+                    print(f"[msg_falhou] Negócio não encontrado pelo telefone {phone} — nenhuma ação "
+                          f"(conv={conversation_id} msg={msg_id}); a régua trata a falha na próxima varredura", flush=True)
             return jsonify({}), 200
 
 
@@ -8285,6 +8288,51 @@ def marcar_perdido_d10_com_validacoes(deal_id, loss_reason_id, end_time=None) ->
     return "perdido" if marcar_negocio_perdido(deal_id, loss_reason_id, end_time=end_time) else "falha"
 
 
+def _falha_eh_numero_inexistente(motivo) -> bool:
+    """True se o motivo de falha do WhatsApp indica número que não existe ou não tem WhatsApp
+    (131026 "Message undeliverable", "not a WhatsApp user"...). Diferente do 131049 e de saldo
+    (BILLING), que são falhas temporárias e continuam sendo reenviadas."""
+    m = (motivo or "").lower()
+    if "131049" in m or "ecosystem engagement" in m or "low balance" in m:
+        return False
+    return ("131026" in m or "undeliverable" in m or "not a whatsapp user" in m
+            or "não é um usuário" in m or "not registered" in m or "sem whatsapp" in m)
+
+
+def _motivo_da_falha(msgs, msg_id) -> str:
+    """Texto do erro (external_error) da mensagem que falhou, lido da listagem da conversa."""
+    for m in msgs or []:
+        if m.get("id") == msg_id:
+            return ((m.get("content_attributes") or {}).get("external_error") or "")
+    return ""
+
+
+def encerrar_por_numero_inexistente(deal_id, conversation_id, etapa_atual_id, motivo, msgs) -> str:
+    """Régua: o follow-up falhou porque o número não existe. Em vez de reenviar a cada varredura,
+    move o negócio para 'Perdido - sem retorno (D10)' e marca como perdido (Contato Inválido 2.4 ou
+    Sem WhatsApp 2.5), com as mesmas validações do D10 (origem preenchida). Se a origem estiver
+    vazia, a perda fica adiada, mas o negócio sai da régua e o reenvio para. Devolve "perdido",
+    "aguardando_origem", "falha" ou "etapa_mantida"."""
+    marcador = f"[followup:numero_inexistente:{deal_id}]"
+    primeira_vez = not marcador_existe(msgs, marcador)
+    if etapa_atual_id not in (ETAPA_NOVO_LEAD, ETAPA_1_CONTATO, ETAPA_2_CONTATO, ETAPA_3_CONTATO,
+                              ETAPA_4_CONTATO_D5, ETAPA_5_CONTATO_D7, ETAPA_PERDIDO_SEM_CONTATO):
+        return "etapa_mantida"
+    mover_etapa_funil_comercial(deal_id, ETAPA_PERDIDO_SEM_CONTATO, permitir_recuo=True)
+    m = (motivo or "").lower()
+    sem_whatsapp = ("not a whatsapp user" in m or "não é um usuário" in m
+                    or "not registered" in m or "sem whatsapp" in m)
+    resultado = marcar_perdido_d10_com_validacoes(
+        deal_id, LOSS_REASON_SEM_WHATSAPP if sem_whatsapp else LOSS_REASON_CONTATO_INVALIDO)
+    if primeira_vez:
+        send_private_note(conversation_id,
+            f"⚠️ Número inexistente ou sem WhatsApp (motivo: {motivo}). O follow-up não será reenviado. "
+            f"Movido para 'Perdido - sem retorno (D10)'"
+            f"{' e marcado como perdido' if resultado == 'perdido' else ' (perda aguardando a origem do negócio)'}. "
+            f"{marcador}")
+    return resultado
+
+
 def _data_gt_para_tasks_d10(deal: dict) -> str:
     """Define um limite inferior seguro para consultar as tasks do negócio.
 
@@ -8925,6 +8973,16 @@ def verificar_followup_dias_silencio():
                 except Exception:
                     msg_id_pendente = None
                 status_entrega = status_da_mensagem(conversation_id, msg_id_pendente)
+                if status_entrega == "failed":
+                    motivo_falha = _motivo_da_falha(msgs_pendencia, msg_id_pendente)
+                    if _falha_eh_numero_inexistente(motivo_falha):
+                        # Número que não existe: reenviar não adianta (e piora a qualidade do número na
+                        # Meta). Encerra como contato inválido e para de reenviar.
+                        resultado_inv = encerrar_por_numero_inexistente(
+                            deal_id, conversation_id, etapa_atual_id, motivo_falha, msgs_pendencia)
+                        print(f"[followup_dias] {tag} número inexistente deal={deal_id} "
+                              f"motivo={motivo_falha[:60]!r} resultado={resultado_inv} — sem reenvio", flush=True)
+                        continue
                 if status_entrega in ("delivered", "read"):
                     # "read" implica que já foi entregue antes (o WhatsApp
                     # progride sent -> delivered -> read), então conta igual.
