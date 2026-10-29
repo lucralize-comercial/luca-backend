@@ -6531,6 +6531,31 @@ def _followup_mensagem_gerada_ativa() -> bool:
     return _cenarios_ativos() and _flag("FOLLOWUP_MENSAGEM_GERADA_ATIVO", "false")
 
 
+# Os modos de ensaio ficam LIGADOS por padrão e só saem com um desligamento explícito: qualquer outro
+# valor (inclusive erro de digitação) mantém o ensaio.
+_VALORES_DESLIGADO = ("false", "0", "nao", "não", "off")
+
+
+def _followup_mensagem_gerada_ensaio() -> bool:
+    """Modo ENSAIO (padrão ligado): o Luca gera o texto e o REGISTRA em log, mas envia o texto fixo.
+    Só envia o texto gerado com FOLLOWUP_MENSAGEM_GERADA_ENSAIO=false."""
+    return os.environ.get("FOLLOWUP_MENSAGEM_GERADA_ENSAIO", "true").strip().lower() not in _VALORES_DESLIGADO
+
+
+def escolher_texto_followup(conversation_id, primeiro_nome, quem_falou_por_ultimo, texto_fixo) -> str:
+    """Texto que vai ao lead nos cenários B e C. Sem a flag: o fixo. Com a flag e em ensaio: gera,
+    registra e envia o fixo. Com a flag e fora do ensaio: o gerado (ou o fixo se falhar/reprovar)."""
+    if not _followup_mensagem_gerada_ativa():
+        return texto_fixo
+    gerado = texto_followup_gerado(conversation_id, primeiro_nome, quem_falou_por_ultimo)
+    cenario = "B" if quem_falou_por_ultimo == "luca" else "C"
+    if _followup_mensagem_gerada_ensaio():
+        print(f"[followup-gerado][ENSAIO] cenario={cenario} conv={conversation_id} "
+              f"gerado={(gerado or 'REPROVADO/FALHOU')[:240]!r} fixo_enviado={texto_fixo[:120]!r}", flush=True)
+        return texto_fixo
+    return gerado or texto_fixo
+
+
 _FRASES_PROIBIDAS_FOLLOWUP = (
     "ainda está por aí", "ainda esta por ai", "momento ruim", "peguei você", "peguei voce", "te peguei",
     "desculpe", "desculpa", "incomod", "disponibilidade", "gostaria",
@@ -7896,8 +7921,7 @@ def verificar_followup_1h_silencio():
             print(f"[followup1h] Pulado — janela de 24h fechada conv={conversation_id}", flush=True)
             continue
 
-        if _followup_mensagem_gerada_ativa():
-            texto = texto_followup_gerado(conversation_id, primeiro_nome, "luca") or texto  # reserva: texto fixo
+        texto = escolher_texto_followup(conversation_id, primeiro_nome, "luca", texto)
         try:
             send_agendorchat_message(conversation_id, texto)
             conv["followup_1h_enviado"] = True
@@ -7976,8 +8000,7 @@ def verificar_followup_4h_silencio_humano():
             print(f"[followup4h] Pulado — janela de 24h fechada conv={conversation_id}", flush=True)
             continue
 
-        if _followup_mensagem_gerada_ativa():
-            texto = texto_followup_gerado(conversation_id, primeiro_nome, "humano") or texto  # reserva: texto fixo
+        texto = escolher_texto_followup(conversation_id, primeiro_nome, "humano", texto)
         try:
             send_agendorchat_message(conversation_id, texto)
             conv["followup_humano_enviado"] = True
@@ -8437,6 +8460,22 @@ def _regua_pula_lead_que_ja_escreveu() -> bool:
     """Flag REGUA_PULAR_LEAD_QUE_JA_ESCREVEU (desligada por padrão): a régua D1 a D10 não faz o
     primeiro envio de uma etapa a quem já escreveu na conversa."""
     return _flag("REGUA_PULAR_LEAD_QUE_JA_ESCREVEU", "false")
+
+
+def _regua_pula_ensaio() -> bool:
+    """Modo ENSAIO da régua (padrão ligado): com REGUA_PULAR_LEAD_QUE_JA_ESCREVEU ligada, a régua só
+    REGISTRA em log os negócios que pularia, sem mover etapa nem pular o envio. Para valer de
+    verdade: REGUA_PULAR_ENSAIO=false."""
+    return os.environ.get("REGUA_PULAR_ENSAIO", "true").strip().lower() not in _VALORES_DESLIGADO
+
+
+def _regua_pula_limite() -> int:
+    """Máximo de negócios movidos por varredura (REGUA_PULAR_LIMITE_POR_VARREDURA, padrão 5): um erro
+    de critério não vira um lote grande de negócios movidos de uma vez."""
+    try:
+        return max(0, int(os.environ.get("REGUA_PULAR_LIMITE_POR_VARREDURA", "5")))
+    except ValueError:
+        return 5
 
 
 def pular_regua_lead_que_ja_escreveu(deal_id, conversation_id, tag, msgs) -> str:
@@ -8984,6 +9023,7 @@ def verificar_followup_dias_silencio():
     ]
 
     enviados = 0
+    pulados_regua = 0  # negócios movidos por REGUA_PULAR_LEAD_QUE_JA_ESCREVEU nesta varredura (limite)
     for d in candidatos:
         deal_id = d.get("id")
         try:
@@ -9173,10 +9213,20 @@ def verificar_followup_dias_silencio():
                     # Primeiro envio desta etapa para um negócio cuja conversa já tem mensagem do lead
                     # (ex.: segundo negócio do mesmo número, caso 46621347): não cobra como se ele
                     # nunca tivesse respondido. Move para "Contato retornado" e sai da régua.
-                    resultado_pulo = pular_regua_lead_que_ja_escreveu(deal_id, conversation_id, tag, msgs_pendencia)
-                    print(f"[followup_dias] {tag} NÃO enviado — o lead já escreveu nesta conversa "
-                          f"deal={deal_id} resultado={resultado_pulo}", flush=True)
-                    continue
+                    if _regua_pula_ensaio():
+                        # ENSAIO (padrão): só registra quem seria pulado; o envio segue como hoje.
+                        print(f"[followup_dias][ENSAIO] {tag} pularia — o lead já escreveu nesta conversa "
+                              f"deal={deal_id} conv={conversation_id}", flush=True)
+                    elif pulados_regua >= _regua_pula_limite():
+                        print(f"[followup_dias] {tag} deal={deal_id} aguarda a próxima varredura — limite de "
+                              f"{_regua_pula_limite()} negócios movidos por varredura atingido", flush=True)
+                        continue
+                    else:
+                        resultado_pulo = pular_regua_lead_que_ja_escreveu(deal_id, conversation_id, tag, msgs_pendencia)
+                        pulados_regua += 1
+                        print(f"[followup_dias] {tag} NÃO enviado — o lead já escreveu nesta conversa "
+                              f"deal={deal_id} resultado={resultado_pulo}", flush=True)
+                        continue
                 enviado, _msg_id = enviar_followup_dia(conversation_id, deal_id, phone, tag, nome)
                 if not enviado:
                     continue
