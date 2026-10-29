@@ -7015,7 +7015,7 @@ def avisar_teams_conversao_repetida(nome, deal_id, conv_id, outros) -> int:
         return 0
     corpo = [
         {"type": "TextBlock", "weight": "Bolder", "size": "Medium", "wrap": True,
-         "text": "🔔 Lead com 2 conversões: unificar e priorizar"},
+         "text": "🔥 Lead quente voltou a converter: unificar e priorizar"},
         {"type": "TextBlock", "wrap": True,
          "text": f"{nome or 'O lead'} converteu de novo pelo RD e já havia conversado com o Luca. "
                  f"Unifique os negócios e dê prioridade ao atendimento."},
