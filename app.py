@@ -11,6 +11,7 @@ import json
 import hmac
 import hashlib
 import inspect
+import unicodedata
 from urllib.parse import parse_qs, quote
 
 app = Flask(__name__)
@@ -5880,7 +5881,7 @@ def agendorchat_webhook():
             # Em thread separada, não atrasa a resposta do Luca.
             threading.Thread(
                 target=mover_para_contato_retornado_se_aplicavel,
-                args=(contact_phone,),
+                args=(contact_phone, conversation_id),
                 daemon=True
             ).start()
 
@@ -6625,6 +6626,40 @@ def lead_ja_escreveu(msgs) -> bool:
                for m in msgs or [])
 
 
+# "Interagiu" = o lead mandou algo ALÉM do texto padrão do botão de WhatsApp do site. Só o texto do
+# botão ("Olá! Gostaria de saber mais sobre os serviços da Lucralize Tech.", com ou sem emoji/"Tech")
+# não é conversa de verdade; qualquer outra mensagem (mesmo sem resposta nossa), áudio ou imagem é.
+# Outros textos padrão de botão: variável TEXTOS_PADRAO_BOTAO, trechos separados por vírgula.
+_TRECHOS_BOTAO_PADRAO = ("gostaria de saber mais sobre os servicos da lucralize",)
+
+
+def _normalizar_texto(texto) -> str:
+    sem_acento = "".join(c for c in unicodedata.normalize("NFD", str(texto or "")) if unicodedata.category(c) != "Mn")
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", sem_acento.lower()).split())
+
+
+def mensagem_eh_texto_padrao_do_botao(texto) -> bool:
+    norm = _normalizar_texto(texto)
+    if not norm:
+        return False
+    extras = [_normalizar_texto(t) for t in os.environ.get("TEXTOS_PADRAO_BOTAO", "").split(",")]
+    return any(t and t in norm for t in _TRECHOS_BOTAO_PADRAO + tuple(extras))
+
+
+def lead_interagiu(msgs) -> bool:
+    """True se o lead mandou pelo menos uma mensagem que NÃO é só o texto padrão do botão de WhatsApp
+    (texto próprio, áudio ou imagem), mesmo que ninguém tenha respondido ainda."""
+    for m in msgs or []:
+        if m.get("message_type") != 0 or m.get("private"):
+            continue
+        conteudo = (m.get("content") or "").strip()
+        if m.get("attachments"):
+            return True
+        if conteudo and not mensagem_eh_texto_padrao_do_botao(conteudo):
+            return True
+    return False
+
+
 _conversas_recarregar_historico = set()  # fora de conversation_histories: não cria entrada de memória
 
 
@@ -7142,7 +7177,7 @@ def enviar_boas_vindas_rd(deal_id) -> str:
             msgs = mensagens_da_conversa(conv_id)
             if marcador_existe(msgs, f"[luca:boas_vindas:{deal_id}]"):
                 return "ja_enviada"
-            if _conversao_repetida_ativa() and lead_ja_escreveu(msgs):
+            if _conversao_repetida_ativa() and lead_interagiu(msgs):
                 return tratar_conversao_repetida(deal_id, person, phone, conv_id, msgs, observacao)
             if janela_aberta(msgs):
                 return "lead_ja_escreveu"  # janela aberta: o Luca responde com mensagem livre
@@ -8140,7 +8175,13 @@ def mover_etapa_funil_comercial(deal_id: int, etapa_alvo_id: int, permitir_recuo
     return r.status_code in (200, 201)
 
 
-def mover_para_contato_retornado_se_aplicavel(phone: str):
+def _retorno_exige_interacao() -> bool:
+    """RETORNO_EXIGE_INTERACAO (desligada por padrão): 'Contato retornado' só quando o lead mandou algo
+    além do texto padrão do botão de WhatsApp."""
+    return _flag("RETORNO_EXIGE_INTERACAO", "false")
+
+
+def mover_para_contato_retornado_se_aplicavel(phone: str, conversation_id=None):
     """Chamado em tempo real quando o lead manda mensagem. 'Contato
     Retornado' confirma que existe uma pessoa real do outro lado, que
     respondeu a alguma mensagem nossa — não é uma etapa reservada só pra
@@ -8164,6 +8205,13 @@ def mover_para_contato_retornado_se_aplicavel(phone: str):
     18/08) — esse caso já teve contato humano e não fechou por outro
     motivo, uma resposta tardia não desfaz isso automaticamente."""
     try:
+        if conversation_id and _retorno_exige_interacao():
+            # Só o texto padrão do botão não é conversa de verdade. Se a leitura das mensagens falhar
+            # (lista vazia), mantém o comportamento de antes e segue.
+            msgs_conv = mensagens_da_conversa(conversation_id)
+            if msgs_conv and not lead_interagiu(msgs_conv):
+                print(f"[contato_retornado] Só o texto padrão do botão — não move ainda conv={conversation_id}", flush=True)
+                return
         _, deal = buscar_pessoa_e_negocio(phone)
         if not deal:
             return
@@ -9211,7 +9259,7 @@ def verificar_followup_dias_silencio():
                     continue
                 print(f"[followup_dias] {tag} confirmado como entregue deal={deal_id} — avançando etapa", flush=True)
             else:
-                if _regua_pula_lead_que_ja_escreveu() and lead_ja_escreveu(msgs_pendencia):
+                if _regua_pula_lead_que_ja_escreveu() and lead_interagiu(msgs_pendencia):
                     # Primeiro envio desta etapa para um negócio cuja conversa já tem mensagem do lead
                     # (ex.: segundo negócio do mesmo número, caso 46621347): não cobra como se ele
                     # nunca tivesse respondido. Move para "Contato retornado" e sai da régua.
