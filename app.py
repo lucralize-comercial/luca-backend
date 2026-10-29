@@ -7042,8 +7042,9 @@ def avisar_teams_conversao_repetida(nome, deal_id, conv_id, outros) -> int:
         {"type": "TextBlock", "weight": "Bolder", "size": "Medium", "wrap": True,
          "text": "🔥 Lead quente voltou a converter: unificar e priorizar"},
         {"type": "TextBlock", "wrap": True,
-         "text": f"{nome or 'O lead'} converteu de novo pelo RD e já havia conversado com o Luca. "
-                 f"Unifique os negócios e dê prioridade ao atendimento."},
+         "text": f"Mesmo lead, dois negócios: {nome or 'O lead'} converteu de novo pelo RD e já havia "
+                 f"conversado com o Luca. Priorize o atendimento, se possível com contato telefônico, "
+                 f"e dê perdido no novo negócio como duplicado."},
         {"type": "TextBlock", "wrap": True,
          "text": f"Negócio novo: [{deal_id}]({link_negocio_agendor(deal_id, conv_id)})"},
     ]
@@ -7094,7 +7095,8 @@ def tratar_conversao_repetida(deal_id, person, phone, conv_id, msgs, observacao)
         send_private_note(conv_id,
             f"🔔 Lead com 2 conversões (já havia conversado com o Luca). Saudação e D0 pulados"
             f"{'; negócio movido para Contato retornado' if movido else ''}. "
-            f"Aviso ao Teams: {'enviado' if avisos else 'não enviado'}. Unificar os negócios e priorizar. {marcador}")
+            f"Aviso ao Teams: {'enviado' if avisos else 'não enviado'}. Priorizar o atendimento e dar perdido "
+            f"neste negócio como duplicado. {marcador}")
     except Exception as e:
         print(f"[conversao-repetida] Erro na nota deal={deal_id}: {type(e).__name__}", flush=True)
     print(f"[conversao-repetida] deal={deal_id} conv={conv_id} movido={movido} avisos={avisos} "
