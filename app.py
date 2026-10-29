@@ -6953,6 +6953,130 @@ def obter_conversa_boas_vindas(phone, nome, criar):
     return conv_id, True
 
 
+# ── Lead que converte de novo (dois negócios do mesmo número) ─────────────────
+# Caso real (28-29/10): o lead respondeu ao Luca em 27/10 (negócio 46590295, "Contato retornado")
+# e converteu outra vez pelo RD em 28/10, o que criou um SEGUNDO negócio (46621347). A saudação foi
+# pulada (o lead já tinha escrito), mas o negócio novo ficou em "1º Contato (D0)" e a régua mandou
+# o D1 a quem já tinha conversado. Agora, com CONVERSAO_REPETIDA_ATIVA, o negócio novo vai para
+# "Contato retornado" e o grupo comercial recebe um aviso para unificar os negócios e priorizar.
+def _conversao_repetida_ativa() -> bool:
+    return _flag("CONVERSAO_REPETIDA_ATIVA", "false")
+
+
+def _urls_webhook_leads_repetidos() -> list:
+    """URLs (https) do fluxo do Teams, separadas por vírgula, em TEAMS_WEBHOOK_LEADS_REPETIDOS.
+    A URL é segredo: nunca vai para log."""
+    bruto = os.environ.get("TEAMS_WEBHOOK_LEADS_REPETIDOS", "")
+    return [u.strip() for u in bruto.split(",") if u.strip().lower().startswith("https://")]
+
+
+def link_negocio_agendor(deal_id, conversation_id=None) -> str:
+    url = f"https://beta.agendor.com.br/funnels/{FUNIL_COMERCIAL_ID}?dealId={deal_id}"
+    return url + (f"&tab=whatsapp&conversationId={conversation_id}" if conversation_id else "")
+
+
+def listar_outros_negocios_abertos_do_telefone(phone, deal_id_atual):
+    """Outros negócios abertos do Funil Comercial cujas pessoas têm este telefone (mais recente
+    primeiro). Devolve None se a consulta falhar (o aviso sai mesmo assim, sem a lista)."""
+    digitos = re.sub(r"\D", "", str(phone or ""))
+    if len(digitos) < 10:
+        return []
+    try:
+        pessoas, vistos = [], set()
+        for tel in [digitos] + _variantes_telefone_ddi(digitos):
+            r = requests.get(f"{AGENDOR_BASE}/people", headers=HEADERS, params={"phone": tel}, timeout=15)
+            r.raise_for_status()
+            for p in r.json().get("data", []):
+                if p.get("id") in vistos or not _pessoa_tem_telefone(p, digitos):
+                    continue
+                vistos.add(p.get("id"))
+                pessoas.append(p)
+        outros = []
+        for p in pessoas:
+            r2 = requests.get(f"{AGENDOR_BASE}/people/{p.get('id')}/deals", headers=HEADERS, timeout=15)
+            r2.raise_for_status()
+            for d in r2.json().get("data", []):
+                stage = d.get("dealStage") or {}
+                if (d.get("id") == deal_id_atual or d.get("wonAt") or d.get("lostAt")
+                        or ((stage.get("funnel") or {}).get("id")) != FUNIL_COMERCIAL_ID):
+                    continue
+                outros.append({"id": d.get("id"), "etapa": stage.get("name") or "", "start": d.get("startTime") or ""})
+        return sorted(outros, key=lambda x: x["start"], reverse=True)
+    except Exception as e:
+        print(f"[conversao-repetida] Erro ao listar outros negócios: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def avisar_teams_conversao_repetida(nome, deal_id, conv_id, outros) -> int:
+    """Posta o aviso no(s) fluxo(s) do Teams. Devolve quantos aceitaram. Nunca levanta exceção."""
+    urls = _urls_webhook_leads_repetidos()
+    if not urls:
+        print("[conversao-repetida] TEAMS_WEBHOOK_LEADS_REPETIDOS vazio — aviso do Teams não enviado", flush=True)
+        return 0
+    corpo = [
+        {"type": "TextBlock", "weight": "Bolder", "size": "Medium", "wrap": True,
+         "text": "🔔 Lead com 2 conversões: unificar e priorizar"},
+        {"type": "TextBlock", "wrap": True,
+         "text": f"{nome or 'O lead'} converteu de novo pelo RD e já havia conversado com o Luca. "
+                 f"Unifique os negócios e dê prioridade ao atendimento."},
+        {"type": "TextBlock", "wrap": True,
+         "text": f"Negócio novo: [{deal_id}]({link_negocio_agendor(deal_id, conv_id)})"},
+    ]
+    for o in (outros or [])[:3]:
+        corpo.append({"type": "TextBlock", "wrap": True,
+                      "text": f"Outro negócio: [{o['id']}]({link_negocio_agendor(o['id'])})"
+                              f"{' (' + o['etapa'] + ')' if o.get('etapa') else ''}"})
+    if not outros:
+        corpo.append({"type": "TextBlock", "wrap": True,
+                      "text": "Não consegui listar o outro negócio: procure pelo telefone do lead."})
+    payload = {"type": "message", "attachments": [{
+        "contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": None,
+        "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard", "version": "1.2", "body": corpo}}]}
+    aceitos = 0
+    for i, url in enumerate(urls, 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code in (200, 201, 202):
+                aceitos += 1
+            else:
+                print(f"[conversao-repetida] Teams destino {i} respondeu HTTP {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"[conversao-repetida] Teams destino {i} falhou: {type(e).__name__}", flush=True)
+    return aceitos
+
+
+def tratar_conversao_repetida(deal_id, person, phone, conv_id, msgs, observacao) -> str:
+    """O lead já conversou antes e acaba de gerar um negócio novo. Em vez de saudação/D0: move
+    para 'Contato retornado' (se MOVER_NOVOS_LEADS_ATIVO), avisa o grupo comercial e deixa uma
+    nota com marcador (não repete o aviso)."""
+    marcador = f"[luca:conversao_repetida:{deal_id}]"
+    if marcador_existe(msgs, marcador):
+        return "conversao_repetida_ja_tratada"
+    nome = _primeiro_nome((person or {}).get("name"))
+    if observacao:
+        print(f"[conversao-repetida] OBSERVAÇÃO: trataria deal={deal_id} conv={conv_id}", flush=True)
+        return "observacao"
+    outros = listar_outros_negocios_abertos_do_telefone(phone, deal_id)
+    movido = False
+    if _flag("MOVER_NOVOS_LEADS_ATIVO", "false"):
+        try:
+            movido = bool(mover_etapa_funil_comercial(deal_id, ETAPA_CONTATO_RETORNADO, permitir_recuo=True))
+        except Exception as e:
+            print(f"[conversao-repetida] Erro ao mover deal={deal_id}: {type(e).__name__}: {e}", flush=True)
+    avisos = avisar_teams_conversao_repetida(nome, deal_id, conv_id, outros)
+    try:
+        send_private_note(conv_id,
+            f"🔔 Lead com 2 conversões (já havia conversado com o Luca). Saudação e D0 pulados"
+            f"{'; negócio movido para Contato retornado' if movido else ''}. "
+            f"Aviso ao Teams: {'enviado' if avisos else 'não enviado'}. Unificar os negócios e priorizar. {marcador}")
+    except Exception as e:
+        print(f"[conversao-repetida] Erro na nota deal={deal_id}: {type(e).__name__}", flush=True)
+    print(f"[conversao-repetida] deal={deal_id} conv={conv_id} movido={movido} avisos={avisos} "
+          f"outros={'?' if outros is None else len(outros)}", flush=True)
+    return "conversao_repetida"
+
+
 def enviar_boas_vindas_rd(deal_id) -> str:
     """Envia a saudação inicial (template) a um negócio criado pela importação
     do RD. Devolve um código curto do que aconteceu (usado em log e testes)."""
@@ -6991,6 +7115,8 @@ def enviar_boas_vindas_rd(deal_id) -> str:
             msgs = mensagens_da_conversa(conv_id)
             if marcador_existe(msgs, f"[luca:boas_vindas:{deal_id}]"):
                 return "ja_enviada"
+            if _conversao_repetida_ativa() and lead_ja_escreveu(msgs):
+                return tratar_conversao_repetida(deal_id, person, phone, conv_id, msgs, observacao)
             if janela_aberta(msgs):
                 return "lead_ja_escreveu"  # janela aberta: o Luca responde com mensagem livre
         tpl = template_por_nome(BOAS_VINDAS_TEMPLATE)
