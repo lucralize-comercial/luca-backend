@@ -8433,6 +8433,33 @@ def _motivo_da_falha(msgs, msg_id) -> str:
     return ""
 
 
+def _regua_pula_lead_que_ja_escreveu() -> bool:
+    """Flag REGUA_PULAR_LEAD_QUE_JA_ESCREVEU (desligada por padrão): a régua D1 a D10 não faz o
+    primeiro envio de uma etapa a quem já escreveu na conversa."""
+    return _flag("REGUA_PULAR_LEAD_QUE_JA_ESCREVEU", "false")
+
+
+def pular_regua_lead_que_ja_escreveu(deal_id, conversation_id, tag, msgs) -> str:
+    """Move o negócio para 'Contato retornado' (sai da régua) e deixa uma nota única com marcador.
+    Devolve "movido", "mover_falhou" ou "ja_tratado"."""
+    marcador = f"[followup:lead_ja_escreveu:{deal_id}]"
+    if marcador_existe(msgs, marcador):
+        return "ja_tratado"
+    try:
+        movido = bool(mover_etapa_funil_comercial(deal_id, ETAPA_CONTATO_RETORNADO, permitir_recuo=True))
+    except Exception as e:
+        print(f"[followup_dias] Erro ao mover deal={deal_id}: {type(e).__name__}: {e}", flush=True)
+        movido = False
+    try:
+        send_private_note(conversation_id,
+            f"🔁 Follow-up {tag} não enviado: o lead já havia escrito nesta conversa. "
+            f"{'Movido para Contato retornado.' if movido else 'Não consegui mover a etapa (confira o negócio).'} "
+            f"{marcador}")
+    except Exception as e:
+        print(f"[followup_dias] Erro na nota deal={deal_id}: {type(e).__name__}", flush=True)
+    return "movido" if movido else "mover_falhou"
+
+
 def encerrar_por_numero_inexistente(deal_id, conversation_id, etapa_atual_id, motivo, msgs) -> str:
     """Régua: o follow-up falhou porque o número não existe. Em vez de reenviar a cada varredura,
     move o negócio para 'Perdido - sem retorno (D10)' e marca como perdido (Contato Inválido 2.4 ou
@@ -9142,6 +9169,14 @@ def verificar_followup_dias_silencio():
                     continue
                 print(f"[followup_dias] {tag} confirmado como entregue deal={deal_id} — avançando etapa", flush=True)
             else:
+                if _regua_pula_lead_que_ja_escreveu() and lead_ja_escreveu(msgs_pendencia):
+                    # Primeiro envio desta etapa para um negócio cuja conversa já tem mensagem do lead
+                    # (ex.: segundo negócio do mesmo número, caso 46621347): não cobra como se ele
+                    # nunca tivesse respondido. Move para "Contato retornado" e sai da régua.
+                    resultado_pulo = pular_regua_lead_que_ja_escreveu(deal_id, conversation_id, tag, msgs_pendencia)
+                    print(f"[followup_dias] {tag} NÃO enviado — o lead já escreveu nesta conversa "
+                          f"deal={deal_id} resultado={resultado_pulo}", flush=True)
+                    continue
                 enviado, _msg_id = enviar_followup_dia(conversation_id, deal_id, phone, tag, nome)
                 if not enviado:
                     continue
