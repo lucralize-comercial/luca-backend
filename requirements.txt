@@ -3,3 +3,4 @@ flask-cors==6.0.2
 requests==2.33.1
 gunicorn==23.0.0
 apscheduler==3.10.4
+holidays==0.107

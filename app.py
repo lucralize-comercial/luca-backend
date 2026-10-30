@@ -586,6 +586,96 @@ def saudacao_atual() -> str:
         return "Boa noite"
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# FERIADOS: sem atendimento. O Luca só distinguia dia útil de fim de semana. Com FERIADOS_ATIVO, os
+# feriados nacionais e do estado (biblioteca `holidays`, FERIADOS_UF, padrão MG) e os dias de FERIADOS
+# (YYYY-MM-DD separados por vírgula: municipais, recessos, pontos facultativos) passam a valer como
+# dia sem atendimento:
+#   - não se oferece nem se aceita reunião nesse dia (o Luca sugere o próximo dia útil);
+#   - as cobranças automáticas (cenários B/C, reforço do cenário A e régua D1-D10) ficam em pausa.
+# O Luca continua respondendo quem escrever. Desligado por padrão.
+# ═════════════════════════════════════════════════════════════════════════════
+_feriados_biblioteca_cache = {}
+_feriados_avisos = set()
+
+
+def _feriados_ativo() -> bool:
+    return _flag("FERIADOS_ATIVO", "false")
+
+
+def _feriados_da_biblioteca(ano):
+    if ano not in _feriados_biblioteca_cache:
+        dias = set()
+        try:
+            import holidays
+            uf = (os.environ.get("FERIADOS_UF", "MG") or "").strip().upper() or None
+            try:
+                dias = set(holidays.Brazil(years=ano, subdiv=uf).keys())
+            except Exception:
+                dias = set(holidays.Brazil(years=ano).keys())  # UF inválida: só os nacionais
+        except Exception as e:
+            print(f"[feriado] biblioteca de feriados indisponível ({type(e).__name__}): só vale FERIADOS", flush=True)
+        _feriados_biblioteca_cache[ano] = dias
+    return _feriados_biblioteca_cache[ano]
+
+
+def _feriados_extras():
+    datas = set()
+    for parte in os.environ.get("FERIADOS", "").replace(";", ",").split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        try:
+            datas.add(datetime.strptime(parte, "%Y-%m-%d").date())
+        except ValueError:
+            if parte not in _feriados_avisos:
+                _feriados_avisos.add(parte)
+                print(f"[feriado] data inválida em FERIADOS ignorada: {parte!r} (use AAAA-MM-DD)", flush=True)
+    return datas
+
+
+def _so_data(dia):
+    return dia.date() if isinstance(dia, datetime) else dia
+
+
+def eh_feriado(dia) -> bool:
+    if not _feriados_ativo():
+        return False
+    d = _so_data(dia)
+    return d in _feriados_da_biblioteca(d.year) or d in _feriados_extras()
+
+
+def eh_dia_util(dia) -> bool:
+    d = _so_data(dia)
+    return d.weekday() < 5 and not eh_feriado(d)
+
+
+def proximo_dia_util(dia):
+    d = _so_data(dia) + timedelta(days=1)
+    while not eh_dia_util(d):
+        d += timedelta(days=1)
+    return d
+
+
+def instrucao_feriado(dt) -> str:
+    prox = proximo_dia_util(dt)
+    return (f"\n\nATENÇÃO (calendário, não diga que 'checou' nada): o dia {dt.strftime('%d/%m')} que o lead pediu é "
+            f"FERIADO e não há atendimento. NÃO confirme nem agende esse dia. Explique de forma natural que nesse "
+            f"dia a equipe não atende e sugira o próximo dia útil, {prox.strftime('%d/%m')}, dentro do horário de atendimento.")
+
+
+def pausar_por_feriado(nome) -> bool:
+    """True se hoje (Brasília) é feriado: as cobranças automáticas ficam em pausa. Loga uma vez por dia."""
+    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+    if not eh_feriado(hoje):
+        return False
+    chave = (nome, hoje)
+    if chave not in _feriados_avisos:
+        _feriados_avisos.add(chave)
+        print(f"[feriado] {nome} em pausa hoje ({hoje.strftime('%d/%m')} é feriado)", flush=True)
+    return True
+
+
 def contexto_data_atual() -> str:
     """Retorna a data/hora atual de Brasília por extenso, MAIS uma tabela
     com a data de cada dia da semana dos próximos 10 dias — pra o Luca
@@ -599,15 +689,25 @@ def contexto_data_atual() -> str:
     meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
              "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
     tabela = []
+    ha_feriado = False
     for n in range(1, 11):
         dia = agora + timedelta(days=n)
-        tabela.append(f"{dias[dia.weekday()]} = {dia.day:02d}/{dia.month:02d}")
+        marca = ""
+        if eh_feriado(dia):
+            marca = " (FERIADO, sem atendimento)"
+            ha_feriado = True
+        tabela.append(f"{dias[dia.weekday()]} = {dia.day:02d}/{dia.month:02d}{marca}")
+    aviso_feriado = ""
+    if ha_feriado:
+        aviso_feriado = (" Nos dias marcados como FERIADO não há atendimento: NUNCA ofereça nem aceite reunião "
+                         "nesses dias; sugira o próximo dia útil.")
     return (f"\n\nDATA E HORA ATUAIS (horário de Brasília): {dias[agora.weekday()]}, "
             f"{agora.day} de {meses[agora.month - 1]} de {agora.year}, {agora.strftime('%H:%M')}. "
             f"Use esta informação ao falar de dias da semana, 'amanhã', prazos e horários de reunião.\n"
             f"PRÓXIMOS DIAS (NUNCA calcule de cabeça a data de um dia da semana — consulte aqui): "
             f"{', '.join(tabela)}.\n"
-            f"Lembre-se: o atendimento é de segunda a quinta das 9h às 17h e sexta das 9h às 16h30, sem fins de semana.")
+            f"Lembre-se: o atendimento é de segunda a quinta das 9h às 17h e sexta das 9h às 16h30, sem fins de semana."
+            f"{aviso_feriado}")
 
 
 USAGE_STATS = {
@@ -932,6 +1032,8 @@ def checar_e_sugerir_horario(dt_pedido: datetime, duracao_min: int = 30):
     permissão, timeout etc.), considera o horário NÃO confirmado. Isso evita
     dizer ao lead que um slot está disponível sem conseguir validar a agenda;
     o fluxo segue para validação com o time em vez de correr risco de conflito."""
+    if eh_feriado(dt_pedido):
+        return False, []  # feriado: sem atendimento (a resposta do Luca oferece o próximo dia útil)
     try:
         eventos = buscar_eventos_do_dia_organizador(dt_pedido)
     except Exception as e:
@@ -4821,7 +4923,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                         print(f"[crm] Tarefa de fallback já existe (idempotência) deal={deal_id} conv={conversation_id}", flush=True)
                     else:
                         prox = datetime.utcnow() - timedelta(hours=3) + timedelta(days=1)
-                        while prox.weekday() >= 5:
+                        while not eh_dia_util(prox):  # fim de semana e (com FERIADOS_ATIVO) feriados
                             prox += timedelta(days=1)
                         dt_pedido = datetime(prox.year, prox.month, prox.day, 9, 0)
                         dt_local, ajustado = ajustar_horario_reuniao(dt_pedido, owner_id_int)
@@ -5589,7 +5691,9 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                         dt_pedido = datetime.strptime(dt_iso_tentativa, "%Y-%m-%dT%H:%M")
                         livre, alternativas = checar_e_sugerir_horario(dt_pedido)
                         if not livre:
-                            if alternativas:
+                            if eh_feriado(dt_pedido):
+                                extra_disponibilidade = instrucao_feriado(dt_pedido)
+                            elif alternativas:
                                 opcoes = " ou ".join(a.strftime("%Hh%M") for a in alternativas)
                                 extra_disponibilidade = (
                                     f"\n\nATENÇÃO (checagem real de agenda, não mencione isso ao lead): "
@@ -6976,6 +7080,8 @@ def verificar_reforco_saudacao():
     """Cenário A. Varre as saudações enviadas pelo Luca; se o lead NUNCA escreveu e ninguém da
     equipe falou depois, manda o reforço (template), uma única vez, FOLLOWUP_A_MINUTOS depois."""
     if not _reforco_saudacao_ativo():
+        return
+    if pausar_por_feriado("reforço da saudação"):
         return
     agora = time.time()
     with _reforcos_saudacao_lock:
@@ -8366,6 +8472,8 @@ def verificar_followup_1h_silencio():
     seja, a reunião já foi agendada com sucesso — silêncio nesse caso é
     esperado, não é "sumiço no meio da negociação"). Baseado em memória
     (conversation_histories) — reseta se o processo reiniciar nesse meio-tempo."""
+    if pausar_por_feriado("cobrança do cenário B (1h)"):
+        return
     agora = time.time()
     for conv_key, conv in list(conversation_histories.items()):
         if conv.get("modo_demo"):
@@ -8455,6 +8563,8 @@ def verificar_followup_4h_silencio_humano():
     humano de verdade do que uma mensagem automática do Luca — e só dentro
     do horário comercial (8h-20h BRT, mesma janela já usada no
     followup_dias), pra não mandar isso de madrugada."""
+    if pausar_por_feriado("cobrança do cenário C (3h)"):
+        return
     cenarios = _cenarios_ativos()
     agora_brt = datetime.utcnow() - timedelta(hours=3)
     if not cenarios and not (8 <= agora_brt.hour < 20):
@@ -9532,6 +9642,8 @@ def dias_desde_referencia(deal_fresco: dict, etapa_atual_id: int, conversation_i
 def verificar_followup_dias_silencio():
     if not _flag("FOLLOWUP_ATIVOS", "false"):
         print("[followup_dias] varredura pulada — FOLLOWUP_ATIVOS desligado", flush=True)
+        return
+    if pausar_por_feriado("régua D1-D10"):
         return
     agora_brt = datetime.utcnow() - timedelta(hours=3)
     if not (8 <= agora_brt.hour < 20):
