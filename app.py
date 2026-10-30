@@ -6746,8 +6746,9 @@ REFORCO_SAUDACAO_TEMPLATE = os.environ.get("REFORCO_SAUDACAO_TEMPLATE", "luca_re
 # ({{1}} no lugar do nome; "\n" vira quebra de linha).
 REFORCO_SAUDACAO_TEXTO_PADRAO = (
     os.environ.get("REFORCO_SAUDACAO_TEXTO", "").replace("\\n", "\n")
-    or "Oi, {{1}}! Passando só para saber se você viu minha mensagem.\n\n"
-       "Qual o melhor horário para a gente conversar hoje?"
+    or "Oi, {{1}}.\n{{2}} da Lucralize, aqui novamente.\n"
+       "Passando só para saber se você viu minha mensagem.\n\n"
+       "Qual o melhor horário para conversarmos?"
 )
 _reforcos_saudacao = {}  # conversa -> {"enviada_em", "nome", "deal_id"}; RAM, como os demais contadores
 _reforcos_saudacao_lock = threading.Lock()
@@ -6760,17 +6761,39 @@ def registrar_reforco_saudacao(conversation_id, nome, deal_id):
             "enviada_em": time.time(), "nome": nome or "", "deal_id": deal_id}
 
 
-def _texto_template_com_nome(tpl, nome, padrao):
-    """Corpo do template com o nome; cai no texto padrão se a listagem não trouxer o corpo."""
+def _corpo_template(tpl, padrao):
+    """Corpo do template como veio na listagem; cai no texto padrão se a listagem não trouxer o corpo."""
     for chave in ("content", "body", "text"):
         v = tpl.get(chave)
         if isinstance(v, str) and "{{1}}" in v:
-            return v.replace("{{1}}", nome)
+            return v
     for comp in (tpl.get("components") or []):
         if (isinstance(comp, dict) and str(comp.get("type") or "").upper() == "BODY"
                 and isinstance(comp.get("text"), str) and "{{1}}" in comp["text"]):
-            return comp["text"].replace("{{1}}", nome)
-    return padrao.replace("{{1}}", nome)
+            return comp["text"]
+    return padrao
+
+
+def _texto_template_com_nome(tpl, nome, padrao, nome_agente=None):
+    """Corpo do template com o nome do lead ({{1}}) e, se informado, o de quem fala ({{2}})."""
+    texto = _corpo_template(tpl, padrao).replace("{{1}}", nome)
+    if nome_agente is not None:
+        texto = texto.replace("{{2}}", nome_agente)
+    return texto
+
+
+def _nome_agente_template() -> str:
+    """Quem assina o template quando o Luca envia (o humano que usa o template digita o próprio nome)."""
+    return (LUCA_BOT_NOME_EXIBICAO or "").strip() or "Luca"
+
+
+def _variaveis_reforco(tpl, nome):
+    """{{1}} = nome do lead. {{2}} = nome do Luca, só se o template aprovado tiver essa variável
+    (mandar parâmetro a mais pode fazer a Meta recusar o envio)."""
+    variaveis = {"1": nome}
+    if "{{2}}" in _corpo_template(tpl, REFORCO_SAUDACAO_TEXTO_PADRAO):
+        variaveis["2"] = _nome_agente_template()
+    return variaveis
 
 
 TEXTO_CONTINUIDADE = (
@@ -6999,8 +7022,9 @@ def _enviar_reforco_saudacao(conv_id, info) -> str:
               f"reforço não enviado conv={conv_id}", flush=True)
         return "sem_template"
     nome = info.get("nome") or ""
-    texto = _texto_template_com_nome(tpl, nome, REFORCO_SAUDACAO_TEXTO_PADRAO)
-    resp = enviar_template_conversa(conv_id, tpl, {"1": nome}, texto)
+    variaveis = _variaveis_reforco(tpl, nome)
+    texto = _texto_template_com_nome(tpl, nome, REFORCO_SAUDACAO_TEXTO_PADRAO, variaveis.get("2"))
+    resp = enviar_template_conversa(conv_id, tpl, variaveis, texto)
     msg_id = (resp or {}).get("id")
     # Mesmo marcador da saudação: assim a mensagem é reconhecida como do Luca (e não de um
     # humano) mesmo que a listagem do Chat não traga template_params.
