@@ -5641,7 +5641,8 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                 reply = reply_blindagem  # sondagem repetida: resposta fixa, sem chamar o modelo
             else:
                 reply = call_claude(conv["messages"], max_tokens=2000,
-                                     system=conv["system"] + extra_disponibilidade + aviso_blindagem, tipo="chat")
+                                     system=conv["system"] + extra_disponibilidade + aviso_blindagem
+                                            + instrucao_cliente_existente(conv), tipo="chat")
                 reply = filtrar_resposta_blindagem(reply, conversation_id)
 
             # Corrigido 01/09 (achado real do gestor: respostas instantâneas,
@@ -5695,6 +5696,7 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
 
             toggle_typing(inbox_identifier, contact_identifier, conversation_id, "off")
             send_agendorchat_message(conversation_id, reply)
+            registrar_cliente_existente(conv, conversation_id, reply)
             # Marca o início da espera por resposta do lead — usado pelo follow-up de 1h
             conv["luca_aguardando_desde"] = time.time()
             conv["contact_name_cache"] = contact_name
@@ -6201,6 +6203,20 @@ def agendorchat_webhook():
             conv = conversation_histories[conv_key]
             if contact_phone:
                 conv["phone"] = contact_phone
+            # Cliente existente: o reset apaga o histórico, então relê a conversa para não tratar
+            # como lead novo quem já recebeu os canais oficiais (caso Pedro, conv 2571, 30/10).
+            if _cliente_existente_ativo():
+                try:
+                    if conversa_eh_cliente_existente(mensagens_da_conversa(conversation_id)):
+                        if _cliente_existente_ensaio():
+                            print(f"[cliente-existente][ENSAIO] reabertura seria tratada como cliente existente "
+                                  f"conv={conversation_id}", flush=True)
+                        else:
+                            conv["cliente_existente"] = True
+                            print(f"[cliente-existente] reabertura de conversa de cliente existente "
+                                  f"conv={conversation_id}", flush=True)
+                except Exception as e:
+                    print(f"[cliente-existente] Erro ao checar reabertura conv={conversation_id}: {e}", flush=True)
 
         # ── Se memória está vazia, busca histórico real do AgendorChat ────────
         # Continuidade (CONTINUIDADE_ATENDIMENTO_ATIVO): depois de um follow-up ou de uma mensagem
@@ -6219,6 +6235,14 @@ def agendorchat_webhook():
                     remote_history = _sem_mensagem_atual(remote_history, message_text)
                     continuidade_ctx = True
                 conv["messages"] = remote_history
+                if _cliente_existente_ativo() and any(
+                        m.get("role") == "assistant" and texto_eh_canais_oficiais(m.get("content"))
+                        for m in remote_history):
+                    if _cliente_existente_ensaio():
+                        print(f"[cliente-existente][ENSAIO] histórico relido seria tratado como cliente existente "
+                              f"conv={conversation_id}", flush=True)
+                    else:
+                        conv["cliente_existente"] = True
             elif not conv["messages"]:
                 # Sem histórico remoto: injeta saudação inicial
                 conv["messages"].append({
@@ -8145,6 +8169,99 @@ Responda apenas com uma palavra: PRECISA ou NAO_PRECISA."""
         return True  # fail-safe: em erro, assume que precisa (comportamento anterior)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# CLIENTE JÁ EXISTENTE: o Luca é SDR. Quando a conversa é de quem já é cliente (o Luca mandou os
+# canais oficiais), ele deixa de cobrar, de rodar a régua e de agir como se fosse lead novo.
+#   CLIENTE_EXISTENTE_ATIVO   liga o reconhecimento (padrão: desligado)
+#   CLIENTE_EXISTENTE_ENSAIO  ligado por padrão: só registra em log o que faria
+# Nunca mexe no negócio do Agendor: se existir um, ele fica como está (só nota e conversa resolvida).
+# ═════════════════════════════════════════════════════════════════════════════
+MARCADOR_CLIENTE_EXISTENTE = "[luca:cliente_existente]"
+_CANAIS_OFICIAIS = ("3546-1210", "3546-1200")
+
+INSTRUCAO_CLIENTE_EXISTENTE = (
+    "\n\nCLIENTE JÁ EXISTENTE (verificado no histórico desta conversa): este contato já é cliente Lucralize. "
+    "NÃO trate como lead novo: não qualifique, não ofereça agendamento nem conversa com especialista, "
+    "não diga que vai repassar ou transferir para alguém e não diga que não tem como ajudar. "
+    "Se um atendente humano já orientou o cliente, não o contradiga. Para dúvidas de atendimento, documentação "
+    "ou andamento, oriente pelos canais oficiais (Devs e profissionais de tecnologia: (31) 3546-1210; demais "
+    "clientes: (31) 3546-1200), em poucas linhas."
+)
+
+
+def _cliente_existente_ativo() -> bool:
+    return _flag("CLIENTE_EXISTENTE_ATIVO", "false")
+
+
+def _cliente_existente_ensaio() -> bool:
+    return os.environ.get("CLIENTE_EXISTENTE_ENSAIO", "true").strip().lower() not in _VALORES_DESLIGADO
+
+
+def texto_eh_canais_oficiais(texto) -> bool:
+    texto = texto or ""
+    return all(c in texto for c in _CANAIS_OFICIAIS)
+
+
+def conversa_eh_cliente_existente(msgs) -> bool:
+    """True se a conversa já tem a nota privada do marcador ou uma mensagem enviada com os canais
+    oficiais (a que o Luca manda ao confirmar que o contato é cliente)."""
+    for m in msgs or []:
+        texto = m.get("content") or ""
+        if m.get("private"):
+            if MARCADOR_CLIENTE_EXISTENTE in texto:
+                return True
+        elif m.get("message_type") == 1 and texto_eh_canais_oficiais(texto):
+            return True
+    return False
+
+
+def instrucao_cliente_existente(conv) -> str:
+    """Trecho extra do prompt para a resposta do Luca numa conversa de cliente (vazio em ensaio)."""
+    if _cliente_existente_ativo() and not _cliente_existente_ensaio() and (conv or {}).get("cliente_existente"):
+        return INSTRUCAO_CLIENTE_EXISTENTE
+    return ""
+
+
+def registrar_cliente_existente(conv, conversation_id, texto_enviado):
+    """Chamado depois de o Luca enviar uma resposta: se foi a dos canais oficiais, marca a conversa."""
+    if not _cliente_existente_ativo() or not texto_eh_canais_oficiais(texto_enviado):
+        return
+    if _cliente_existente_ensaio():
+        print(f"[cliente-existente][ENSAIO] conversa seria marcada como cliente existente conv={conversation_id}",
+              flush=True)
+        return
+    if conv is not None and not conv.get("cliente_existente"):
+        conv["cliente_existente"] = True
+        print(f"[cliente-existente] conversa marcada como cliente existente conv={conversation_id}", flush=True)
+
+
+def pular_por_cliente_existente(conv, conversation_id, msgs, tag) -> bool:
+    """True se a cobrança `tag` não deve sair porque a conversa é de cliente. Em ensaio só registra.
+    Fora do ensaio deixa a nota privada com o marcador (uma vez) e resolve a conversa."""
+    if not _cliente_existente_ativo():
+        return False
+    if not ((conv or {}).get("cliente_existente") or conversa_eh_cliente_existente(msgs)):
+        return False
+    if _cliente_existente_ensaio():
+        print(f"[cliente-existente][ENSAIO] {tag} pularia — conversa de cliente existente conv={conversation_id}",
+              flush=True)
+        return False
+    if conv is not None:
+        conv["cliente_existente"] = True
+    tem_nota = any(m.get("private") and MARCADOR_CLIENTE_EXISTENTE in (m.get("content") or "")
+                   for m in msgs or [])
+    if not tem_nota:
+        try:
+            send_private_note(conversation_id, (
+                "ℹ️ Conversa de cliente já existente: o Luca não cobra nem roda a régua aqui. "
+                f"O negócio (se houver) não foi alterado. {MARCADOR_CLIENTE_EXISTENTE}"))
+        except Exception as e:
+            print(f"[cliente-existente] Erro ao deixar nota conv={conversation_id}: {e}", flush=True)
+    resolver_conversa_agendorchat(conversation_id)
+    print(f"[cliente-existente] {tag} NÃO enviado — conversa de cliente existente conv={conversation_id}", flush=True)
+    return True
+
+
 def verificar_followup_1h_silencio():
     """A cada 15 min, verifica conversas em que o Luca respondeu por último e
     o lead ficou 1h+ sem responder. Manda uma mensagem única puxando o lead
@@ -8205,6 +8322,9 @@ def verificar_followup_1h_silencio():
         except Exception as e:
             print(f"[followup1h] Erro ao checar janela conv={conversation_id}: {e}", flush=True)
             msgs_janela = None
+        if pular_por_cliente_existente(conv, conversation_id, msgs_janela, "followup1h"):
+            conv["followup_1h_enviado"] = True  # não volta a checar a cada 15 min
+            continue
         if msgs_janela is not None and not janela_aberta(msgs_janela):
             send_private_note(conversation_id, (
                 f"🔔 Follow-up de 1h NÃO enviado — janela de 24h do WhatsApp fechada. "
@@ -8284,6 +8404,9 @@ def verificar_followup_4h_silencio_humano():
         except Exception as e:
             print(f"[followup4h] Erro ao checar janela conv={conversation_id}: {e}", flush=True)
             msgs_janela = None
+        if pular_por_cliente_existente(conv, conversation_id, msgs_janela, "followup4h"):
+            conv["followup_humano_enviado"] = True
+            continue
         if msgs_janela is not None and not janela_aberta(msgs_janela):
             send_private_note(conversation_id, (
                 f"🔔 Follow-up de 4h NÃO enviado — janela de 24h do WhatsApp fechada. "
@@ -9514,6 +9637,8 @@ def verificar_followup_dias_silencio():
                     continue
                 print(f"[followup_dias] {tag} confirmado como entregue deal={deal_id} — avançando etapa", flush=True)
             else:
+                if pular_por_cliente_existente(None, conversation_id, msgs_pendencia, tag):
+                    continue  # conversa de cliente: a régua não cobra (o negócio não é alterado)
                 if _regua_pula_lead_que_ja_escreveu() and lead_interagiu(msgs_pendencia):
                     # Primeiro envio desta etapa para um negócio cuja conversa já tem mensagem do lead
                     # (ex.: segundo negócio do mesmo número, caso 46621347): não cobra como se ele
