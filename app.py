@@ -592,7 +592,8 @@ def saudacao_atual() -> str:
 # (YYYY-MM-DD separados por vírgula: municipais, recessos, pontos facultativos) passam a valer como
 # dia sem atendimento:
 #   - não se oferece nem se aceita reunião nesse dia (o Luca sugere o próximo dia útil);
-#   - as cobranças automáticas (cenários B/C, reforço do cenário A e régua D1-D10) ficam em pausa.
+#   - (opcional, FERIADOS_PAUSAR_COBRANCAS=true, desligado por padrão) as cobranças automáticas
+#     (cenários B/C, reforço do cenário A e régua D1-D10) ficam em pausa.
 # O Luca continua respondendo quem escrever. Desligado por padrão.
 # ═════════════════════════════════════════════════════════════════════════════
 _feriados_biblioteca_cache = {}
@@ -665,7 +666,11 @@ def instrucao_feriado(dt) -> str:
 
 
 def pausar_por_feriado(nome) -> bool:
-    """True se hoje (Brasília) é feriado: as cobranças automáticas ficam em pausa. Loga uma vez por dia."""
+    """True se hoje (Brasília) é feriado e FERIADOS_PAUSAR_COBRANCAS está ligada: as cobranças automáticas
+    ficam em pausa. Por padrão (decisão da diretoria, 30/10) as cobranças CONTINUAM em feriado; o feriado
+    só bloqueia o agendamento de reunião. Loga uma vez por dia."""
+    if not _flag("FERIADOS_PAUSAR_COBRANCAS", "false"):
+        return False
     hoje = (datetime.utcnow() - timedelta(hours=3)).date()
     if not eh_feriado(hoje):
         return False
