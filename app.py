@@ -6746,8 +6746,8 @@ REFORCO_SAUDACAO_TEMPLATE = os.environ.get("REFORCO_SAUDACAO_TEMPLATE", "luca_re
 # ({{1}} no lugar do nome; "\n" vira quebra de linha).
 REFORCO_SAUDACAO_TEXTO_PADRAO = (
     os.environ.get("REFORCO_SAUDACAO_TEXTO", "").replace("\\n", "\n")
-    or "Oi, {{1}}.\n{{2}} da Lucralize, aqui novamente.\n"
-       "Passando só para saber se você viu minha mensagem.\n\n"
+    or "Oi, {{1}}. Tudo bem?\n{{2}} da Lucralize, aqui novamente.\n\n"
+       "Passando para saber se você conseguiu ver minha mensagem anterior.\n\n"
        "Qual o melhor horário para conversarmos?"
 )
 _reforcos_saudacao = {}  # conversa -> {"enviada_em", "nome", "deal_id"}; RAM, como os demais contadores
