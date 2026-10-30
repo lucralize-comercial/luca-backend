@@ -7532,6 +7532,75 @@ def _boas_vindas_rd_em_segundo_plano(deal_id):
         print(f"[boas-vindas] Erro deal={deal_id}: {type(e).__name__}: {e}", flush=True)
 
 
+# Recuperação da saudação perdida (BOAS_VINDAS_RECUPERACAO_ATIVA): a saudação do RD roda numa tarefa
+# em segundo plano disparada pelo aviso de "negócio criado". Um reinício (deploy, mudança de variável)
+# no meio dela, ou um aviso que não chega, deixava o lead sem saudação (caso Saul, 30/10). A varredura
+# de Novo Lead, que roda a cada 15 min, passa a repetir a saudação para negócios do RD recentes que
+# ainda não receberam. A função da saudação já evita duplicar (marca na conversa).
+#   BOAS_VINDAS_RECUPERACAO_ATIVA   liga a recuperação (padrão: desligada)
+#   BOAS_VINDAS_RECUPERACAO_ENSAIO  ligado por padrão: só registra em log o que enviaria
+#   BOAS_VINDAS_RECUPERACAO_HORAS   só negócios criados nas últimas N horas (padrão 6)
+RECUPERACAO_SAUDACAO_IDADE_MINIMA_MIN = 10  # antes disso o caminho normal ainda pode estar rodando
+RECUPERACAO_SAUDACAO_LIMITE_POR_VARREDURA = 3
+
+
+def _recuperacao_saudacao_ativa() -> bool:
+    return _flag("BOAS_VINDAS_RECUPERACAO_ATIVA", "false")
+
+
+def _recuperacao_saudacao_ensaio() -> bool:
+    return os.environ.get("BOAS_VINDAS_RECUPERACAO_ENSAIO", "true").strip().lower() not in _VALORES_DESLIGADO
+
+
+def _recuperacao_saudacao_horas() -> float:
+    try:
+        return max(float(os.environ.get("BOAS_VINDAS_RECUPERACAO_HORAS", "6")), 0.5)
+    except (TypeError, ValueError):
+        return 6.0
+
+
+def recuperar_saudacao_perdida(deal, motivo, enviadas) -> str:
+    """Repete a saudação do RD para um negócio recente em Novo Lead que ficou sem ela.
+    `enviadas` é um contador de uma lista [n] compartilhado na varredura. Devolve um código curto."""
+    if not _recuperacao_saudacao_ativa():
+        return "desligado"
+    deal_id = deal.get("id")
+    # O cache de negócios do projeto usa startTime como data do lead; aceita createdAt se vier.
+    # Se a data vier sem horário (só o dia), compara por dia, sem a idade mínima.
+    bruto = str(deal.get("createdAt") or deal.get("startTime") or "")
+    criada = _parse_dt(bruto)
+    if not criada:
+        print(f"[recuperacao] sem data de criação deal={deal_id} — não recupera", flush=True)
+        return "sem_data"
+    agora = datetime.now(timezone.utc)
+    so_data = len(bruto) <= 10 or bruto[11:19] == "00:00:00"
+    horas = _recuperacao_saudacao_horas()
+    if so_data:
+        if criada.date() < (agora - timedelta(hours=3 + horas)).date():
+            return "antigo"
+        idade_txt = f"dia={criada.date()}"
+    else:
+        idade_min = (agora - criada).total_seconds() / 60
+        if idade_min < RECUPERACAO_SAUDACAO_IDADE_MINIMA_MIN:
+            return "recente"
+        if idade_min > horas * 60:
+            return "antigo"
+        idade_txt = f"criado_ha={int(idade_min)}min"
+    if _recuperacao_saudacao_ensaio():
+        print(f"[recuperacao][ENSAIO] enviaria a saudação deal={deal_id} motivo={motivo} {idade_txt}", flush=True)
+        return "ensaio"
+    if enviadas[0] >= RECUPERACAO_SAUDACAO_LIMITE_POR_VARREDURA:
+        print(f"[recuperacao] deal={deal_id} aguarda a próxima varredura — limite de "
+              f"{RECUPERACAO_SAUDACAO_LIMITE_POR_VARREDURA} por varredura atingido", flush=True)
+        return "limite"
+    resultado = enviar_boas_vindas_rd(deal_id)
+    if resultado == "enviada":
+        enviadas[0] += 1
+    print(f"[recuperacao] saudação deal={deal_id} motivo={motivo} {idade_txt} "
+          f"resultado={resultado}", flush=True)
+    return resultado
+
+
 def deal_tem_marca(deal_id, marcador: str) -> bool:
     """Verifica se já existe uma tarefa no negócio com essa marca — usado pra
     tornar a nota e a transcrição idempotentes de verdade (sobrevive a
@@ -8012,6 +8081,7 @@ def mover_novos_leads_para_1contato():
     ]
 
     movidos = 0
+    saudacoes_recuperadas = [0]
     for d in candidatos:
         deal_id = d.get("id")
         person = d.get("person") or {}
@@ -8061,6 +8131,7 @@ def mover_novos_leads_para_1contato():
             conv = conversa_do_telefone(telefone)
             if not conv:
                 print(f"[novo_lead] Pulado — conversa não encontrada telefone={telefone} deal={deal_id}", flush=True)
+                recuperar_saudacao_perdida(d, "sem_conversa", saudacoes_recuperadas)
                 continue
             msgs = mensagens_da_conversa(conv["id"])
             # Aceita QUALQUER mensagem enviada (não exige automation_id) —
@@ -8074,6 +8145,7 @@ def mover_novos_leads_para_1contato():
             if not saudacao_enviada:
                 print(f"[novo_lead] Pulado — saudação ainda não confirmada na conversa "
                       f"deal={deal_id}", flush=True)
+                recuperar_saudacao_perdida(d, "sem_saudacao", saudacoes_recuperadas)
                 continue
 
             # Confere a etapa FRESCA antes de mover — o cache de negócios só
