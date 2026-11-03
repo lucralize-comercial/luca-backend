@@ -9961,6 +9961,46 @@ def limpar_memoria_conversas_inativas_safe():
 # SCHEDULER + MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
+# CHECK-UP PÓS-INÍCIO (CHECKUP_POS_INICIO_ATIVO, desligado por padrão). Cada deploy ou mudança de
+# variável reinicia o serviço, e o que estava só na memória (como a saudação do RD em segundo plano) se
+# perde; a varredura de Novo Lead só voltava a rodar 15 min depois do início, e com o cache de negócios
+# ainda vazio. Depois de cada início o Luca espera o cache de negócios ficar COMPLETO (o cache é
+# publicado página a página: `updated_at` sozinho não basta, é preciso `fetch_running` terminar) e
+# então roda uma vez a varredura de Novo Lead, que recupera a saudação perdida (BOAS_VINDAS_RECUPERACAO_*).
+CHECKUP_ESPERA_INICIAL_SEGUNDOS = 60
+CHECKUP_ESPERA_CACHE_MAX_SEGUNDOS = 15 * 60
+CHECKUP_INTERVALO_SEGUNDOS = 15
+
+
+def _checkup_pos_inicio_ativo() -> bool:
+    return _flag("CHECKUP_POS_INICIO_ATIVO", "false")
+
+
+def cache_de_negocios_pronto() -> bool:
+    return bool(cache.get("updated_at")) and not fetch_running
+
+
+def checkup_pos_inicio():
+    """Roda numa thread própria, uma vez por início do serviço. Nunca levanta erro."""
+    if not _checkup_pos_inicio_ativo():
+        return
+    try:
+        time.sleep(CHECKUP_ESPERA_INICIAL_SEGUNDOS)
+        limite = time.time() + CHECKUP_ESPERA_CACHE_MAX_SEGUNDOS
+        while not cache_de_negocios_pronto() and time.time() < limite:
+            time.sleep(CHECKUP_INTERVALO_SEGUNDOS)
+        if not cache_de_negocios_pronto():
+            print("[checkup-pos-inicio] cache de negócios não ficou pronto a tempo — varredura extra NÃO rodou "
+                  "(a varredura normal de 15 min segue valendo)", flush=True)
+            return
+        print(f"[checkup-pos-inicio] cache pronto ({len(cache.get('deals') or [])} negócios) — rodando a "
+              f"varredura de Novo Lead (recupera saudação perdida)", flush=True)
+        mover_novos_leads_para_1contato_safe()
+        print("[checkup-pos-inicio] concluído", flush=True)
+    except Exception as e:
+        print(f"[checkup-pos-inicio] Erro: {type(e).__name__}: {e}", flush=True)
+
+
 def _resumo_comercial_outubro_log():
     """Somente agregados: sem tokens, contatos ou qualquer chamada adicional a API."""
     inicio, fim = "2026-10-01", "2026-10-16"
@@ -10102,6 +10142,7 @@ scheduler.add_job(verificar_followup_dias_silencio_safe, "interval", hours=3, id
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "interval", hours=3, id="reconciliar_perdidos_d10")
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "date", run_date=datetime.now() + timedelta(minutes=2), id="reconciliar_perdidos_d10_inicial")
 scheduler.add_job(fetch_deals_safe, "date", run_date=datetime.now() + timedelta(seconds=5), id="fetch_inicial")
+threading.Thread(target=checkup_pos_inicio, daemon=True, name="checkup_pos_inicio").start()
 scheduler.add_job(_rd_retro_auto_retomar_se_necessario, "interval", minutes=5, id="rd_retro_auto_retomada")
 
 # Revalidacao pontual: tres casos antigos com origem vazia. Os outros tres
