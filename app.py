@@ -7225,6 +7225,101 @@ def reforco_saudacao_recente(msgs, agora=None, horas=None) -> bool:
     return bool(envios) and (agora - max(envios)) < horas * 3600
 
 
+REFORCO_RECONSTRUIR_LIMITE = 100  # negócios conferidos por reinício (cada um custa 2-3 chamadas à API)
+
+
+def _reforco_reconstruir_ativo() -> bool:
+    """Padrão LIGADO (junto com o reforço): só recoloca na fila; o envio continua passando por todas as
+    checagens de _enviar_reforco_saudacao."""
+    return _reforco_saudacao_ativo() and _flag("REFORCO_RECONSTRUIR_FILA_ATIVO", "true")
+
+
+def _reforco_reconstruir_ensaio() -> bool:
+    return _flag("REFORCO_RECONSTRUIR_FILA_ENSAIO", "false")
+
+
+def _hora_da_saudacao(msgs, deal_id):
+    """Hora (epoch) da nota privada que marca a saudação do RD ([luca:boas_vindas:ID]); None se não houver."""
+    marca = f"[luca:boas_vindas:{deal_id}]"
+    horas = []
+    for m in msgs or []:
+        if marca in (m.get("content") or ""):
+            try:
+                h = float(m.get("created_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if h > 0:
+                horas.append(h)
+    return min(horas) if horas else None
+
+
+def reconstruir_fila_reforco_saudacao() -> dict:
+    """A fila do reforço (cenário A) fica em memória e some a cada reinício. Depois de cada início,
+    recoloca nela quem recebeu a saudação do RD há menos de FOLLOWUP_A_LIMITE_HORAS e continua sem
+    resposta: lê a conversa (nota [luca:boas_vindas:ID]) e usa a hora ORIGINAL da saudação."""
+    if not _reforco_reconstruir_ativo():
+        return {"desligado": 1}
+    agora = time.time()
+    hoje = (datetime.utcnow() - timedelta(hours=3)).date()
+    candidatos = []
+    for d in cache.get("deals") or []:
+        etapa = d.get("dealStage") or {}
+        if (etapa.get("funnel") or {}).get("id") != FUNIL_COMERCIAL_ID:
+            continue
+        if etapa.get("id") not in (ETAPA_NOVO_LEAD, ETAPA_1_CONTATO) or d.get("wonAt") or d.get("lostAt"):
+            continue
+        try:
+            dia = datetime.strptime(str(d.get("startTime") or "")[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if (hoje - dia).days <= 1:
+            candidatos.append(d)
+    res = {"candidatos": len(candidatos), "recolocados": 0, "ja_na_fila": 0, "sem_saudacao": 0,
+           "antigo": 0, "nao_elegivel": 0, "sem_conversa": 0, "erros": 0}
+    ensaio = _reforco_reconstruir_ensaio()
+    for d in candidatos[:REFORCO_RECONSTRUIR_LIMITE]:
+        deal_id = d.get("id")
+        try:
+            person = d.get("person") or {}
+            phone = telefone_da_pessoa(person["id"]) if person.get("id") else ""
+            conv = conversa_do_telefone(phone) if phone else None
+            if not conv or not conv.get("id"):
+                res["sem_conversa"] += 1
+                continue
+            conv_id = int(conv["id"])
+            with _reforcos_saudacao_lock:
+                if conv_id in _reforcos_saudacao:
+                    res["ja_na_fila"] += 1
+                    continue
+            msgs = mensagens_da_conversa(conv_id)
+            enviada_em = _hora_da_saudacao(msgs, deal_id)
+            if not enviada_em:
+                res["sem_saudacao"] += 1
+                continue
+            if agora - enviada_em > FOLLOWUP_A_LIMITE_HORAS * 3600:
+                res["antigo"] += 1  # o D1 assume
+                continue
+            if (conv.get("status") == "resolved" or marcador_existe(msgs, "[followup:reforco_d0]")
+                    or lead_ja_escreveu(msgs) or humano_realmente_respondeu(conv_id)):
+                res["nao_elegivel"] += 1
+                continue
+            if ensaio:
+                print(f"[reforco-fila][ENSAIO] recolocaria na fila deal={deal_id} conv={conv_id} "
+                      f"saudacao_ha={int((agora - enviada_em) / 60)}min", flush=True)
+            else:
+                with _reforcos_saudacao_lock:
+                    _reforcos_saudacao[conv_id] = {"enviada_em": enviada_em, "deal_id": deal_id,
+                                                  "nome": _primeiro_nome(person.get("name"))}
+                print(f"[reforco-fila] recolocado na fila deal={deal_id} conv={conv_id} "
+                      f"saudacao_ha={int((agora - enviada_em) / 60)}min", flush=True)
+            res["recolocados"] += 1
+        except Exception as e:
+            res["erros"] += 1
+            print(f"[reforco-fila] Erro deal={deal_id}: {type(e).__name__}: {e}", flush=True)
+    print(f"[reforco-fila] reconstrução concluída: {res}", flush=True)
+    return res
+
+
 def _enviar_reforco_saudacao(conv_id, info) -> str:
     msgs = mensagens_da_conversa(conv_id)
     if not msgs:
@@ -10122,6 +10217,10 @@ def checkup_pos_inicio():
         print(f"[checkup-pos-inicio] cache pronto ({len(cache.get('deals') or [])} negócios) — rodando a "
               f"varredura de Novo Lead (recupera saudação perdida)", flush=True)
         mover_novos_leads_para_1contato_safe()
+        try:
+            reconstruir_fila_reforco_saudacao()  # a fila do reforço (cenário A) é só RAM: refaz a partir das conversas
+        except Exception as e:
+            print(f"[checkup-pos-inicio] Erro ao reconstruir a fila do reforço: {type(e).__name__}: {e}", flush=True)
         print("[checkup-pos-inicio] concluído", flush=True)
     except Exception as e:
         print(f"[checkup-pos-inicio] Erro: {type(e).__name__}: {e}", flush=True)
