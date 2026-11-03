@@ -833,6 +833,38 @@ TEAMS_COPIA = [
         "TEAMS_COPIA", ""
     ).split(",") if e.strip()
 ]
+# Coorganizadores das reuniões do Luca (só contas da empresa; mudam as OPÇÕES da reunião no Teams, não o
+# horário do evento, que só o organizador edita). Vazio = ninguém. Entram também como convidados opcionais.
+TEAMS_COORGANIZADORES = [
+    e.strip() for e in os.environ.get(
+        "TEAMS_COORGANIZADORES", ""
+    ).replace(";", ",").split(",") if e.strip()
+]
+# Idioma falado da reunião (gravação e transcrição). Sem isso o Teams usa o padrão da conta (inglês).
+TEAMS_IDIOMA_REUNIAO = os.environ.get("TEAMS_IDIOMA_REUNIAO", "pt-BR").strip() or "pt-BR"
+
+
+def _participantes_com_coorganizadores(participants, coorganizadores):
+    """Lista COMPLETA de attendees do onlineMeeting com `role: coorganizer` para os e-mails informados
+    (a API exige a lista inteira ao alterar attendees). Preserva os itens como vieram; acrescenta quem
+    ainda não estava. Devolve None se não há nada a mudar."""
+    alvo = {e.strip().lower() for e in (coorganizadores or []) if e and e.strip()}
+    if not alvo:
+        return None
+    atuais = [dict(a) for a in ((participants or {}).get("attendees") or []) if isinstance(a, dict)]
+    ja_tem = set()
+    mudou = False
+    for a in atuais:
+        upn = str(a.get("upn") or "").strip().lower()
+        if upn in alvo:
+            ja_tem.add(upn)
+            if a.get("role") != "coorganizer":
+                a["role"] = "coorganizer"
+                mudou = True
+    for email in sorted(alvo - ja_tem):
+        atuais.append({"upn": email, "role": "coorganizer"})
+        mudou = True
+    return atuais if mudou else None
 
 _azure_token_cache = {"token": None, "expira_em": 0}
 
@@ -1141,6 +1173,12 @@ def create_teams_meeting(lead_name: str, lead_email: str, start_iso: str,
     )
     for email_copia in copias:
         attendees.append({"emailAddress": {"address": email_copia}, "type": "optional"})
+    # Coorganizadores precisam estar convidados para receber o papel no Teams.
+    ja_convidados = {str(e).strip().lower() for e in emails_lead} | {str(e).strip().lower() for e in copias}
+    for email_coorg in TEAMS_COORGANIZADORES:
+        if email_coorg.strip().lower() not in ja_convidados:
+            attendees.append({"emailAddress": {"address": email_coorg}, "type": "optional"})
+            ja_convidados.add(email_coorg.strip().lower())
 
     inicio = datetime.strptime(start_iso[:19], "%Y-%m-%dT%H:%M:%S")
     fim = inicio + timedelta(minutes=duracao_min)
@@ -1190,20 +1228,38 @@ def create_teams_meeting(lead_name: str, lead_email: str, start_iso: str,
             resultados = busca.json().get("value") or []
             if resultados:
                 meeting_id = resultados[0].get("id")
-                patch_resp = requests.patch(
-                    f"https://graph.microsoft.com/v1.0/users/{object_id}/onlineMeetings/{meeting_id}",
-                    headers=headers,
-                    # "recordAutomatically" é a propriedade confirmada e
-                    # atualizável via PATCH no modelo v1.0 (confirmado com
-                    # segunda opinião em 11/08). "transcribeAutomatically"
-                    # não existe; "allowTranscription" existe mas é imutável
-                    # após a criação, por isso não é tentado aqui.
-                    json={"recordAutomatically": True},
-                    timeout=15
-                )
+                url_meeting = f"https://graph.microsoft.com/v1.0/users/{object_id}/onlineMeetings/{meeting_id}"
+                # "recordAutomatically" é a propriedade confirmada e atualizável via PATCH no modelo v1.0
+                # ("transcribeAutomatically" não existe; "allowTranscription" é imutável após a criação).
+                # "meetingSpokenLanguageTag" (doc v1.0 do PATCH onlineMeeting) define o idioma falado para
+                # gravação e transcrição; sem ele o Teams usa o padrão da conta (inglês). Se a Microsoft
+                # recusar o idioma, repete só com a gravação para não perdê-la.
+                corpo = {"recordAutomatically": True, "meetingSpokenLanguageTag": TEAMS_IDIOMA_REUNIAO}
+                patch_resp = requests.patch(url_meeting, headers=headers, json=corpo, timeout=15)
+                if patch_resp.status_code >= 400:
+                    print(f"[teams] Idioma '{TEAMS_IDIOMA_REUNIAO}' recusado (HTTP {patch_resp.status_code}): "
+                          f"{patch_resp.text[:200]} — repetindo só com a gravação", flush=True)
+                    patch_resp = requests.patch(url_meeting, headers=headers,
+                                                json={"recordAutomatically": True}, timeout=15)
+                else:
+                    print(f"[teams] Idioma da reunião definido: {TEAMS_IDIOMA_REUNIAO}", flush=True)
                 patch_resp.raise_for_status()
                 print(f"[teams] ✅ Gravação automática configurada com sucesso, "
                       f"meeting_id={meeting_id}", flush=True)
+                # Coorganizadores (TEAMS_COORGANIZADORES): etapa SEPARADA e best-effort — se falhar, a gravação
+                # e o idioma acima já valeram. A API exige a lista completa de attendees.
+                try:
+                    lista = _participantes_com_coorganizadores(
+                        resultados[0].get("participants"), TEAMS_COORGANIZADORES)
+                    if lista:
+                        coorg_resp = requests.patch(url_meeting, headers=headers,
+                                                    json={"participants": {"attendees": lista}}, timeout=15)
+                        coorg_resp.raise_for_status()
+                        print(f"[teams] ✅ Coorganizadores definidos ({len(TEAMS_COORGANIZADORES)}) "
+                              f"meeting_id={meeting_id}", flush=True)
+                except Exception as e_coorg:
+                    print(f"[teams] Coorganizadores não definidos (não bloqueia): {type(e_coorg).__name__}: "
+                          f"{e_coorg}", flush=True)
             else:
                 print(f"[teams] Busca do onlineMeeting não retornou nenhum resultado "
                       f"pra join_url={join_url}", flush=True)
