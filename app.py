@@ -6904,6 +6904,16 @@ FOLLOWUP_B_MINUTOS = int(os.environ.get("FOLLOWUP_B_MINUTOS", "60"))
 FOLLOWUP_C_MINUTOS = int(os.environ.get("FOLLOWUP_C_MINUTOS", "180"))
 # Depois disso o D1 (que só vem 1 dia depois da saudação) já assumiu: o reforço não sai mais.
 FOLLOWUP_A_LIMITE_HORAS = 20
+# O reforço (template) só sai entre 8h e 20h (BRT): a saudação pode ir de madrugada, o reforço não.
+# Se cair fora da janela, espera a próxima (o limite de 20h acima continua valendo).
+REFORCO_SAUDACAO_JANELA_BRT = (8, 20)
+# Depois do reforço, o D1 espera pelo menos isso (o mesmo ritmo de 3h da régua), para não virar
+# dois toques seguidos na mesma manhã.
+REFORCO_ATE_D1_HORAS = 3
+# Um reforço enviado fica sendo acompanhado até a Meta confirmar a entrega ou recusar (só no log).
+REFORCO_CONFIRMACAO_MIN = 3
+REFORCO_CONFIRMACAO_DESISTE_MIN = 60
+_reforcos_a_confirmar = {}  # conversa -> {"msg_id", "enviado_em"}; RAM
 # Texto livre só vale dentro das 24h depois de o lead escrever, e quem nunca escreveu não tem
 # essa janela: o reforço do cenário A é um TEMPLATE. Sem o template aprovado ele não envia nada.
 REFORCO_SAUDACAO_TEMPLATE = os.environ.get("REFORCO_SAUDACAO_TEMPLATE", "luca_reforco_saudacao_01")
@@ -7145,8 +7155,11 @@ def verificar_reforco_saudacao():
     if pausar_por_feriado("reforço da saudação"):
         return
     agora = time.time()
+    _conferir_reforcos_enviados(agora)
     with _reforcos_saudacao_lock:
         pendentes = list(_reforcos_saudacao.items())
+    hora_brt = (datetime.utcnow() - timedelta(hours=3)).hour
+    dentro_da_janela = REFORCO_SAUDACAO_JANELA_BRT[0] <= hora_brt < REFORCO_SAUDACAO_JANELA_BRT[1]
     for conv_id, info in pendentes:
         decorrido = agora - info["enviada_em"]
         if decorrido < FOLLOWUP_A_MINUTOS * 60:
@@ -7155,6 +7168,8 @@ def verificar_reforco_saudacao():
             with _reforcos_saudacao_lock:
                 _reforcos_saudacao.pop(conv_id, None)  # o D1 assume
             continue
+        if not dentro_da_janela:
+            continue  # fora das 8h-20h: fica na fila e sai na primeira varredura da janela
         resultado = "erro"
         try:
             resultado = _enviar_reforco_saudacao(conv_id, info)
@@ -7165,6 +7180,49 @@ def verificar_reforco_saudacao():
             with _reforcos_saudacao_lock:
                 _reforcos_saudacao.pop(conv_id, None)
         print(f"[reforco-saudacao] conv={conv_id} resultado={resultado}", flush=True)
+
+
+def _conferir_reforcos_enviados(agora):
+    """O POST do template volta 200 mesmo quando a Meta recusa depois (ex.: 131049). Aqui, alguns
+    minutos depois do envio, lê o status da mensagem e registra no log o que de fato aconteceu."""
+    with _reforcos_saudacao_lock:
+        itens = list(_reforcos_a_confirmar.items())
+    for conv_id, ref in itens:
+        idade_min = (agora - ref["enviado_em"]) / 60
+        if idade_min < REFORCO_CONFIRMACAO_MIN:
+            continue
+        status = status_da_mensagem(conv_id, ref["msg_id"])
+        if status in ("delivered", "read"):
+            print(f"[reforco-saudacao] conv={conv_id} entregue (status={status})", flush=True)
+        elif status == "failed":
+            try:
+                motivo = _motivo_da_falha(mensagens_da_conversa(conv_id), ref["msg_id"])
+            except Exception:
+                motivo = ""
+            print(f"[reforco-saudacao] conv={conv_id} RECUSADO pela Meta — o lead NÃO recebeu o reforço "
+                  f"motivo={(motivo or 'não informado')[:80]!r}", flush=True)
+        elif idade_min < REFORCO_CONFIRMACAO_DESISTE_MIN:
+            continue  # ainda sem confirmação: olha de novo na próxima varredura
+        else:
+            print(f"[reforco-saudacao] conv={conv_id} sem confirmação de entrega após "
+                  f"{int(idade_min)} min (status={status})", flush=True)
+        with _reforcos_saudacao_lock:
+            _reforcos_a_confirmar.pop(conv_id, None)
+
+
+def reforco_saudacao_recente(msgs, agora=None, horas=None) -> bool:
+    """True se o reforço do cenário A foi enviado há menos de `horas` (padrão REFORCO_ATE_D1_HORAS).
+    O D1 usa isto para esperar e não virar dois toques seguidos."""
+    horas = REFORCO_ATE_D1_HORAS if horas is None else horas
+    agora = time.time() if agora is None else agora
+    envios = []
+    for m in msgs or []:
+        if "[followup:reforco_d0]" in (m.get("content") or ""):
+            try:
+                envios.append(float(m.get("created_at") or 0))
+            except (TypeError, ValueError):
+                pass
+    return bool(envios) and (agora - max(envios)) < horas * 3600
 
 
 def _enviar_reforco_saudacao(conv_id, info) -> str:
@@ -7199,6 +7257,9 @@ def _enviar_reforco_saudacao(conv_id, info) -> str:
         f"🔁 Reforço da saudação enviado (lead ainda não respondeu). "
         f"[followup:reforco_d0] [luca:boas_vindas_msg:{msg_id}]")
     marcar_recarregar_historico(conv_id)
+    if msg_id:
+        with _reforcos_saudacao_lock:
+            _reforcos_a_confirmar[conv_id] = {"msg_id": msg_id, "enviado_em": time.time()}
     return "enviado"
 
 
@@ -9926,6 +9987,10 @@ def verificar_followup_dias_silencio():
                         print(f"[followup_dias] {tag} NÃO enviado — o lead já escreveu nesta conversa "
                               f"deal={deal_id} resultado={resultado_pulo}", flush=True)
                         continue
+                if reforco_saudacao_recente(msgs_pendencia):
+                    print(f"[followup_dias] {tag} aguarda — o reforço da saudação saiu há menos de "
+                          f"{REFORCO_ATE_D1_HORAS}h deal={deal_id} conv={conversation_id}", flush=True)
+                    continue
                 enviado, _msg_id = enviar_followup_dia(conversation_id, deal_id, phone, tag, nome)
                 if not enviado:
                     continue
