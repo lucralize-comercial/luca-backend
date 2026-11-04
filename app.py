@@ -708,7 +708,9 @@ def contexto_data_atual() -> str:
                          "nesses dias; sugira o próximo dia útil.")
     return (f"\n\nDATA E HORA ATUAIS (horário de Brasília): {dias[agora.weekday()]}, "
             f"{agora.day} de {meses[agora.month - 1]} de {agora.year}, {agora.strftime('%H:%M')}. "
-            f"Use esta informação ao falar de dias da semana, 'amanhã', prazos e horários de reunião.\n"
+            f"Use esta informação ao falar de dias da semana, 'amanhã', prazos e horários de reunião. "
+            f"Se uma data combinada antes já passou (ex.: o lead pediu 'amanhã' em um dia anterior), NÃO a trate "
+            f"como futura nem repita 'amanhã': diga que esse horário já passou e ofereça um novo.\n"
             f"PRÓXIMOS DIAS (NUNCA calcule de cabeça a data de um dia da semana — consulte aqui): "
             f"{', '.join(tabela)}.\n"
             f"Lembre-se: o atendimento é de segunda a quinta das 9h às 17h e sexta das 9h às 16h30, sem fins de semana."
@@ -919,6 +921,21 @@ PADRAO_HORARIO = re.compile(
     r"|\b\d{1,2}\s?[:h]\s?\d{0,2}\b",
     re.IGNORECASE
 )
+
+
+def texto_das_ultimas_mensagens_do_lead(conv, message_text: str, maximo: int = 4) -> str:
+    """Mensagens SEGUIDAS do lead (desde a última resposta do Luca), mais a atual, em um só texto."""
+    partes = []
+    for m in reversed((conv or {}).get("messages") or []):
+        if m.get("role") != "user":
+            break
+        partes.append(str(m.get("content") or ""))
+        if len(partes) >= maximo:
+            break
+    partes.reverse()
+    texto = " ".join(p.strip() for p in partes if p.strip())
+    atual = (message_text or "").strip()
+    return texto if atual and atual in texto else (texto + " " + atual).strip()
 
 
 def parece_ter_horario(texto: str) -> bool:
@@ -4820,7 +4837,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                 f"Necessidade: {d.get('necessidade', '')}\n"
                 f"E-mail: {d.get('email', '')}\n"
                 f"Preferência de reunião: {d.get('preferencia', '')}\n"
-                f"Status: {d.get('status', '')}\n"
+                f"Status: {status_sem_confirmacao_falsa(d.get('status', ''), d.get('preferencia', ''), ja_tem_reuniao_real or bool(conv.get('reuniao_real_criada')))}\n"
                 f"{nota_marcador}"
             )
             r1 = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
@@ -4894,7 +4911,10 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                                 motivo_validacao = f"não foi possível validar a agenda automaticamente: {e}"
                                 ocupado = False
 
-                            if ocupado:
+                            if dt_local <= datetime.utcnow() - timedelta(hours=3):
+                                requer_validacao_time = True
+                                motivo_validacao = "o horário pedido já passou (o lead precisa de um novo horário)"
+                            elif ocupado:
                                 requer_validacao_time = True
                                 motivo_validacao = "horário solicitado já está ocupado na agenda do consultor"
 
@@ -4923,6 +4943,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                                     )
                                 teams_join_url = resultado_teams.get("join_url")
                                 if teams_join_url:
+                                    conv["reuniao_real_criada"] = True  # o resumo só pode dizer "confirmado" depois disto
                                     texto_reuniao += f"\nLink da reunião (Teams): {teams_join_url}\n{reuniao_real_marcador}"
                                     print(f"[crm] ✅ Reunião Teams criada deal={deal_id} "
                                           f"linha={linha_negocio} join_url={teams_join_url}", flush=True)
@@ -4940,25 +4961,11 @@ def registrar_no_crm(conv, conversation_id, contact_name):
 
                     if requer_validacao_time:
                         print(f"[crm] ⚠️ Reunião NÃO criada automaticamente deal={deal_id}: {motivo_validacao}", flush=True)
-                        validacao_marcador = f"[luca:validar_horario:{conversation_id}]"
-                        if not deal_tem_marca(deal_id, validacao_marcador):
-                            texto_validacao = (
-                                "[Luca] VALIDAR HORÁRIO COM O TIME — não foi criada reunião automática. "
-                                f"Preferência do lead: {preferencia}. Motivo: {motivo_validacao}. "
-                                f"{validacao_marcador}"
-                            )
-                            payload_validacao = {
-                                "text": texto_validacao,
-                                "type": "tarefa",
-                                "due_date": dt_local.strftime("%Y-%m-%dT%H:%M:%S"),
-                            }
-                            if owner_id:
-                                payload_validacao["assigned_users"] = [int(owner_id)]
-                            rv = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
-                                               headers={**HEADERS, "Content-Type": "application/json"},
-                                               json=payload_validacao, timeout=15)
-                            print(f"[crm] Validação humana de horário criada deal={deal_id} "
-                                  f"status={rv.status_code}", flush=True)
+                        # O marcador inclui o horário pedido: outro horário depois gera outra validação.
+                        validacao_marcador = f"[luca:validar_horario:{conversation_id}:{dt_iso}]"
+                        if not validacao_horario_registrada(conversation_id, deal_id, validacao_marcador):
+                            registrar_validacao_horario(conv, conversation_id, deal_id, owner_id, (d.get("nome") or contact_name or ""),
+                                                        preferencia, dt_local, motivo_validacao, validacao_marcador)
                             mensagem_validacao = (
                                 "Entendi! Nesse horário eu não consigo confirmar automaticamente. "
                                 "Vou validar essa possibilidade com o nosso time e eles te retornam por aqui, combinado?"
@@ -5202,7 +5209,18 @@ def fetch_conversation_history(conversation_id: int) -> list:
         return []
 
 
-def build_lead_note(conv_data: dict) -> str:
+def status_sem_confirmacao_falsa(status, preferencia, reuniao_real=False) -> str:
+    """O status do resumo é escolhido pelo modelo e podia sair "Agendamento confirmado" sem reunião
+    nenhuma (caso do Wilton, 02/11: o horário estava ocupado). Sem reunião real criada, vira
+    "Preferência informada"."""
+    s = (status or "").strip()
+    if s.lower().startswith("agendamento confirmado") and not reuniao_real:
+        pref = (preferencia or "").strip()
+        return f"Preferência informada: {pref} (ainda não confirmado)" if pref else "Em qualificação"
+    return s
+
+
+def build_lead_note(conv_data: dict, reuniao_real: bool = False) -> str:
     """Monta o texto da nota interna com o resumo do lead, em dois blocos:
     Dados do Lead (operacional) e Inteligência Comercial (contexto de venda).
     Campos não informados/não inferíveis aparecem como "Não informado" —
@@ -5228,7 +5246,8 @@ def build_lead_note(conv_data: dict) -> str:
     estilo_comunicacao = g("estilo_comunicacao")
     motivo_recusa = g("motivo_recusa")
 
-    status     = conv_data.get("status", "Em atendimento")
+    status     = status_sem_confirmacao_falsa(conv_data.get("status", "Em atendimento"),
+                                              conv_data.get("preferencia"), reuniao_real)
 
     lines = [
         "📋 DADOS DO LEAD",
@@ -5745,9 +5764,12 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
             # mesmo, como se estivesse ocupado por outra pessoa.
             extra_disponibilidade = ""
             extra_disponibilidade += contexto_campanha_cct(conversation_id)
-            if parece_ter_horario(message_text) and not conv.get("crm_registrado"):
+            # O lead costuma mandar o dia e a hora em mensagens separadas ("Amanhã dia 03/11" e
+            # "13:00 horas", caso do Wilton): lê as mensagens seguidas dele, não só a última.
+            texto_horario = texto_das_ultimas_mensagens_do_lead(conv, message_text)
+            if parece_ter_horario(texto_horario) and not conv.get("crm_registrado"):
                 try:
-                    dt_iso_tentativa = parse_preferencia_datetime(message_text, tipo="disponibilidade")
+                    dt_iso_tentativa = parse_preferencia_datetime(texto_horario, tipo="disponibilidade")
                     if dt_iso_tentativa:
                         dt_pedido = datetime.strptime(dt_iso_tentativa, "%Y-%m-%dT%H:%M")
                         livre, alternativas = checar_e_sugerir_horario(dt_pedido)
@@ -5918,7 +5940,7 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
 
                     if not conv.get("note_sent") and (dados_completos or conversa_encerrada) and not conv.get("modo_demo"):
                         d["telefone"] = conv.get("phone") or d.get("telefone", "Não informado")
-                        note_text = build_lead_note(d)
+                        note_text = build_lead_note(d, reuniao_real=bool(conv.get("reuniao_real_criada")))
                         send_private_note(conversation_id, note_text)
                         conv["note_sent"] = True
                         print(f"[note] Nota enviada conv={conversation_id} | completo={dados_completos} | encerrado={conversa_encerrada}", flush=True)
@@ -5932,7 +5954,7 @@ def _processar_resposta_luca(conv_key, conversation_id, msg_token, message_id,
                         # desfecho real do lead nunca fica refletido na nota,
                         # ficando travado no status anterior pra sempre.
                         d["telefone"] = conv.get("phone") or d.get("telefone", "Não informado")
-                        note_text = build_lead_note(d)
+                        note_text = build_lead_note(d, reuniao_real=bool(conv.get("reuniao_real_criada")))
                         send_private_note(conversation_id, note_text)
                         conv["note_sent"] = True
                         conv["recusa_registrada"] = True
@@ -7940,6 +7962,102 @@ def deal_tem_marca(deal_id, marcador: str) -> bool:
         return False  # fail-open: em erro na checagem, permite criar (não trava o fluxo)
 
 
+VALIDACAO_HORARIO_AGUARDA_HORAS = float(os.environ.get("VALIDACAO_HORARIO_AGUARDA_HORAS", "24"))
+
+
+def _urls_webhook_validacao_horario() -> list:
+    """Grupo Comercial no Teams: TEAMS_WEBHOOK_VALIDACAO_HORARIO ou, se vazia, o mesmo fluxo do aviso
+    de lead repetido. A URL é segredo: nunca vai para log."""
+    bruto = os.environ.get("TEAMS_WEBHOOK_VALIDACAO_HORARIO", "")
+    urls = [u.strip() for u in bruto.split(",") if u.strip().lower().startswith("https://")]
+    return urls or _urls_webhook_leads_repetidos()
+
+
+def validacao_horario_registrada(conversation_id, deal_id, marcador: str) -> bool:
+    """Já houve esta validação? Confere a NOTA da conversa (grava sempre) e a tarefa do CRM (pode falhar)."""
+    try:
+        if marcador_existe(mensagens_da_conversa(conversation_id), marcador):
+            return True
+    except Exception as e:
+        print(f"[validacao-horario] Erro ao ler a conversa {conversation_id}: {type(e).__name__}: {e}", flush=True)
+    return deal_tem_marca(deal_id, marcador)
+
+
+def avisar_teams_validacao_horario(nome, deal_id, conv_id, preferencia, motivo) -> int:
+    """Avisa o grupo Comercial que o Luca prometeu retorno do time. Devolve quantos destinos aceitaram."""
+    urls = _urls_webhook_validacao_horario()
+    if not urls:
+        print("[validacao-horario] nenhum fluxo do Teams configurado — aviso NÃO enviado", flush=True)
+        return 0
+    corpo = [
+        {"type": "TextBlock", "weight": "Bolder", "size": "Medium", "wrap": True,
+         "text": "⏰ Lead aguardando retorno do time: validar horário"},
+        {"type": "TextBlock", "wrap": True,
+         "text": f"{nome or 'O lead'} pediu {preferencia or 'um horário'} e o Luca não conseguiu confirmar "
+                 f"({motivo}). O Luca disse que o time retorna pelo WhatsApp: entre em contato com o lead."},
+        {"type": "TextBlock", "wrap": True,
+         "text": f"Negócio: [{deal_id}]({link_negocio_agendor(deal_id, conv_id)})"},
+    ]
+    payload = {"type": "message", "attachments": [{
+        "contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": None,
+        "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard", "version": "1.2", "body": corpo}}]}
+    aceitos = 0
+    for i, url in enumerate(urls, 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code in (200, 201, 202):
+                aceitos += 1
+            else:
+                print(f"[validacao-horario] Teams destino {i} respondeu HTTP {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"[validacao-horario] Teams destino {i} falhou: {type(e).__name__}", flush=True)
+    return aceitos
+
+
+def registrar_validacao_horario(conv, conversation_id, deal_id, owner_id, nome, preferencia, dt_local, motivo, marcador):
+    """O Luca vai dizer ao lead que o time retorna: garante que o time SAIBA. (1) nota na conversa com o
+    marcador (é ela que impede repetir); (2) tarefa no CRM, conferindo o resultado (antes dava 400 e
+    o log dizia "criada"); (3) aviso no grupo Comercial do Teams; (4) o "ainda está por aí?" do
+    cenário B fica suspenso enquanto o retorno é do time."""
+    conv["aguardando_time_desde"] = time.time()
+    try:
+        send_private_note(conversation_id,
+            f"⚠️ HORÁRIO A VALIDAR COM O TIME: o lead pediu {preferencia or 'um horário'} e o Luca não confirmou "
+            f"({motivo}). O Luca prometeu que o time retorna por aqui. {marcador}")
+    except Exception as e:
+        print(f"[validacao-horario] Erro na nota da conversa {conversation_id}: {type(e).__name__}: {e}", flush=True)
+    texto = ("[Luca] VALIDAR HORÁRIO COM O TIME: não foi criada reunião automática. "
+             f"Preferência do lead: {preferencia}. Motivo: {motivo}. {marcador}")
+    tentativas = [
+        {"text": texto, "due_date": dt_local.strftime("%Y-%m-%dT%H:%M:%S"),
+         **({"assigned_users": [int(owner_id)]} if owner_id else {})},
+        {"text": texto},  # o mesmo formato da nota do CRM, que sempre funcionou
+    ]
+    criada = False
+    for payload in tentativas:
+        try:
+            rv = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks",
+                               headers={**HEADERS, "Content-Type": "application/json"}, json=payload, timeout=15)
+        except Exception as e:
+            print(f"[validacao-horario] Erro ao criar a tarefa deal={deal_id}: {type(e).__name__}: {e}", flush=True)
+            continue
+        if rv.status_code in (200, 201):
+            criada = True
+            print(f"[validacao-horario] tarefa criada deal={deal_id} status={rv.status_code}", flush=True)
+            break
+        print(f"[validacao-horario] tarefa RECUSADA deal={deal_id} status={rv.status_code} "
+              f"campos={sorted(payload)} resposta={rv.text[:200]!r}", flush=True)
+    aceitos = avisar_teams_validacao_horario(nome, deal_id, conversation_id, preferencia, motivo)
+    if not criada and not aceitos:
+        print(f"[validacao-horario] ⚠️ NINGUÉM foi avisado (tarefa e Teams falharam) deal={deal_id} "
+              f"conv={conversation_id} — só a nota na conversa registra o pedido", flush=True)
+    else:
+        print(f"[validacao-horario] avisos: tarefa={'ok' if criada else 'falhou'} teams={aceitos} "
+              f"deal={deal_id} conv={conversation_id}", flush=True)
+    return criada, aceitos
+
+
 def humano_realmente_respondeu(conversation_id: int) -> bool:
     """True se existe, em qualquer ponto da conversa, uma mensagem de saída
     escrita por um usuário humano de verdade (sender.type == 'user'), não
@@ -8700,6 +8818,9 @@ def verificar_followup_1h_silencio():
             continue
         if conv.get("crm_registrado"):
             continue  # reunião já agendada com sucesso — silêncio é esperado
+        desde_time = conv.get("aguardando_time_desde")
+        if desde_time and (agora - desde_time) < VALIDACAO_HORARIO_AGUARDA_HORAS * 3600:
+            continue  # o Luca disse "o time te retorna": a bola está com a gente, não se cobra o lead
         elapsed = agora - aguardando_desde
         if elapsed < FOLLOWUP_B_MINUTOS * 60:
             continue
