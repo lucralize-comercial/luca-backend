@@ -9420,6 +9420,34 @@ def _falha_eh_numero_inexistente(motivo) -> bool:
             or "não é um usuário" in m or "not registered" in m or "sem whatsapp" in m)
 
 
+# Depois de um 131049 ("healthy ecosystem engagement") a Meta pede "aguarde pelo menos 24 horas antes
+# de reenviar". 0 desliga a espera (volta a reenviar na varredura seguinte, a cada 3h).
+FOLLOWUP_ESPERA_APOS_131049_HORAS = float(os.environ.get("FOLLOWUP_ESPERA_APOS_131049_HORAS", "24"))
+
+
+def horas_restantes_espera_131049(msgs, msg_id, agora=None) -> float:
+    """Horas que ainda faltam para reenviar uma mensagem que a Meta recusou por qualidade/engajamento
+    (131049 ou QUALITY_BLOCK), contadas da hora da mensagem que falhou. 0 = pode reenviar (ou não é
+    esse tipo de falha, ou a hora da mensagem é desconhecida)."""
+    if FOLLOWUP_ESPERA_APOS_131049_HORAS <= 0:
+        return 0.0
+    m = next((x for x in (msgs or []) if x.get("id") == msg_id), None)
+    if not m:
+        return 0.0
+    attrs = m.get("content_attributes") or {}
+    motivo = (attrs.get("external_error") or "").lower()
+    if not ("131049" in motivo or "ecosystem engagement" in motivo or attrs.get("error_category") == "QUALITY_BLOCK"):
+        return 0.0
+    try:
+        criada = float(m.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if criada <= 0:
+        return 0.0
+    agora = time.time() if agora is None else agora
+    return max(0.0, FOLLOWUP_ESPERA_APOS_131049_HORAS * 3600 - (agora - criada)) / 3600
+
+
 def _motivo_da_falha(msgs, msg_id) -> str:
     """Texto do erro (external_error) da mensagem que falhou, lido da listagem da conversa."""
     for m in msgs or []:
@@ -10167,6 +10195,12 @@ def verificar_followup_dias_silencio():
                             f"automaticamente. Precisa de verificação manual.")
                         print(f"[followup_dias] {tag} falhou 3x seguidas deal={deal_id} — "
                               f"parou de reenviar, precisa de verificação manual", flush=True)
+                        continue
+                    espera_h = horas_restantes_espera_131049(msgs_pendencia, msg_id_pendente)
+                    if espera_h > 0:
+                        # A Meta pede 24h depois do 131049; reenviar antes só piora a qualidade do número.
+                        print(f"[followup_dias] {tag} aguarda {espera_h:.1f}h para reenviar — a Meta pediu esperar "
+                              f"24h depois do 131049 deal={deal_id}", flush=True)
                         continue
                     print(f"[followup_dias] {tag} tinha falhado (mensagem anterior não entregue) "
                           f"deal={deal_id} — tentando reenviar", flush=True)
