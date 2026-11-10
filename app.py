@@ -9296,6 +9296,12 @@ TEXTOS_DEVFEST_POR_CATEGORIA = {
            "Somos especialistas em atender devs e profissionais de tecnologia, reduzindo impostos e "
            "cuidando de toda a parte contábil, pra você focar no que importa.\n\n"
            "Queria marcar uma conversa rápida para te mostrar como. Qual a sua disponibilidade?"),
+    "B3": ("Oi, {{1}}, Tudo bem?\n\n"
+           "Sou o Luca, da Lucralize. A gente se conheceu no DevFest 2026!\n\n"
+           "Você comentou que já trabalha como PJ e cuida da contabilidade por conta própria.\n\n"
+           "Somos especialistas em devs e profissionais de tecnologia. Cuidamos de toda a parte contábil "
+           "e de impostos, pra você focar no que importa.\n\n"
+           "Queria marcar uma conversa rápida para te mostrar como. Qual a sua disponibilidade?"),
 }
 DEVFEST_LIMITE_MAXIMO = 50
 _devfest_lock = threading.Lock()
