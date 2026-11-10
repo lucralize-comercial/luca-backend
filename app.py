@@ -8089,6 +8089,7 @@ def humano_realmente_respondeu(conversation_id: int) -> bool:
                    and not (m.get("additional_attributes") or {}).get("automation_id")
                    and "Em breve um de nossos consultores dará andamento" not in (m.get("content") or "")]
         ids_luca = ids_mensagens_do_luca(msgs)
+        eventos_atrib = _eventos_de_atribuicao(msgs)
         for m in dialogo:
             if m.get("id") in ids_luca:
                 continue  # saudação enviada pelo próprio Luca
@@ -8103,6 +8104,8 @@ def humano_realmente_respondeu(conversation_id: int) -> bool:
                     eh_template = bool((m.get("additional_attributes") or {}).get("template_params"))
                     eh_template_conhecido = eh_conteudo_de_template_luca(m.get("content"))
                     if not tem_marca and not eh_template and not eh_template_conhecido:
+                        if conversa_estava_com_o_luca(eventos_atrib, m.get("id")):
+                            continue  # conversa atribuída ao Luca: o time falando pelo agente dele
                         return True  # [gestor] escreveu manualmente por essa conta
                     continue
                 if not eh_assignee_bot(sender):
@@ -8130,12 +8133,42 @@ def tipo_evento_atribuicao(content):
     if "não atribuído" in baixo or "não atribuída" in baixo or "nao atribuido" in baixo:
         return "ninguem"
     if "atribuiu a si mesm" in baixo:
-        return "humano"
+        # "Luca atribuiu a si mesmo esse atendimento" é o Luca (ex.: o time virou a conversa
+        # para ele usando o agente do Luca) — não é uma pessoa assumindo.
+        nome_si = re.split(r"\s+atribuiu a si mesm", texto, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        return "bot" if nome_si and eh_assignee_bot({"name": nome_si, "available_name": nome_si}) else "humano"
     achado = _RE_ATRIBUIDO_A.match(texto)
     if achado:
         nome = achado.group("nome").strip()
         return "bot" if eh_assignee_bot({"name": nome, "available_name": nome}) else "humano"
     return None
+
+
+def _eventos_de_atribuicao(msgs):
+    """[(id, tipo)] dos avisos de atribuição da conversa, em ordem."""
+    eventos = []
+    for m in msgs or []:
+        if m.get("message_type") != 2:
+            continue
+        tipo = tipo_evento_atribuicao(m.get("content"))
+        if tipo and m.get("id") is not None:
+            eventos.append((m.get("id"), tipo))
+    eventos.sort(key=lambda e: e[0])
+    return eventos
+
+
+def conversa_estava_com_o_luca(eventos, msg_id) -> bool:
+    """True se, na hora em que a mensagem `msg_id` foi escrita, o último aviso de atribuição
+    era "atribuída ao Luca". Mensagem digitada pela conta do Luca nessa situação é o time
+    falando pelo agente do Luca: não conta como humano e não abre a janela de 1h
+    (caso da conversa 2659: a pessoa virou a conversa para o Luca e conversou pelo agente dele)."""
+    if msg_id is None:
+        return False
+    ultimo = None
+    for eid, tipo in eventos or []:
+        if eid < msg_id:
+            ultimo = tipo
+    return ultimo == "bot"
 
 
 def segundos_desde_ultima_intervencao_humana(conversation_id: int):
@@ -8170,6 +8203,7 @@ def segundos_desde_ultima_intervencao_humana(conversation_id: int):
                    and "Em breve um de nossos consultores dará andamento" not in (m.get("content") or "")]
         ultima_humana_em = None
         ids_luca = ids_mensagens_do_luca(msgs)
+        eventos_atrib = _eventos_de_atribuicao(msgs)
         for m in dialogo:
             if m.get("id") in ids_luca:
                 continue  # saudação enviada pelo próprio Luca
@@ -8184,7 +8218,8 @@ def segundos_desde_ultima_intervencao_humana(conversation_id: int):
                     eh_template = bool((m.get("additional_attributes") or {}).get("template_params"))
                     eh_template_conhecido = eh_conteudo_de_template_luca(m.get("content"))
                     if not tem_marca and not eh_template and not eh_template_conhecido:
-                        ultima_humana_em = m.get("created_at") or ultima_humana_em
+                        if not conversa_estava_com_o_luca(eventos_atrib, m.get("id")):
+                            ultima_humana_em = m.get("created_at") or ultima_humana_em
                     continue
                 if not eh_assignee_bot(sender):
                     ultima_humana_em = m.get("created_at") or ultima_humana_em
