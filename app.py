@@ -9338,6 +9338,7 @@ TEXTOS_DEVFEST_POR_CATEGORIA = {
           "Queria marcar uma conversa rápida para te mostrar como. Qual a sua disponibilidade?"),
 }
 DEVFEST_LIMITE_MAXIMO = 50
+DEVFEST_MAXIMO_CONTINUO = 250  # teto de envios por execução no modo "continuar"
 _devfest_lock = threading.Lock()
 
 
@@ -9369,6 +9370,15 @@ def _msg_devfest(m) -> bool:
     return str(params.get("name") or "").startswith(TEMPLATES_DEVFEST_PREFIXO)
 
 
+def _nota_disparo_devfest(msgs):
+    """Nota privada que o próprio disparo grava ao enviar. Segundo sinal de 'já enviado', para o caso de
+    a lista de mensagens não trazer o template_params (ex.: mensagem com falha ou histórico longo)."""
+    for m in msgs or []:
+        if m.get("private") and "Disparo DevFest 2026" in str(m.get("content") or ""):
+            return m
+    return None
+
+
 def _ultimo_envio_devfest(msgs):
     envios = [m for m in msgs or [] if _msg_devfest(m)]
     return max(envios, key=lambda m: m.get("id", 0)) if envios else None
@@ -9398,6 +9408,7 @@ def _devfest_mover_se_entregue(deal_id, conv_id, msg_id) -> str:
     return str(status)
 
 
+_devfest_telefones_enviados = set()  # telefones já enviados desde o último restart (evita negócio duplicado)
 _devfest_pendentes = {}  # deal_id -> {"conv", "msg_id", "desde"}; RAM (o webhook e o reenvio recuperam)
 DEVFEST_ESPERA_ENTREGA_MIN = 30
 
@@ -9406,6 +9417,7 @@ def _devfest_conferir_pendentes(esperar=True):
     """Confere as entregas do lote. Entregue -> move; falhou -> nota e NÃO move; sem confirmação
     após DEVFEST_ESPERA_ENTREGA_MIN -> só loga (o webhook ou um novo disparo recuperam depois)."""
     limite = time.time() + DEVFEST_ESPERA_ENTREGA_MIN * 60
+    contagem = {"entregues": 0, "falhas": 0, "sem_confirmacao": 0}
     while _devfest_pendentes:
         for deal_id, ref in list(_devfest_pendentes.items()):
             status = status_da_mensagem(ref["conv"], ref["msg_id"])
@@ -9413,6 +9425,7 @@ def _devfest_conferir_pendentes(esperar=True):
                 _devfest_pos_entrega(deal_id, ref["conv"])
                 print(f"[devfest] Entrega confirmada deal={deal_id} -> 1º Contato (D0) e conversa resolvida", flush=True)
                 _devfest_pendentes.pop(deal_id, None)
+                contagem["entregues"] += 1
             elif status == "failed":
                 try:
                     motivo = _motivo_da_falha(mensagens_da_conversa(ref["conv"]), ref["msg_id"])
@@ -9421,14 +9434,17 @@ def _devfest_conferir_pendentes(esperar=True):
                 print(f"[devfest] Mensagem NÃO entregue deal={deal_id} motivo={(motivo or 'não informado')[:80]!r}"
                       f" (etapa mantida em Lead)", flush=True)
                 _devfest_pendentes.pop(deal_id, None)
+                contagem["falhas"] += 1
         if not _devfest_pendentes or not esperar:
             break
         if time.time() > limite:
             print(f"[devfest] Sem confirmação de entrega após {DEVFEST_ESPERA_ENTREGA_MIN} min: "
                   f"{list(_devfest_pendentes)} (etapa mantida em Lead)", flush=True)
+            contagem["sem_confirmacao"] += len(_devfest_pendentes)
             _devfest_pendentes.clear()
             break
         time.sleep(60)
+    return contagem
 
 
 def _devfest_enviar_um(cat, deal, confirmar):
@@ -9457,8 +9473,14 @@ def _devfest_enviar_um(cat, deal, confirmar):
         return "sem_texto", f"{cat}: cadastre o texto do template em TEXTOS_DEVFEST_POR_CATEGORIA"
     if not confirmar:
         return "simulado", f"{_telefone_e164(phone)} -> {tpl.get('name')}"
+    tel_chave = re.sub(r"\D", "", str(_telefone_e164(phone)))
+    if tel_chave in _devfest_telefones_enviados:
+        return "ja_enviado", "mesmo telefone já recebeu nesta execução (negócio duplicado)"
     conv_id, _criada = obter_conversa_boas_vindas(phone, nome, True)
-    anterior = _ultimo_envio_devfest(mensagens_da_conversa(conv_id))
+    msgs_conv = mensagens_da_conversa(conv_id)
+    anterior = _ultimo_envio_devfest(msgs_conv)
+    if not anterior and _nota_disparo_devfest(msgs_conv):
+        return "ja_enviado", f"conv={conv_id} (nota de disparo anterior; sem confirmação de entrega)"
     if anterior:
         # Já recebeu o template: não reenvia. Se a entrega foi confirmada, completa a etapa.
         return "ja_enviado", f"conv={conv_id} entrega={_devfest_mover_se_entregue(deal_id, conv_id, anterior.get('id'))}"
@@ -9468,6 +9490,7 @@ def _devfest_enviar_um(cat, deal, confirmar):
     except Exception as e:
         return "erro_envio", f"{type(e).__name__}: {e}"
     msg_id = (resp or {}).get("id")
+    _devfest_telefones_enviados.add(tel_chave)
     try:
         send_private_note(conv_id, f"📣 Disparo DevFest 2026 ({cat}) enviado: {tpl.get('name')}. "
                                     f"[luca:boas_vindas_msg:{msg_id}]")
@@ -9479,27 +9502,72 @@ def _devfest_enviar_um(cat, deal, confirmar):
     return "enviado", f"conv={conv_id} msg={msg_id} (move para 1º Contato (D0) quando a entrega for confirmada)"
 
 
+def _devfest_lote(candidatos, confirmar, intervalo, resumo):
+    """Roda um lote. Devolve True se deve parar tudo (erro de envio ou fora do horário)."""
+    parar = False
+    for cat, d in candidatos:
+        agora_brt = datetime.utcnow() - timedelta(hours=3)
+        if confirmar and not (8 <= agora_brt.hour < 20):
+            print("[devfest] Fora do horário de envio (8h-20h BRT): lote interrompido", flush=True)
+            resumo["fora_do_horario"] = resumo.get("fora_do_horario", 0) + 1
+            parar = True
+            break
+        try:
+            status, detalhe = _devfest_enviar_um(cat, d, confirmar)
+        except Exception as e:
+            status, detalhe = "erro", f"{type(e).__name__}: {e}"
+        resumo[status] = resumo.get(status, 0) + 1
+        print(f"[devfest] {cat} deal={d.get('id')} -> {status} {detalhe}", flush=True)
+        if status in ("erro_envio", "erro"):
+            print("[devfest] Erro: lote interrompido para não repetir a falha", flush=True)
+            parar = True
+            break
+        if status == "enviado":
+            time.sleep(intervalo)
+    return parar
+
+
 def _devfest_rodar(candidatos, confirmar, intervalo):
     resumo = {}
     try:
-        for cat, d in candidatos:
-            agora_brt = datetime.utcnow() - timedelta(hours=3)
-            if confirmar and not (8 <= agora_brt.hour < 20):
-                print("[devfest] Fora do horário de envio (8h-20h BRT): lote interrompido", flush=True)
-                resumo["fora_do_horario"] = resumo.get("fora_do_horario", 0) + 1
-                break
-            try:
-                status, detalhe = _devfest_enviar_um(cat, d, confirmar)
-            except Exception as e:
-                status, detalhe = "erro", f"{type(e).__name__}: {e}"
-            resumo[status] = resumo.get(status, 0) + 1
-            print(f"[devfest] {cat} deal={d.get('id')} -> {status} {detalhe}", flush=True)
-            if status in ("erro_envio", "erro"):
-                print("[devfest] Erro: lote interrompido para não repetir a falha", flush=True)
-                break
-            if status == "enviado":
-                time.sleep(intervalo)
+        _devfest_lote(candidatos, confirmar, intervalo, resumo)
         _devfest_conferir_pendentes()
+    finally:
+        print(f"[devfest] Fim do lote: {resumo}", flush=True)
+        _devfest_lock.release()
+
+
+def _devfest_rodar_continuo(categorias, limite, maximo, intervalo):
+    """Modo 'continuar': roda lotes de `limite` em sequência até esgotar os candidatos, atingir `maximo`
+    envios, passar das 20h BRT, dar erro de envio ou a taxa de falha de entrega do lote passar de 30%.
+    Cada lote espera as confirmações de entrega antes de começar o próximo."""
+    resumo = {}
+    tentados = set()
+    lote_n = 0
+    try:
+        while resumo.get("enviado", 0) < maximo:
+            restante = maximo - resumo.get("enviado", 0)
+            fila = [(c, d) for c, d in _devfest_candidatos(categorias) if d.get("id") not in tentados]
+            lote = fila[:min(limite, restante)]
+            if not lote:
+                print("[devfest] Contínuo: sem mais candidatos", flush=True)
+                break
+            lote_n += 1
+            for _c, d in lote:
+                tentados.add(d.get("id"))
+            antes = resumo.get("enviado", 0)
+            print(f"[devfest] Contínuo: lote {lote_n} com {len(lote)} negócios (enviados até aqui: {antes}/{maximo})", flush=True)
+            parar = _devfest_lote(lote, True, intervalo, resumo)
+            conf = _devfest_conferir_pendentes()
+            enviados_lote = resumo.get("enviado", 0) - antes
+            print(f"[devfest] Contínuo: lote {lote_n} fechado: enviados={enviados_lote} {conf}", flush=True)
+            if parar:
+                break
+            if enviados_lote >= 5 and conf["falhas"] >= max(3, 0.3 * enviados_lote):
+                print(f"[devfest] Contínuo: {conf['falhas']} falhas de entrega em {enviados_lote} envios "
+                      f"(>= 30%): parado por segurança", flush=True)
+                resumo["parado_por_falhas"] = 1
+                break
     finally:
         print(f"[devfest] Fim do lote: {resumo}", flush=True)
         _devfest_lock.release()
@@ -9507,8 +9575,10 @@ def _devfest_rodar(candidatos, confirmar, intervalo):
 
 @app.route("/devfest/disparo", methods=["POST"])
 def devfest_disparo():
-    """Corpo JSON: {"categorias": ["B2"], "limite": 3, "confirmar": false, "intervalo": 2}.
-    Sem "confirmar": true, só lista o que seria enviado."""
+    """Corpo JSON: {"categorias": ["B2"], "limite": 3, "confirmar": false, "intervalo": 2,
+    "continuar": false, "maximo": 250}. Sem "confirmar": true, só lista o que seria enviado.
+    Com "continuar": true, roda lotes de "limite" em sequência (cada um espera as entregas) até
+    esgotar os candidatos ou atingir "maximo" envios (teto DEVFEST_MAXIMO_CONTINUO)."""
     negado = exigir_chave_admin()
     if negado:
         return negado
@@ -9520,18 +9590,27 @@ def devfest_disparo():
     try:
         limite = max(1, min(int(corpo.get("limite", 3)), DEVFEST_LIMITE_MAXIMO))
         intervalo = max(1.0, float(corpo.get("intervalo", 2)))
+        maximo = max(1, min(int(corpo.get("maximo", DEVFEST_MAXIMO_CONTINUO)), DEVFEST_MAXIMO_CONTINUO))
     except (TypeError, ValueError):
         return jsonify({"erro": "parametros_invalidos"}), 400
     confirmar = corpo.get("confirmar") is True
+    continuar = corpo.get("continuar") is True
     if not cache.get("deals"):
         return jsonify({"erro": "cache_vazio", "detalhe": "Execute /refresh e tente novamente."}), 409
-    candidatos = _devfest_candidatos(categorias)[:limite]
+    candidatos = _devfest_candidatos(categorias)[:maximo if continuar else limite]
     previa = [{"categoria": c, "deal": d.get("id"), "titulo": d.get("title")} for c, d in candidatos]
     if not confirmar:
         # Simulação rápida e sem efeito colateral: mostra só o plano (não chama nenhuma API de envio)
-        return jsonify({"modo": "simulacao", "total": len(previa), "negocios": previa}), 200
+        return jsonify({"modo": "simulacao", "continuar": continuar, "total": len(previa),
+                        "negocios": previa}), 200
     if not _devfest_lock.acquire(blocking=False):
         return jsonify({"erro": "lote_em_andamento"}), 409
+    if continuar:
+        threading.Thread(target=_devfest_rodar_continuo, args=(categorias, limite, maximo, intervalo),
+                         daemon=True).start()
+        return jsonify({"modo": "envio_continuo", "lote": limite, "maximo": maximo,
+                        "candidatos_agora": len(previa),
+                        "acompanhe": "logs do Railway com [devfest]"}), 202
     threading.Thread(target=_devfest_rodar, args=(candidatos, True, intervalo), daemon=True).start()
     return jsonify({"modo": "envio", "total": len(previa), "negocios": previa,
                     "acompanhe": "logs do Railway com [devfest]"}), 202
