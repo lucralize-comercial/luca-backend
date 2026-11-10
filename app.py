@@ -9288,7 +9288,7 @@ def mover_etapa_gdg(deal_id, nome_etapa_alvo: str, permitir_recuo: bool = False)
 TEMPLATES_DEVFEST_POR_CATEGORIA = {
     "A1": "devfest_2026_clt_com_cnpj",
     "A2": "devfest_2026_clt_sem_cnpj",
-    "B1": "devfest_2026_pj_com_contabilidade",
+    "B1": "devfest_2026_pj_com_contab",
     "B2": "devfest_2026_pj_sem_contabilidade",
     "B3": "devfest_2026_pj_conta_propria",
     "C": "devfest_2026_nao_programador",
@@ -9308,6 +9308,20 @@ TEXTOS_DEVFEST_POR_CATEGORIA = {
            "Somos especialistas em devs e profissionais de tecnologia. Cuidamos de toda a parte contábil "
            "e de impostos, pra você focar no que importa.\n\n"
            "Queria marcar uma conversa rápida para te mostrar como. Qual a sua disponibilidade?"),
+    "B1": ("Oi, {{1}}, tudo bem?\n\n"
+           "Sou o Luca, da _Lucralize Contabilidade_. A gente se conheceu no DevFest 2026!\n\n"
+           "Você comentou que já trabalha como PJ e tem uma contabilidade.\n\n"
+           "*Somos especialistas em devs e profissionais de tecnologia.* Muitos PJs de tech chegam até "
+           "nós porque queriam um contador que entenda o dia a dia do setor.\n\n"
+           "_Queria marcar uma conversa rápida, sem compromisso_, para te mostrar como trabalhamos. "
+           "Qual a sua disponibilidade?"),
+    "A1": ("Oi, {{1}}, tudo bem?\n\n"
+           "Sou o Luca, da _Lucralize Contabilidade_. A gente se conheceu no DevFest 2026!\n\n"
+           "Você comentou que trabalha como CLT e também tem um CNPJ.\n\n"
+           "*Somos especialistas em devs e profissionais de tecnologia*, e ajudamos a organizar a parte "
+           "contábil e os impostos de quem tem CLT e CNPJ ao mesmo tempo.\n\n"
+           "_Queria marcar uma conversa rápida, sem compromisso_, para te mostrar como. "
+           "Qual a sua disponibilidade?"),
     "A2": ("Oi, {{1}}, tudo bem?\n\n"
            "Sou o Luca, da _Lucralize Contabilidade_. A gente se conheceu no DevFest 2026!\n\n"
            "Você comentou que trabalha como CLT. *Já pensou em quanto ganharia como PJ?*\n\n"
