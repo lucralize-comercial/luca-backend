@@ -6084,13 +6084,13 @@ def agendorchat_webhook():
                 status_dev = msg_atual.get("status")
                 phone_dev = ((conversation.get("meta") or {}).get("sender") or {}).get("phone_number", "")
                 if status_dev in ("delivered", "read") and phone_dev:
-                    def _mover_devfest(phone_=phone_dev):
+                    def _mover_devfest(phone_=phone_dev, conv_=conversation_id):
                         try:
                             pessoa_, _ = buscar_pessoa_e_negocio(phone_)
                             if pessoa_ and pessoa_.get("id"):
                                 d_ = buscar_deal_gdg(pessoa_["id"])
                                 if d_:
-                                    mover_etapa_gdg(d_["id"], "1º Contato (D0)")
+                                    _devfest_pos_entrega(d_["id"], conv_)
                                     _devfest_pendentes.pop(d_["id"], None)
                         except Exception as e_:
                             print(f"[devfest] Erro ao mover após entrega: {e_}", flush=True)
@@ -9334,12 +9334,26 @@ def _ultimo_envio_devfest(msgs):
     return max(envios, key=lambda m: m.get("id", 0)) if envios else None
 
 
+def _devfest_pos_entrega(deal_id, conv_id) -> bool:
+    """Entrega confirmada: move para 1º Contato (D0) e RESOLVE a conversa, como no fluxo do Funil
+    Comercial (a caixa de abertas só mostra o que precisa de atenção; se o lead responder, reabre).
+    Não resolve se o lead já escreveu na conversa."""
+    ok = mover_etapa_gdg(deal_id, "1º Contato (D0)")
+    if ok and conv_id:
+        try:
+            if not lead_interagiu(mensagens_da_conversa(conv_id)):
+                resolver_conversa_agendorchat(conv_id)
+        except Exception as e:
+            print(f"[devfest] Erro ao resolver conversa conv={conv_id}: {e}", flush=True)
+    return ok
+
+
 def _devfest_mover_se_entregue(deal_id, conv_id, msg_id) -> str:
     """Só move para 1º Contato (D0) quando a entrega foi confirmada (delivered/read), como na régua
     do Funil Comercial. Devolve o status lido ('movido' quando moveu)."""
     status = status_da_mensagem(conv_id, msg_id)
     if status in ("delivered", "read"):
-        mover_etapa_gdg(deal_id, "1º Contato (D0)")
+        _devfest_pos_entrega(deal_id, conv_id)
         return "movido"
     return str(status)
 
@@ -9356,8 +9370,8 @@ def _devfest_conferir_pendentes(esperar=True):
         for deal_id, ref in list(_devfest_pendentes.items()):
             status = status_da_mensagem(ref["conv"], ref["msg_id"])
             if status in ("delivered", "read"):
-                mover_etapa_gdg(deal_id, "1º Contato (D0)")
-                print(f"[devfest] Entrega confirmada deal={deal_id} -> 1º Contato (D0)", flush=True)
+                _devfest_pos_entrega(deal_id, ref["conv"])
+                print(f"[devfest] Entrega confirmada deal={deal_id} -> 1º Contato (D0) e conversa resolvida", flush=True)
                 _devfest_pendentes.pop(deal_id, None)
             elif status == "failed":
                 try:
