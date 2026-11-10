@@ -6078,6 +6078,27 @@ def agendorchat_webhook():
             if marcador_existe(msgs, marcador_falha):
                 return jsonify({}), 200
             msg_atual = next((m for m in msgs if m.get("id") == msg_id), None)
+            if msg_atual and _msg_devfest(msg_atual):
+                # Template da campanha DevFest (funil GDG): entregue -> 1º Contato (D0) no GDG;
+                # falhou -> só registra. NUNCA mexe em negócio do Funil Comercial.
+                status_dev = msg_atual.get("status")
+                phone_dev = ((conversation.get("meta") or {}).get("sender") or {}).get("phone_number", "")
+                if status_dev in ("delivered", "read") and phone_dev:
+                    def _mover_devfest(phone_=phone_dev):
+                        try:
+                            pessoa_, _ = buscar_pessoa_e_negocio(phone_)
+                            if pessoa_ and pessoa_.get("id"):
+                                d_ = buscar_deal_gdg(pessoa_["id"])
+                                if d_:
+                                    mover_etapa_gdg(d_["id"], "1º Contato (D0)")
+                                    _devfest_pendentes.pop(d_["id"], None)
+                        except Exception as e_:
+                            print(f"[devfest] Erro ao mover após entrega: {e_}", flush=True)
+                    threading.Thread(target=_mover_devfest, daemon=True).start()
+                elif status_dev == "failed":
+                    print(f"[devfest] message_updated: falha conv={conversation_id} msg={msg_id}: "
+                          f"{_motivo_da_falha(msgs, msg_id)[:80]!r} (etapa mantida)", flush=True)
+                return jsonify({}), 200
             if not msg_atual or msg_atual.get("status") != "failed":
                 return jsonify({}), 200
             content_attrs_falha = msg_atual.get("content_attributes") or {}
@@ -9290,6 +9311,62 @@ def _devfest_candidatos(categorias):
     return saida
 
 
+def _msg_devfest(m) -> bool:
+    """True se a mensagem de SAÍDA é um template da campanha (devfest_2026_*)."""
+    if m.get("message_type") != 1:
+        return False
+    params = (m.get("additional_attributes") or {}).get("template_params") or {}
+    return str(params.get("name") or "").startswith(TEMPLATES_DEVFEST_PREFIXO)
+
+
+def _ultimo_envio_devfest(msgs):
+    envios = [m for m in msgs or [] if _msg_devfest(m)]
+    return max(envios, key=lambda m: m.get("id", 0)) if envios else None
+
+
+def _devfest_mover_se_entregue(deal_id, conv_id, msg_id) -> str:
+    """Só move para 1º Contato (D0) quando a entrega foi confirmada (delivered/read), como na régua
+    do Funil Comercial. Devolve o status lido ('movido' quando moveu)."""
+    status = status_da_mensagem(conv_id, msg_id)
+    if status in ("delivered", "read"):
+        mover_etapa_gdg(deal_id, "1º Contato (D0)")
+        return "movido"
+    return str(status)
+
+
+_devfest_pendentes = {}  # deal_id -> {"conv", "msg_id", "desde"}; RAM (o webhook e o reenvio recuperam)
+DEVFEST_ESPERA_ENTREGA_MIN = 30
+
+
+def _devfest_conferir_pendentes(esperar=True):
+    """Confere as entregas do lote. Entregue -> move; falhou -> nota e NÃO move; sem confirmação
+    após DEVFEST_ESPERA_ENTREGA_MIN -> só loga (o webhook ou um novo disparo recuperam depois)."""
+    limite = time.time() + DEVFEST_ESPERA_ENTREGA_MIN * 60
+    while _devfest_pendentes:
+        for deal_id, ref in list(_devfest_pendentes.items()):
+            status = status_da_mensagem(ref["conv"], ref["msg_id"])
+            if status in ("delivered", "read"):
+                mover_etapa_gdg(deal_id, "1º Contato (D0)")
+                print(f"[devfest] Entrega confirmada deal={deal_id} -> 1º Contato (D0)", flush=True)
+                _devfest_pendentes.pop(deal_id, None)
+            elif status == "failed":
+                try:
+                    motivo = _motivo_da_falha(mensagens_da_conversa(ref["conv"]), ref["msg_id"])
+                except Exception:
+                    motivo = ""
+                print(f"[devfest] Mensagem NÃO entregue deal={deal_id} motivo={(motivo or 'não informado')[:80]!r}"
+                      f" (etapa mantida em Lead)", flush=True)
+                _devfest_pendentes.pop(deal_id, None)
+        if not _devfest_pendentes or not esperar:
+            break
+        if time.time() > limite:
+            print(f"[devfest] Sem confirmação de entrega após {DEVFEST_ESPERA_ENTREGA_MIN} min: "
+                  f"{list(_devfest_pendentes)} (etapa mantida em Lead)", flush=True)
+            _devfest_pendentes.clear()
+            break
+        time.sleep(60)
+
+
 def _devfest_enviar_um(cat, deal, confirmar):
     """Devolve (status, detalhe). Nunca levanta exceção para quem chama decidir; erro de envio
     vem como 'erro_envio' e o lote para."""
@@ -9313,8 +9390,10 @@ def _devfest_enviar_um(cat, deal, confirmar):
     if not confirmar:
         return "simulado", f"{_telefone_e164(phone)} -> {tpl.get('name')}"
     conv_id, _criada = obter_conversa_boas_vindas(phone, nome, True)
-    if conversa_veio_do_devfest(conv_id):
-        return "ja_enviado", f"conv={conv_id}"
+    anterior = _ultimo_envio_devfest(mensagens_da_conversa(conv_id))
+    if anterior:
+        # Já recebeu o template: não reenvia. Se a entrega foi confirmada, completa a etapa.
+        return "ja_enviado", f"conv={conv_id} entrega={_devfest_mover_se_entregue(deal_id, conv_id, anterior.get('id'))}"
     primeiro = _primeiro_nome(nome)
     variaveis = {"1": primeiro}
     texto = _texto_template_com_nome(tpl, primeiro, "")
@@ -9329,8 +9408,9 @@ def _devfest_enviar_um(cat, deal, confirmar):
         marcar_recarregar_historico(conv_id)
     except Exception as e:
         print(f"[devfest] Nota interna falhou conv={conv_id}: {e}", flush=True)
-    mover_etapa_gdg(deal_id, "1º Contato (D0)")
-    return "enviado", f"conv={conv_id} msg={msg_id}"
+    if msg_id:
+        _devfest_pendentes[deal_id] = {"conv": conv_id, "msg_id": msg_id, "desde": time.time()}
+    return "enviado", f"conv={conv_id} msg={msg_id} (move para 1º Contato (D0) quando a entrega for confirmada)"
 
 
 def _devfest_rodar(candidatos, confirmar, intervalo):
@@ -9353,6 +9433,7 @@ def _devfest_rodar(candidatos, confirmar, intervalo):
                 break
             if status == "enviado":
                 time.sleep(intervalo)
+        _devfest_conferir_pendentes()
     finally:
         print(f"[devfest] Fim do lote: {resumo}", flush=True)
         _devfest_lock.release()
