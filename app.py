@@ -9315,12 +9315,13 @@ TEXTOS_DEVFEST_POR_CATEGORIA = {
            "Se ficar com dúvida ou estiver pensando em migrar para PJ, pode contar com a gente."),
     "C": ("Oi, {{1}}, tudo bem?\n\n"
           "Sou o Luca, da _Lucralize Contabilidade_. A gente se conheceu no DevFest 2026!\n\n"
-          "Por aqui já ajudamos muitos devs e profissionais de tecnologia a *reduzir impostos* e "
+          "Por aqui já ajudamos muitos profissionais de tecnologia a *pagar menos imposto* e a "
           "simplificar a contabilidade.\n\n"
-          "*Se você pensa em atuar como PJ* e quer saber quanto ganharia, simule aqui: "
+          "Se você ainda pensa em virar PJ, dá para simular quanto ia ganhar: "
           "https://lucralize.github.io/calculadora-pjxclt/\n\n"
-          "*Se já atua como PJ?* https://lucralize.com.br/calculadora-dev/\n\n"
-          "Posso te mostrar como fazemos isso. Qual a sua disponibilidade?"),
+          "E se já é PJ, vale conferir se está no melhor regime tributário: "
+          "https://lucralize.com.br/calculadora-dev/\n\n"
+          "Queria marcar uma conversa rápida para te mostrar como. Qual a sua disponibilidade?"),
 }
 DEVFEST_LIMITE_MAXIMO = 50
 _devfest_lock = threading.Lock()
