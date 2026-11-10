@@ -9287,6 +9287,16 @@ TEMPLATES_DEVFEST_POR_CATEGORIA = {
     "B3": "devfest_2026_pj_diy",
     "C": "devfest_2026_nao_programador",
 }
+# Texto de cada template como aprovado no Meta ({{1}} = nome). É o que aparece como mensagem no chat.
+# Usado quando a listagem do AgendorChat não traz o corpo do template. Categoria sem texto NÃO é enviada.
+TEXTOS_DEVFEST_POR_CATEGORIA = {
+    "B2": ("Oi, {{1}}, Tudo bem?\n\n"
+           "Sou o Luca, da Lucralize. A gente se conheceu no DevFest 2026!\n\n"
+           "Você comentou que já trabalha como PJ, mas ainda não tem uma contabilidade.\n\n"
+           "Somos especialistas em atender devs e profissionais de tecnologia, reduzindo impostos e "
+           "cuidando de toda a parte contábil, pra você focar no que importa.\n\n"
+           "Queria marcar uma conversa rápida para te mostrar como. Qual a sua disponibilidade?"),
+}
 DEVFEST_LIMITE_MAXIMO = 50
 _devfest_lock = threading.Lock()
 
@@ -9387,6 +9397,10 @@ def _devfest_enviar_um(cat, deal, confirmar):
     tpl = template_por_nome(TEMPLATES_DEVFEST_POR_CATEGORIA[cat])
     if not tpl:
         return "sem_template", TEMPLATES_DEVFEST_POR_CATEGORIA[cat]
+    primeiro = _primeiro_nome(nome)
+    texto = _texto_template_com_nome(tpl, primeiro, TEXTOS_DEVFEST_POR_CATEGORIA.get(cat, ""))
+    if not texto.strip():
+        return "sem_texto", f"{cat}: cadastre o texto do template em TEXTOS_DEVFEST_POR_CATEGORIA"
     if not confirmar:
         return "simulado", f"{_telefone_e164(phone)} -> {tpl.get('name')}"
     conv_id, _criada = obter_conversa_boas_vindas(phone, nome, True)
@@ -9394,9 +9408,7 @@ def _devfest_enviar_um(cat, deal, confirmar):
     if anterior:
         # Já recebeu o template: não reenvia. Se a entrega foi confirmada, completa a etapa.
         return "ja_enviado", f"conv={conv_id} entrega={_devfest_mover_se_entregue(deal_id, conv_id, anterior.get('id'))}"
-    primeiro = _primeiro_nome(nome)
     variaveis = {"1": primeiro}
-    texto = _texto_template_com_nome(tpl, primeiro, "")
     try:
         resp = enviar_template_conversa(conv_id, tpl, variaveis, texto)
     except Exception as e:
