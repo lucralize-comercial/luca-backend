@@ -6078,7 +6078,13 @@ def agendorchat_webhook():
             if marcador_existe(msgs, marcador_falha):
                 return jsonify({}), 200
             msg_atual = next((m for m in msgs if m.get("id") == msg_id), None)
-            if msg_atual and _msg_devfest(msg_atual):
+            # A listagem do Chat nem sempre traz template_params de uma mensagem que FALHOU; por isso
+            # também reconhece o disparo pela nota interna "Disparo DevFest 2026" com o id da mensagem.
+            eh_devfest = bool(msg_atual) and (_msg_devfest(msg_atual) or any(
+                "Disparo DevFest 2026" in (m.get("content") or "")
+                and f"[luca:boas_vindas_msg:{msg_id}]" in (m.get("content") or "")
+                for m in msgs))
+            if eh_devfest:
                 # Template da campanha DevFest (funil GDG): entregue -> 1º Contato (D0) no GDG;
                 # falhou -> só registra. NUNCA mexe em negócio do Funil Comercial.
                 status_dev = msg_atual.get("status")
