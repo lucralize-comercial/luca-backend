@@ -9253,6 +9253,143 @@ def mover_etapa_gdg(deal_id, nome_etapa_alvo: str, permitir_recuo: bool = False)
     return r.status_code in (200, 201)
 
 
+# ── Disparo dos templates da campanha DevFest 2026 (funil GDG) ───────────────
+# Rota manual e protegida (X-API-Key). Por padrão só SIMULA (dry-run): só envia de verdade com
+# "confirmar": true. Lê os negócios da etapa "Lead" do funil GDG, escolhe o template pela letra do
+# título ("B2 - Nome") e, depois de enviar, move o negócio para "1º Contato (D0)".
+# Sem régua D1-D10: um disparo por lead (trava: se a conversa já recebeu devfest_2026_*, pula).
+TEMPLATES_DEVFEST_POR_CATEGORIA = {
+    "A1": "devfest_2026_clt_com_cnpj",
+    "A2": "devfest_2026_clt_sem_cnpj",
+    "B1": "devfest_2026_pj_com_contabilidade",
+    "B2": "devfest_2026_pj_sem_contabilidade",
+    "B3": "devfest_2026_pj_diy",
+    "C": "devfest_2026_nao_programador",
+}
+DEVFEST_LIMITE_MAXIMO = 50
+_devfest_lock = threading.Lock()
+
+
+def _categoria_do_titulo(titulo):
+    m = re.match(r"^\s*(A1|A2|B1|B2|B3|C)\s+-\s+", str(titulo or ""))
+    return m.group(1) if m else None
+
+
+def _devfest_candidatos(categorias):
+    """Negócios do cache na etapa Lead do funil GDG, com categoria válida (na ordem do cache)."""
+    saida = []
+    for d in cache.get("deals") or []:
+        etapa = d.get("dealStage") or {}
+        if (etapa.get("funnel") or {}).get("id") != FUNIL_GDG_ID:
+            continue
+        if _norm_etapa(etapa.get("name")) != "lead" or d.get("wonAt") or d.get("lostAt"):
+            continue
+        cat = _categoria_do_titulo(d.get("title"))
+        if cat and (not categorias or cat in categorias):
+            saida.append((cat, d))
+    return saida
+
+
+def _devfest_enviar_um(cat, deal, confirmar):
+    """Devolve (status, detalhe). Nunca levanta exceção para quem chama decidir; erro de envio
+    vem como 'erro_envio' e o lote para."""
+    deal_id = deal.get("id")
+    pessoa_id = (deal.get("person") or {}).get("id")
+    nome = (deal.get("person") or {}).get("name") or ""
+    if not pessoa_id:
+        return "sem_pessoa", ""
+    fresco = buscar_deal_fresco(deal_id)
+    etapa = fresco.get("dealStage") or {}
+    if (etapa.get("funnel") or {}).get("id") != FUNIL_GDG_ID or _norm_etapa(etapa.get("name")) != "lead":
+        return "etapa_mudou", str(etapa.get("name"))
+    phone = telefone_da_pessoa(pessoa_id)
+    if not phone:
+        return "sem_telefone", ""
+    if numero_bloqueado(phone):
+        return "numero_bloqueado", ""
+    tpl = template_por_nome(TEMPLATES_DEVFEST_POR_CATEGORIA[cat])
+    if not tpl:
+        return "sem_template", TEMPLATES_DEVFEST_POR_CATEGORIA[cat]
+    if not confirmar:
+        return "simulado", f"{_telefone_e164(phone)} -> {tpl.get('name')}"
+    conv_id, _criada = obter_conversa_boas_vindas(phone, nome, True)
+    if conversa_veio_do_devfest(conv_id):
+        return "ja_enviado", f"conv={conv_id}"
+    primeiro = _primeiro_nome(nome)
+    variaveis = {"1": primeiro}
+    texto = _texto_template_com_nome(tpl, primeiro, "")
+    try:
+        resp = enviar_template_conversa(conv_id, tpl, variaveis, texto)
+    except Exception as e:
+        return "erro_envio", f"{type(e).__name__}: {e}"
+    msg_id = (resp or {}).get("id")
+    try:
+        send_private_note(conv_id, f"📣 Disparo DevFest 2026 ({cat}) enviado: {tpl.get('name')}. "
+                                    f"[luca:boas_vindas_msg:{msg_id}]")
+        marcar_recarregar_historico(conv_id)
+    except Exception as e:
+        print(f"[devfest] Nota interna falhou conv={conv_id}: {e}", flush=True)
+    mover_etapa_gdg(deal_id, "1º Contato (D0)")
+    return "enviado", f"conv={conv_id} msg={msg_id}"
+
+
+def _devfest_rodar(candidatos, confirmar, intervalo):
+    resumo = {}
+    try:
+        for cat, d in candidatos:
+            agora_brt = datetime.utcnow() - timedelta(hours=3)
+            if confirmar and not (8 <= agora_brt.hour < 20):
+                print("[devfest] Fora do horário de envio (8h-20h BRT): lote interrompido", flush=True)
+                resumo["fora_do_horario"] = resumo.get("fora_do_horario", 0) + 1
+                break
+            try:
+                status, detalhe = _devfest_enviar_um(cat, d, confirmar)
+            except Exception as e:
+                status, detalhe = "erro", f"{type(e).__name__}: {e}"
+            resumo[status] = resumo.get(status, 0) + 1
+            print(f"[devfest] {cat} deal={d.get('id')} -> {status} {detalhe}", flush=True)
+            if status in ("erro_envio", "erro"):
+                print("[devfest] Erro: lote interrompido para não repetir a falha", flush=True)
+                break
+            if status == "enviado":
+                time.sleep(intervalo)
+    finally:
+        print(f"[devfest] Fim do lote: {resumo}", flush=True)
+        _devfest_lock.release()
+
+
+@app.route("/devfest/disparo", methods=["POST"])
+def devfest_disparo():
+    """Corpo JSON: {"categorias": ["B2"], "limite": 3, "confirmar": false, "intervalo": 2}.
+    Sem "confirmar": true, só lista o que seria enviado."""
+    negado = exigir_chave_admin()
+    if negado:
+        return negado
+    corpo = request.get_json(silent=True) or {}
+    categorias = [str(c).upper() for c in (corpo.get("categorias") or [])]
+    invalidas = [c for c in categorias if c not in TEMPLATES_DEVFEST_POR_CATEGORIA]
+    if invalidas:
+        return jsonify({"erro": "categoria_invalida", "categorias": invalidas}), 400
+    try:
+        limite = max(1, min(int(corpo.get("limite", 3)), DEVFEST_LIMITE_MAXIMO))
+        intervalo = max(1.0, float(corpo.get("intervalo", 2)))
+    except (TypeError, ValueError):
+        return jsonify({"erro": "parametros_invalidos"}), 400
+    confirmar = corpo.get("confirmar") is True
+    if not cache.get("deals"):
+        return jsonify({"erro": "cache_vazio", "detalhe": "Execute /refresh e tente novamente."}), 409
+    candidatos = _devfest_candidatos(categorias)[:limite]
+    previa = [{"categoria": c, "deal": d.get("id"), "titulo": d.get("title")} for c, d in candidatos]
+    if not confirmar:
+        # Simulação rápida e sem efeito colateral: mostra só o plano (não chama nenhuma API de envio)
+        return jsonify({"modo": "simulacao", "total": len(previa), "negocios": previa}), 200
+    if not _devfest_lock.acquire(blocking=False):
+        return jsonify({"erro": "lote_em_andamento"}), 409
+    threading.Thread(target=_devfest_rodar, args=(candidatos, True, intervalo), daemon=True).start()
+    return jsonify({"modo": "envio", "total": len(previa), "negocios": previa,
+                    "acompanhe": "logs do Railway com [devfest]"}), 202
+
+
 def _retorno_exige_interacao() -> bool:
     """RETORNO_EXIGE_INTERACAO (desligada por padrão): 'Contato retornado' só quando o lead mandou algo
     além do texto padrão do botão de WhatsApp."""
