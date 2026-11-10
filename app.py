@@ -9284,7 +9284,7 @@ TEMPLATES_DEVFEST_POR_CATEGORIA = {
     "A2": "devfest_2026_clt_sem_cnpj",
     "B1": "devfest_2026_pj_com_contabilidade",
     "B2": "devfest_2026_pj_sem_contabilidade",
-    "B3": "devfest_2026_pj_diy",
+    "B3": "devfest_2026_pj_conta_propria",
     "C": "devfest_2026_nao_programador",
 }
 # Texto de cada template como aprovado no Meta ({{1}} = nome). É o que aparece como mensagem no chat.
