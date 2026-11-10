@@ -967,6 +967,7 @@ TEMPLATES_PROPRIOS_LUCA = (
 # Só os dois assuntos abaixo têm instrução ESPECÍFICA (mais precisa, porque
 # sabemos exatamente do que se trata). Qualquer outro template que não seja
 # do Luca cai no fallback genérico logo depois.
+TEMPLATES_DEVFEST_PREFIXO = "devfest_2026_"  # leads do DevFest 2026 / funil GDG (prospects)
 TEMPLATES_CCT_MIGRACAO = ("lucralize_tech_migracao_cc",)
 TEMPLATES_CCT_INDICACAO = ("lucralize_tech_indicacao_premiada", "lucralize_tech_indicacao_premiada_v2")
 
@@ -1001,6 +1002,16 @@ def contexto_campanha_cct(conversation_id) -> str:
         nome_template = template_params.get("name", "")
         if nome_template in TEMPLATES_PROPRIOS_LUCA:
             return ""  # template do próprio Luca — segue o fluxo normal
+        if str(nome_template).startswith(TEMPLATES_DEVFEST_PREFIXO):
+            # Leads do DevFest 2026 (funil GDG): são PROSPECTS, não clientes.
+            return (
+                "\n\n[CONTEXTO IMPORTANTE: Este é um LEAD (prospect), NÃO um cliente existente. Ele "
+                "conheceu a Lucralize Tech no evento DevFest 2026 e está respondendo ao template que "
+                "NÓS enviamos (leia o histórico para ver o texto exato). Siga o fluxo normal de "
+                "qualificação e agendamento de reunião. NÃO ofereça condições comerciais, descontos "
+                "ou gratuidades além do que já consta na mensagem enviada: se perguntarem, diga que "
+                "o especialista detalha na reunião.]"
+            )
         # O CCT não manda "name", mas manda o texto de exemplo do template
         # em template_params.meta.example — usa como segundo critério pra
         # identificar qual campanha é, mesmo sem o nome.
@@ -4789,6 +4800,12 @@ def registrar_no_crm(conv, conversation_id, contact_name):
             return False
         person, deal = buscar_pessoa_e_negocio(phone)
         d = conv.get("lead_data", {})
+        if not deal and person and person.get("id") and conversa_veio_do_devfest(conversation_id):
+            # Lead DE FATO do funil GDG (a conversa recebeu o template da campanha): usa o negócio
+            # dele, sem criar outro no Funil Comercial. Sem o template, segue o fluxo normal abaixo.
+            deal = buscar_deal_gdg(person["id"])
+            if deal:
+                print(f"[crm] Negócio no funil GDG encontrado deal={deal.get('id')} conv={conversation_id}", flush=True)
         if not deal:
             nome_lead = d.get("nome") or contact_name
             email_lead = d.get("email", "")
@@ -5057,6 +5074,8 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                 else:
                     print(f"[crm] Etapa não movida — atual={etapa_atual_id} já é igual/posterior a 'Reunião agendada' "
                           f"ou fora da ordem mapeada (ex: Perdido)", flush=True)
+            elif funil_atual_id == FUNIL_GDG_ID:
+                mover_etapa_gdg(deal_id, "Reunião agendada")
             else:
                 print(f"[crm] Etapa não movida — negócio fora do Funil Comercial (funil={funil_atual_id})", flush=True)
 
@@ -9132,6 +9151,108 @@ def mover_etapa_funil_comercial(deal_id: int, etapa_alvo_id: int, permitir_recuo
     return r.status_code in (200, 201)
 
 
+# ── Funil de GDG BH e Uberlândia (leads do DevFest 2026) ─────────────────────
+# Regras condicionadas ao funil: aqui NÃO existe régua D1→D10. O Luca só move
+#   Lead / 1º Contato (D0) → Contato Retornado (lead respondeu) → Reunião agendada.
+# A API de mover etapa espera a POSIÇÃO (1-indexada) da etapa no funil. A ordem
+# abaixo foi conferida pelo print do funil em 10/11/2026; se reordenarem as
+# etapas no Agendor, atualize esta lista.
+FUNIL_GDG_ID = int(os.environ.get("FUNIL_GDG_ID", "775651"))
+ORDEM_ETAPAS_GDG = [
+    "lead", "1 contato (d0)", "contato retornado", "reuniao agendada",
+    "fechamento", "perdido", "perdido sem contato",
+]
+
+
+def _norm_etapa(nome) -> str:
+    """Normaliza nome de etapa (minúsculas, sem acento, sem º/°) pra comparar sem depender da grafia."""
+    import unicodedata
+    s = str(nome or "").replace("º", "").replace("°", "")
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return " ".join(s.lower().split())
+
+
+def buscar_deal_gdg(person_id):
+    """Negócio ATIVO (não ganho/perdido) da pessoa no funil GDG, o mais recente, ou None.
+    Falha de API devolve None (só loga): quem chama nunca deve criar negócio por causa disso."""
+    for tentativa in range(2):
+        try:
+            r = requests.get(f"{AGENDOR_BASE}/people/{person_id}/deals", headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            deals = [
+                d for d in r.json().get("data", [])
+                if ((d.get("dealStage") or {}).get("funnel") or {}).get("id") == FUNIL_GDG_ID
+                and not d.get("wonAt") and not d.get("lostAt")
+            ]
+            if deals:
+                return sorted(deals, key=lambda d: d.get("startTime", ""), reverse=True)[0]
+            return None
+        except Exception as e:
+            print(f"[gdg] Tentativa {tentativa+1}/2 falhou ao buscar negócio person={person_id}: {e}", flush=True)
+            if tentativa == 0:
+                time.sleep(2)
+    return None
+
+
+def conversa_veio_do_devfest(conversation_id) -> bool:
+    """True só se a conversa RECEBEU o template da campanha (devfest_2026_*): é o sinal de que o lead
+    é do GDG. Sem esse sinal (ou se a checagem falhar), NÃO é tratado como GDG: o fluxo normal do
+    Funil Comercial segue (inclusive criar negócio novo lá)."""
+    if not conversation_id:
+        return False
+    try:
+        for m in mensagens_da_conversa(conversation_id) or []:
+            if m.get("message_type") != 1:  # só mensagens de SAÍDA
+                continue
+            params = (m.get("additional_attributes") or {}).get("template_params") or {}
+            if str(params.get("name") or "").startswith(TEMPLATES_DEVFEST_PREFIXO):
+                return True
+    except Exception as e:
+        print(f"[gdg] Erro ao checar origem DevFest conv={conversation_id}: {type(e).__name__}: {e}", flush=True)
+    return False
+
+
+def mover_etapa_gdg(deal_id, nome_etapa_alvo: str, permitir_recuo: bool = False) -> bool:
+    """Move o negócio pra etapa (por NOME) dentro do funil GDG. Busca a etapa atual FRESCA,
+    só avança por padrão e nunca mexe em negócio de outro funil."""
+    alvo = _norm_etapa(nome_etapa_alvo)
+    if alvo not in ORDEM_ETAPAS_GDG:
+        print(f"[gdg] Etapa alvo desconhecida: {nome_etapa_alvo!r}", flush=True)
+        return False
+    try:
+        deal_fresco = buscar_deal_fresco(deal_id)
+    except Exception as e:
+        print(f"[gdg] Erro ao buscar negócio fresco deal={deal_id}: {e}", flush=True)
+        return False
+    deal_stage = deal_fresco.get("dealStage") or {}
+    if (deal_stage.get("funnel") or {}).get("id") != FUNIL_GDG_ID:
+        print(f"[gdg] Etapa não movida: negócio fora do funil GDG deal={deal_id}", flush=True)
+        return False
+    atual = _norm_etapa(deal_stage.get("name"))
+    if atual in ORDEM_ETAPAS_GDG:
+        idx_atual = ORDEM_ETAPAS_GDG.index(atual)
+    else:
+        seq = deal_stage.get("sequence")  # fallback: posição informada pela API, se vier
+        if isinstance(seq, int) and 1 <= seq <= len(ORDEM_ETAPAS_GDG):
+            idx_atual = seq - 1
+        else:
+            print(f"[gdg] Etapa atual fora da ordem mapeada ({deal_stage.get('name')!r}) deal={deal_id}", flush=True)
+            return False
+    idx_alvo = ORDEM_ETAPAS_GDG.index(alvo)
+    if idx_atual == idx_alvo:
+        return True
+    if not permitir_recuo and idx_atual >= idx_alvo:
+        print(f"[gdg] Etapa não movida: atual (idx={idx_atual}) já é igual/posterior ao alvo (idx={idx_alvo}) deal={deal_id}", flush=True)
+        return False
+    r = requests.put(f"{AGENDOR_BASE}/deals/{deal_id}/stage",
+                      headers={**HEADERS, "Content-Type": "application/json"},
+                      json={"dealStage": idx_alvo + 1, "funnel": FUNIL_GDG_ID}, timeout=15)
+    print(f"[gdg] Etapa -> {nome_etapa_alvo} (posição enviada={idx_alvo + 1}) deal={deal_id} "
+          f"status={r.status_code}", flush=True)
+    return r.status_code in (200, 201)
+
+
 def _retorno_exige_interacao() -> bool:
     """RETORNO_EXIGE_INTERACAO (desligada por padrão): 'Contato retornado' só quando o lead mandou algo
     além do texto padrão do botão de WhatsApp."""
@@ -9169,8 +9290,13 @@ def mover_para_contato_retornado_se_aplicavel(phone: str, conversation_id=None):
             if msgs_conv and not lead_interagiu(msgs_conv):
                 print(f"[contato_retornado] Só o texto padrão do botão — não move ainda conv={conversation_id}", flush=True)
                 return
-        _, deal = buscar_pessoa_e_negocio(phone)
+        pessoa, deal = buscar_pessoa_e_negocio(phone)
         if not deal:
+            # Funil GDG (DevFest 2026): sem régua; qualquer resposta do lead → Contato Retornado
+            if pessoa and pessoa.get("id") and conversa_veio_do_devfest(conversation_id):
+                deal_gdg = buscar_deal_gdg(pessoa["id"])
+                if deal_gdg:
+                    mover_etapa_gdg(deal_gdg["id"], "Contato Retornado")
             return
         etapa_atual_id = (deal.get("dealStage") or {}).get("id")
         if etapa_atual_id in (ETAPA_NOVO_LEAD, ETAPA_1_CONTATO, ETAPA_2_CONTATO,
