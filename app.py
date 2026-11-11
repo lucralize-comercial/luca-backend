@@ -4471,6 +4471,64 @@ def extrair_hora_explicita(texto: str):
     return None
 
 
+_RE_DATA_EXPLICITA = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
+
+
+def resolver_data_na_preferencia(texto, agora=None):
+    """Data (date) que o TEXTO da preferência já diz sozinho, sem IA: 'dd/mm' (ex.: 'quarta (18/11)'),
+    'hoje', 'amanhã', 'depois de amanhã'. None se não disser nenhuma.
+    Caso real (11/11/2026, conv 2881): o lead pediu 'hoje', a preferência ficou 'quarta-feira às 15h30'
+    e a IA devolveu a quarta SEGUINTE (18/11), criando a reunião uma semana depois."""
+    agora = agora or (datetime.utcnow() - timedelta(hours=3))
+    t = (texto or "").lower()
+    m = _RE_DATA_EXPLICITA.search(t)
+    if m:
+        dia, mes = int(m.group(1)), int(m.group(2))
+        ano = int(m.group(3)) if m.group(3) else agora.year
+        if ano < 100:
+            ano += 2000
+        try:
+            d = datetime(ano, mes, dia).date()
+            if not m.group(3) and d < agora.date():
+                d = datetime(ano + 1, mes, dia).date()
+            return d
+        except ValueError:
+            pass
+    if re.search(r"depois\s+de\s+amanh[ãa]", t):
+        return agora.date() + timedelta(days=2)
+    if re.search(r"\bamanh[ãa]\b", t):
+        return agora.date() + timedelta(days=1)
+    if re.search(r"\bhoje\b", t):
+        return agora.date()
+    return None
+
+
+def divergencia_com_oferta_do_luca(conv, dt_pedido, agora=None) -> str:
+    """Trava antes de criar a reunião: se o Luca ofereceu ao lead esse mesmo horário dizendo 'hoje',
+    'amanhã' ou 'depois de amanhã' e a data convertida não for essa, devolve o motivo (a reunião não é
+    criada e o caso vai para validação humana). Vazio se não houver divergência ou oferta com dia relativo."""
+    agora = agora or (datetime.utcnow() - timedelta(hours=3))
+    for m in reversed((conv or {}).get("messages") or []):
+        if m.get("role") != "assistant":
+            continue
+        txt = (m.get("content") or "").lower()
+        if extrair_hora_explicita(txt) != (dt_pedido.hour, dt_pedido.minute):
+            continue
+        if re.search(r"depois\s+de\s+amanh[ãa]", txt):
+            esperado, rotulo = agora.date() + timedelta(days=2), "depois de amanhã"
+        elif re.search(r"\bamanh[ãa]\b", txt):
+            esperado, rotulo = agora.date() + timedelta(days=1), "amanhã"
+        elif re.search(r"\bhoje\b", txt):
+            esperado, rotulo = agora.date(), "hoje"
+        else:
+            continue
+        if dt_pedido.date() != esperado:
+            return (f"a data convertida ({dt_pedido.strftime('%d/%m')}) diverge da oferta do Luca "
+                    f"('{rotulo}', {esperado.strftime('%d/%m')}) para o mesmo horário")
+        return ""
+    return ""
+
+
 def parse_preferencia_datetime(preferencia: str, tipo: str = "agendamento"):
     """Converte a preferência do lead ('terça às 12h10') em ISO usando o Claude.
     tipo: rótulo pro rastreamento de custo por hora (ver [usage-hora]) —
@@ -4487,12 +4545,22 @@ def parse_preferencia_datetime(preferencia: str, tipo: str = "agendamento"):
         return None
     try:
         agora_brt = datetime.utcnow() - timedelta(hours=3)
+        data_texto = resolver_data_na_preferencia(preferencia, agora_brt)
+        hora_texto = extrair_hora_explicita(preferencia)
+        if data_texto and hora_texto:
+            # Data e hora estão no próprio texto ('hoje às 15h30', 'quarta (18/11) às 15h'): sem IA.
+            iso_det = datetime(data_texto.year, data_texto.month, data_texto.day,
+                               hora_texto[0], hora_texto[1]).strftime("%Y-%m-%dT%H:%M")
+            print(f"[crm] preferencia='{preferencia}' -> iso={iso_det} (data e hora lidas do texto, sem IA)", flush=True)
+            return iso_det
         prompt = (
             f"Data e hora atuais em Brasília (BRT, UTC-3): {agora_brt.strftime('%Y-%m-%dT%H:%M')} "
             f"({agora_brt.strftime('%A')}).\n\n"
             "Converta a preferência de reunião abaixo para data e hora futuras no formato "
             "ISO exato AAAA-MM-DDTHH:MM (ex: 2026-07-15T10:00), usando a data atual acima como "
-            "referência. IMPORTANTE: o horário na preferência já está no horário local de "
+            "referência. REGRA DO DIA: 'hoje' é a data atual; 'amanhã' é o dia seguinte; se o dia da "
+            "semana pedido for o MESMO dia da semana de hoje e o horário ainda estiver à frente, a data "
+            "é HOJE (nunca a semana que vem). IMPORTANTE: o horário na preferência já está no horário local de "
             "Brasília (BRT) — responda no MESMO horário local, sem converter para UTC nem "
             "aplicar nenhum deslocamento de fuso. CRÍTICO: se a preferência mencionar só um "
             "período vago do dia (ex: 'de manhã', 'à tarde', 'à noite') SEM uma hora exata "
@@ -4509,8 +4577,13 @@ def parse_preferencia_datetime(preferencia: str, tipo: str = "agendamento"):
         resp = call_claude([{"role": "user", "content": prompt}], max_tokens=30, tipo="classificacao",
                            model="claude-haiku-4-5-20251001").strip()
         if "INDEFINIDA" in resp.upper():
+            print(f"[crm] preferencia='{preferencia}' -> INDEFINIDA (resposta do modelo='{resp[:40]}')", flush=True)
             return None
         dt_parseado = datetime.strptime(resp[:16], "%Y-%m-%dT%H:%M")
+        if data_texto and dt_parseado.date() != data_texto:
+            print(f"[crm] ⚠️ Data da IA ({dt_parseado.date()}) diverge da data do texto "
+                  f"('{preferencia}' -> {data_texto}) — usando a do texto", flush=True)
+            dt_parseado = dt_parseado.replace(year=data_texto.year, month=data_texto.month, day=data_texto.day)
 
         # A IA pode errar a hora mesmo com texto sem ambiguidade nenhuma —
         # já vimos isso acontecer de dois jeitos diferentes (confusão
@@ -4527,6 +4600,7 @@ def parse_preferencia_datetime(preferencia: str, tipo: str = "agendamento"):
                   f"{hora_explicita[1]:02d}) — corrigindo pra hora do texto", flush=True)
             dt_parseado = dt_parseado.replace(hour=hora_explicita[0], minute=hora_explicita[1])
 
+        print(f"[crm] preferencia='{preferencia}' -> resposta_ia='{resp[:20]}' iso={dt_parseado.strftime('%Y-%m-%dT%H:%M')}", flush=True)
         return dt_parseado.strftime("%Y-%m-%dT%H:%M")
     except Exception as e:
         print(f"[crm] Preferência não convertida ('{preferencia}'): {e}", flush=True)
@@ -4928,9 +5002,13 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                                 motivo_validacao = f"não foi possível validar a agenda automaticamente: {e}"
                                 ocupado = False
 
+                            motivo_divergencia = divergencia_com_oferta_do_luca(conv, dt_local)
                             if dt_local <= datetime.utcnow() - timedelta(hours=3):
                                 requer_validacao_time = True
                                 motivo_validacao = "o horário pedido já passou (o lead precisa de um novo horário)"
+                            elif motivo_divergencia:
+                                requer_validacao_time = True
+                                motivo_validacao = motivo_divergencia
                             elif ocupado:
                                 requer_validacao_time = True
                                 motivo_validacao = "horário solicitado já está ocupado na agenda do consultor"
@@ -5311,6 +5389,7 @@ Retorne APENAS o JSON, sem texto adicional.
 
 Conversa:
 {history_text}
+{contexto_data_atual()}
 
 Retorne este JSON (deixe em branco "" se não informado OU não puder ser inferido com segurança —
 NUNCA invente, deduza ou chute um valor plausível; vazio é sempre melhor que um palpite):
@@ -5337,6 +5416,7 @@ NUNCA invente, deduza ou chute um valor plausível; vazio é sempre melhor que u
 }}
 
 Campos de DADOS DO LEAD (extração direta, factual):
+"preferencia" = dia e horário pedidos pelo lead, SEMPRE com a data explícita entre parênteses, ex.: "hoje (11/11) às 15h30", "amanhã (12/11) às 10h", "quarta (18/11) às 15h30". NUNCA só o dia da semana. Use a data atual e a tabela de próximos dias; se o dia da semana pedido for o mesmo de hoje e o horário ainda estiver à frente, é HOJE. Sem horário exato, deixe vazio.
 "empresa_nome" = razão social ou nome fantasia da empresa, SOMENTE se o contato informar explicitamente; não usar o nome da pessoa como substituto.
 "empresa_situacao" = se o lead já tem CNPJ aberto ou vai abrir (ex: "Já possui CNPJ", "Vai abrir novo CNPJ", "Segundo CNPJ").
 "faturamento_aproximado" = valor ou faixa que o lead mencionou (ex: "~R$8mil/mês"). Só se ele disse um número, nunca estime.
@@ -5365,7 +5445,7 @@ Campos de INTELIGÊNCIA COMERCIAL (exigem mais cuidado — só preencha com evid
 Nunca use "0.0" nem "9.9" — são categorias administrativas da equipe, não algo pra você escolher.
 "resumo_conversa" = 1 a 2 frases resumindo o essencial da conversa até agora, em tom neutro e factual.
 
-Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-mail" | "Preferência informada: [dia] às [horário]" | "Agendamento confirmado" | "Perdido: [motivo breve]"
+Para status use: "Em qualificação" | "Interesse confirmado" | "Aguardando e-mail" | "Preferência informada: [dia (dd/mm)] às [horário]" | "Agendamento confirmado" | "Perdido: [motivo breve]"
 
 Use "Perdido: [motivo]" SÓ quando o lead disser explicitamente que não vai seguir (ex: "já fechei com outra empresa", "não tenho mais interesse", "vou resolver sozinho") — nunca infira isso por silêncio ou tom.
 """
