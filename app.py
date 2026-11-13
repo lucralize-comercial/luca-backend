@@ -1056,7 +1056,7 @@ def contexto_campanha_cct(conversation_id) -> str:
     return ""
 
 
-def buscar_eventos_do_dia_organizador(dt_dia: datetime) -> list:
+def buscar_eventos_do_dia_organizador(dt_dia: datetime, tentativas: int = 1) -> list:
     """Busca os eventos reais do dia inteiro na agenda do organizador
     ([especialista]) via Microsoft Graph — 1 chamada só, depois os slots livres
     são calculados localmente em Python (barato, sem nova chamada por
@@ -1073,8 +1073,23 @@ def buscar_eventos_do_dia_organizador(dt_dia: datetime) -> list:
         "$select": "subject,start,end",
         "$top": "50",
     }
-    r = requests.get(f"https://graph.microsoft.com/v1.0/users/{TEAMS_ORGANIZADOR}/calendarView",
-                      headers=headers, params=params, timeout=20)
+    r = None
+    for tentativa in range(1, max(1, tentativas) + 1):
+        try:
+            r = requests.get(f"https://graph.microsoft.com/v1.0/users/{TEAMS_ORGANIZADOR}/calendarView",
+                              headers=headers, params=params, timeout=20)
+            if r.status_code < 500:
+                break
+            erro_agenda = f"HTTP {r.status_code}"
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            erro_agenda = str(e)
+            r = None
+        if tentativa >= max(1, tentativas):
+            if r is None:
+                raise requests.exceptions.Timeout(erro_agenda)
+            break
+        print(f"[agenda] Graph falhou ({erro_agenda[:80]}), tentando de novo ({tentativa}/{tentativas})", flush=True)
+        time.sleep(3)
     r.raise_for_status()
     eventos = []
     for ev in r.json().get("value", []):
@@ -4451,6 +4466,7 @@ def reuniao_foi_agendada_pela_liz(deal_id):
 
 
 PADRAO_HORA_EXPLICITA = re.compile(r"\b(\d{1,2})\s?[:h]\s?(\d{2})?\b", re.IGNORECASE)
+PADRAO_HORA_SEM_H = re.compile(r"\b[àa]s\s+(\d{1,2})\b(?!\s*(?:h\b|:|/|\d|pessoas?|vezes|anos?|mil\b|reais))", re.IGNORECASE)
 
 def extrair_hora_explicita(texto: str):
     """Extrai (hora, minuto) de um horário EXPLÍCITO e inequívoco no texto
@@ -4463,6 +4479,10 @@ def extrair_hora_explicita(texto: str):
     isso). Retorna None se não achar um padrão claro de horário no texto."""
     m = PADRAO_HORA_EXPLICITA.search(texto or "")
     if not m:
+        # "amanhã às 15" (sem o "h"): só vale entre 6 e 20, para não confundir "às 3" (manhã ou tarde?)
+        m2 = PADRAO_HORA_SEM_H.search(texto or "")
+        if m2 and 6 <= int(m2.group(1)) <= 20:
+            return (int(m2.group(1)), 0)
         return None
     hora = int(m.group(1))
     minuto = int(m.group(2)) if m.group(2) else 0
@@ -4919,7 +4939,7 @@ def registrar_no_crm(conv, conversation_id, contact_name):
                     try:
                         with _TEAMS_AGENDAMENTO_LOCK:
                             try:
-                                eventos_finais = buscar_eventos_do_dia_organizador(dt_local)
+                                eventos_finais = buscar_eventos_do_dia_organizador(dt_local, tentativas=2)
                                 fim_local = dt_local + timedelta(minutes=30)
                                 ocupado = any(dt_local < ev_fim and fim_local > ev_ini
                                               for ev_ini, ev_fim in eventos_finais)
@@ -6300,6 +6320,12 @@ def agendorchat_webhook():
             if conv_humano:
                 conv_humano["was_resolved"] = False
                 conv_humano["last_msg_at"] = time.time()
+                # O lead RESPONDEU: a cobrança de silêncio (cenários B e C) não vale mais. Sem isto, o
+                # cronômetro do C seguia contando e cobrava quem já tinha respondido (caso Luan: "OK").
+                conv_humano["humano_aguardando_desde"] = None
+                conv_humano["followup_humano_enviado"] = False
+                conv_humano["luca_aguardando_desde"] = None
+                conv_humano["followup_1h_enviado"] = False
             return jsonify({}), 200
 
         # ── Extrai campos do payload ──────────────────────────────────────────
@@ -6757,6 +6783,11 @@ def verificar_leads_parados():
             continue
         parado_ha = agora - last_msg_at
         if parado_ha < LEADS_PARADOS_MINUTOS * 60 or parado_ha > 86400:
+            continue
+        # Mesma janela de 1h do humano do webhook: sem isto, esta varredura (30 min) retomava por cima de
+        # uma pessoa que tinha acabado de escrever (caso Arthur: o Luca respondeu o "Tudo certo" do cliente).
+        segundos_humano = segundos_desde_ultima_intervencao_humana(conversation_id)
+        if segundos_humano is not None and segundos_humano < 3600:
             continue
         if tentar_retomar_conversa(conversation_id, origem="leads_parados"):
             print(f"[leads_parados] Lead estava parado há {int(parado_ha/60)}min, "
@@ -9057,6 +9088,179 @@ def verificar_reforco_saudacao_safe():
         print(f"[reforco-saudacao] Erro geral na varredura: {e}", flush=True)
 
 
+AGENDA_RETRY_ESPERA_MIN = int(os.environ.get("AGENDA_RETRY_ESPERA_MIN", "20"))
+AGENDA_RETRY_ANTECEDENCIA_MIN = int(os.environ.get("AGENDA_RETRY_ANTECEDENCIA_MIN", "30"))
+_RE_VALIDAR_HORARIO = re.compile(r"\[luca:validar_horario:(\d+):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})\]")
+_agenda_retry_logados = set()
+
+
+def _agenda_retry_ativo() -> bool:
+    return _flag("AGENDA_RETRY_ATIVO", "true")
+
+
+def _agenda_retry_ensaio() -> bool:
+    return _flag("AGENDA_RETRY_ENSAIO", "true")
+
+
+def dados_do_lead_na_conversa(msgs):
+    """(nome, e-mail, segmento) lidos da nota '📋 DADOS DO LEAD' mais recente que tenha e-mail."""
+    for m in reversed(msgs or []):
+        txt = m.get("content") or ""
+        if "DADOS DO LEAD" not in txt:
+            continue
+        email = re.search(r"E-mail:\s*([^\s]+@[^\s]+)", txt)
+        if not email:
+            continue
+        nome = re.search(r"Nome:\s*(.+)", txt)
+        seg = re.search(r"Segmento:\s*(.+)", txt)
+        return ((nome.group(1).strip() if nome else ""), email.group(1).strip().rstrip(".,;)"),
+                (seg.group(1).strip() if seg else ""))
+    return ("", "", "")
+
+
+def agendamento_pendente_na_conversa(conversation_id, msgs):
+    """(dt_iso, marcador, criado_em) do último pedido de validação de horário que foi para o time por
+    FALHA DA AGENDA (timeout da Microsoft) e ainda não teve desfecho; None se não houver."""
+    ultimo = None
+    for m in msgs or []:
+        txt = m.get("content") or ""
+        mk = _RE_VALIDAR_HORARIO.search(txt)
+        if mk and "não foi possível validar a agenda" in txt:
+            ultimo = (mk.group(2), mk.group(0), m.get("created_at"))
+    if not ultimo:
+        return None
+    desfecho = f"[luca:agenda_retry:{conversation_id}:{ultimo[0]}]"
+    if any(desfecho in (m.get("content") or "") for m in msgs or []):
+        return None
+    return ultimo
+
+
+def _ids_conversas_abertas():
+    ids = []
+    for pagina in (1, 2, 3):
+        url = (f"{AGENDORCHAT_BASE}/accounts/{AGENDORCHAT_ACCOUNT_ID}/conversations"
+               f"?status=open&assignee_type=all&page={pagina}")
+        resp = requests.get(url, headers={"api_access_token": AGENDORCHAT_TOKEN}, timeout=15)
+        resp.raise_for_status()
+        dados = resp.json().get("data") or {}
+        lista = dados.get("payload") or []
+        for c in lista:
+            try:
+                if int(c.get("inbox_id") or 0) in INBOXES_IGNORADOS:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            ids.append(c.get("id"))
+        if len(lista) < 25:
+            break
+    return [i for i in ids if i]
+
+
+def _retentar_agendamento_da_conversa(conversation_id, agora_brt):
+    msgs = mensagens_da_conversa(conversation_id)
+    pend = agendamento_pendente_na_conversa(conversation_id, msgs)
+    if not pend:
+        return
+    dt_iso, _marcador, criado_em = pend
+    dt = datetime.strptime(dt_iso, "%Y-%m-%dT%H:%M")
+    if dt <= agora_brt + timedelta(minutes=AGENDA_RETRY_ANTECEDENCIA_MIN):
+        return  # tarde demais para criar sozinho: fica com o time
+    try:
+        if criado_em and time.time() - float(criado_em) < AGENDA_RETRY_ESPERA_MIN * 60:
+            return  # deixa a pessoa do time tentar primeiro
+    except (TypeError, ValueError):
+        pass
+    segundos_humano = segundos_desde_ultima_intervencao_humana(conversation_id)
+    if segundos_humano is not None and segundos_humano < 900:
+        return  # alguém do time escreveu agora há pouco: não atropela
+    nome, email, segmento = dados_do_lead_na_conversa(msgs)
+    if not email:
+        return
+    detalhe = get_conversation_details(conversation_id) or {}
+    phone = ((detalhe.get("meta") or {}).get("sender") or {}).get("phone_number", "")
+    if not phone:
+        return
+    person, deal = buscar_pessoa_e_negocio(phone)
+    if not deal:
+        return
+    deal_id = deal.get("id")
+    reuniao_real_marcador = f"[luca:reuniao_real:{conversation_id}]"
+    if deal_tem_marca(deal_id, reuniao_real_marcador):
+        return
+    desfecho = f"[luca:agenda_retry:{conversation_id}:{dt_iso}]"
+    with _TEAMS_AGENDAMENTO_LOCK:
+        try:
+            eventos = buscar_eventos_do_dia_organizador(dt, tentativas=2)
+        except Exception as e:
+            print(f"[agenda-retry] agenda ainda indisponível conv={conversation_id}: {str(e)[:120]}", flush=True)
+            return
+        fim = dt + timedelta(minutes=30)
+        if any(dt < ev_fim and fim > ev_ini for ev_ini, ev_fim in eventos):
+            if _agenda_retry_ensaio():
+                chave = (conversation_id, dt_iso, "ocupado")
+                if chave not in _agenda_retry_logados:
+                    _agenda_retry_logados.add(chave)
+                    print(f"[agenda-retry][ENSAIO] horário já ocupado na agenda, não criaria conv={conversation_id} "
+                          f"{dt_iso}", flush=True)
+                return
+            send_private_note(conversation_id, (
+                f"ℹ️ A agenda voltou e o horário {dt.strftime('%d/%m às %H:%M')} já está ocupado (ou a reunião foi "
+                f"criada à mão). O Luca não cria outra reunião; o time segue com o caso. {desfecho}"))
+            print(f"[agenda-retry] horário ocupado — não cria conv={conversation_id} {dt_iso}", flush=True)
+            return
+        if _agenda_retry_ensaio():
+            chave = (conversation_id, dt_iso, "livre")
+            if chave not in _agenda_retry_logados:
+                _agenda_retry_logados.add(chave)
+                print(f"[agenda-retry][ENSAIO] agenda disponível e horário livre: CRIARIA a reunião conv={conversation_id} "
+                      f"deal={deal_id} {dt_iso} e mandaria o link ao lead", flush=True)
+            return
+        resultado = create_teams_meeting(nome or "Lead", email, dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                                         detectar_linha_negocio(segmento))
+        link = (resultado or {}).get("join_url")
+        if not link:
+            print(f"[agenda-retry] Teams não devolveu o link conv={conversation_id} — tenta no próximo ciclo", flush=True)
+            return
+        owner_id = (deal.get("owner") or {}).get("id")
+        payload = {"text": ("[Luca] Reunião com especialista — criada automaticamente depois da instabilidade "
+                            f"da agenda. Link da reunião (Teams): {link}\n{reuniao_real_marcador}"),
+                   "type": "reuniao", "due_date": dt.strftime("%Y-%m-%dT%H:%M:%S")}
+        if owner_id:
+            payload["assigned_users"] = [int(owner_id)]
+        r = requests.post(f"{AGENDOR_BASE}/deals/{deal_id}/tasks", headers={**HEADERS, "Content-Type": "application/json"},
+                          json=payload, timeout=15)
+        print(f"[agenda-retry] ✅ Reunião criada conv={conversation_id} deal={deal_id} {dt_iso} "
+              f"tarefa_status={r.status_code}", flush=True)
+        send_private_note(conversation_id, (
+            f"✅ A agenda voltou e o Luca criou a reunião de {dt.strftime('%d/%m às %H:%M')} e enviou o link ao lead. "
+            f"{desfecho}"))
+    primeiro = (nome or "").split(" ")[0] or "tudo certo"
+    send_agendorchat_message(conversation_id, remover_travessao(
+        f"Consegui deixar tudo pronto, {primeiro}! Aqui está o link da nossa videochamada:\n{link}\n\n"
+        f"Qualquer dúvida antes, estou por aqui."))
+
+
+def retentar_agendamentos_pendentes():
+    """Quando a agenda da Microsoft falha e o horário vai para o time, tenta de novo a cada 10 min:
+    se a agenda voltou e o horário NÃO consta nela (ninguém criou à mão), cria a reunião no Teams e
+    manda o link. Se o horário já está ocupado, não cria e deixa nota. Em ensaio (padrão) só registra."""
+    if not _agenda_retry_ativo():
+        return
+    agora_brt = datetime.utcnow() - timedelta(hours=3)
+    for conversation_id in _ids_conversas_abertas():
+        try:
+            _retentar_agendamento_da_conversa(conversation_id, agora_brt)
+        except Exception as e:
+            print(f"[agenda-retry] Erro conv={conversation_id}: {e}", flush=True)
+
+
+def retentar_agendamentos_pendentes_safe():
+    try:
+        retentar_agendamentos_pendentes()
+    except Exception as e:
+        print(f"[agenda-retry] Erro geral na varredura: {e}", flush=True)
+
+
 def verificar_followup_4h_silencio_humano_safe():
     try:
         verificar_followup_4h_silencio_humano()
@@ -11042,6 +11246,7 @@ scheduler.add_job(verificar_followup_4h_silencio_humano_safe, "interval", minute
 scheduler.add_job(verificar_reforco_saudacao_safe, "interval", minutes=10, id="reforco_saudacao")
 scheduler.add_job(verificar_retomada_apos_silencio_humano_safe, "interval", minutes=15, id="retomada_apos_silencio_humano")
 scheduler.add_job(verificar_leads_parados_safe, "interval", minutes=15, id="leads_parados")
+scheduler.add_job(retentar_agendamentos_pendentes_safe, "interval", minutes=10, id="agenda_retry")
 scheduler.add_job(verificar_followup_dias_silencio_safe, "interval", hours=3, id="followup_dias_silencio")
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "interval", hours=3, id="reconciliar_perdidos_d10")
 scheduler.add_job(verificar_perdidos_d10_travados_safe, "date", run_date=datetime.now() + timedelta(minutes=2), id="reconciliar_perdidos_d10_inicial")
