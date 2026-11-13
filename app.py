@@ -7245,14 +7245,11 @@ GUARDA_VALIDACAO_HORAS = 24
 
 
 def guarda_de_cobranca(conversation_id, cenario, msgs=None, detalhe=None):
-    """(permitido, motivo). Só fatos: quem está atribuído, quem falou por último e se o time ficou de
-    retornar sobre um horário. Em dúvida (erro), NÃO cobra: silêncio custa menos do que cobrar errado."""
+    """(permitido, motivo). Só fatos: quem falou por último e se o time ficou de retornar sobre um horário.
+    Quem está atribuído NÃO entra: o cenário C é justamente "uma pessoa escreveu e o lead sumiu", e a pessoa
+    quase sempre está atribuída. Em dúvida (erro), NÃO cobra: silêncio custa menos do que cobrar errado."""
     try:
         msgs = msgs if msgs is not None else mensagens_da_conversa(conversation_id)
-        detalhe = detalhe if detalhe is not None else (get_conversation_details(conversation_id) or {})
-        assignee = (detalhe.get("meta") or {}).get("assignee")
-        if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
-            return False, f"atribuída a {assignee.get('name') or 'uma pessoa'}: a vez é do time"
         dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")
                    and (m.get("content") or "").strip()
                    and not (m.get("additional_attributes") or {}).get("automation_id")]
@@ -7303,8 +7300,8 @@ def contexto_da_conversa(msgs, max_chars=3000) -> str:
     return ("[CONTEXTO INTERNO, não cite nem copie isto ao lead; use só para saber o que já foi combinado e não "
             "repetir perguntas. Se uma nota diz que o horário já foi combinado e o lead não viu a confirmação, "
             "confirme com ele em vez de perguntar de novo. Se diz que o time ficou de retornar, não cobre nem "
-            "prometa nada pelo time. Só diga que a reunião está confirmada se houver o link dela na conversa; "
-            "senão diga que o time confirma. Não afirme fatos que não estejam na conversa ou aqui.]\n"
+            "prometa nada pelo time. Se o time disse que o horário está reservado, pode confirmar esse horário; "
+            "só não diga que o convite já foi enviado sem o link. Não afirme fatos que não estejam na conversa ou aqui.]\n"
             f"Notas internas:\n{corpo}\n[FIM DO CONTEXTO INTERNO]")
 
 
