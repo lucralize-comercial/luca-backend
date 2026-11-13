@@ -6509,7 +6509,14 @@ def agendorchat_webhook():
 
         # ── Detecta reabertura após encerramento — reseta para novo atendimento ─
         if conv.get("was_resolved"):
-            print(f"[webhook] Conversa reaberta após encerramento — resetando histórico conv={conversation_id}", flush=True)
+            continuar_reabertura = _reabertura_continua()
+            mesmo_dia_reabertura = reabertura_no_mesmo_dia(conv.get("last_msg_at"))
+            print(f"[webhook] Conversa reaberta após encerramento — "
+                  f"{'continuando com o histórico' if continuar_reabertura else 'resetando histórico'} "
+                  f"(mesmo dia={'sim' if mesmo_dia_reabertura else 'não'}) conv={conversation_id}", flush=True)
+            if not continuar_reabertura and _contexto_ativo():
+                print(f"[contexto][ENSAIO] com a chave ligada o Luca releria o histórico e as notas e continuaria "
+                      f"de onde parou, sem recomeçar conv={conversation_id}", flush=True)
             extra = ""
             if contact_name:
                 extra += f"\n\nINFORMAÇÃO DO CONTATO: o lead se chama {contact_name}."
@@ -6520,9 +6527,18 @@ def agendorchat_webhook():
             # sempre "user", e um array começando com "assistant" causava
             # respostas vazias (stop_reason=end_turn, content=[]). A instrução
             # de dar boas-vindas de volta vai só no system prompt.
-            extra += (" Esta conversa foi reaberta após um atendimento anterior "
-                      "ter sido encerrado — cumprimente o lead calorosamente, "
-                      "como quem dá boas-vindas de volta, antes de seguir normalmente.")
+            if continuar_reabertura:
+                extra += (" Esta conversa foi marcada como concluída pela equipe, mas a demanda pode continuar: "
+                          "leia TODO o histórico e as notas, identifique o que ficou pendente e continue exatamente dali. "
+                          "NÃO recomece o atendimento e NÃO peça de novo dados já informados (e-mail, telefone, horário).")
+                if not mesmo_dia_reabertura:
+                    extra += " Se o lead cumprimentar, cumprimente brevemente de volta, sem festa, antes de retomar."
+                else:
+                    extra += " Não cumprimente de novo: continue a conversa."
+            else:
+                extra += (" Esta conversa foi reaberta após um atendimento anterior "
+                          "ter sido encerrado — cumprimente o lead calorosamente, "
+                          "como quem dá boas-vindas de volta, antes de seguir normalmente.")
             # Checa o estado REAL da reunião no CRM (não confia só no que está
             # escrito no histórico de mensagens, que pode estar desatualizado
             # se muito tempo passou). Barato: sem chamada ao Claude.
@@ -6556,7 +6572,8 @@ def agendorchat_webhook():
                 # Evita que o bloco abaixo ("se memória vazia, busca histórico
                 # remoto") traga de volta o histórico antigo — o reset é
                 # intencional, o array vazio aqui é o estado desejado.
-                "skip_remote_fetch": True,
+                "skip_remote_fetch": not continuar_reabertura,
+                "reaberta_continuacao": continuar_reabertura,
             }
             conv = conversation_histories[conv_key]
             if contact_phone:
@@ -6586,10 +6603,11 @@ def agendorchat_webhook():
         continuidade_ctx = False
         if (not conv["messages"] or recarregar) and not conv.get("skip_remote_fetch"):
             remote_history = fetch_conversation_history(conversation_id)
+            reaberta_continuacao = conv.pop("reaberta_continuacao", False)
             if remote_history:
                 print(f"[history] Recuperados {len(remote_history)} msgs da conv={conversation_id}"
-                      f"{' (continuidade)' if recarregar else ''}", flush=True)
-                if recarregar:
+                      f"{' (continuidade)' if recarregar else ''}{' (reabertura)' if reaberta_continuacao else ''}", flush=True)
+                if recarregar or reaberta_continuacao:
                     remote_history = _sem_mensagem_atual(remote_history, message_text)
                     continuidade_ctx = True
                 conv["messages"] = remote_history
@@ -7095,6 +7113,29 @@ def _cenarios_ativos() -> bool:
 
 def _continuidade_ativa() -> bool:
     return _flag("CONTINUIDADE_ATENDIMENTO_ATIVO", "false")
+
+
+# Reabertura de conversa concluída (caso Luan, 13/11/2026): a equipe às vezes conclui antes de a demanda
+# acabar, então quando o lead volta é CONTINUAÇÃO. Com a chave do contexto único ligada (fora do ensaio),
+# o Luca relê o histórico e as notas em vez de começar do zero. Mesmo dia = sem saudação especial; a folga
+# cobre a virada do dia (lead que falou às 23:59 e volta às 00:01).
+REABERTURA_VIRADA_HORAS = float(os.environ.get("REABERTURA_VIRADA_HORAS", "3"))
+
+
+def _reabertura_continua() -> bool:
+    return _contexto_ativo() and not _contexto_ensaio()
+
+
+def reabertura_no_mesmo_dia(ultima_ts, agora_ts=None) -> bool:
+    """True se a conversa voltou no mesmo dia (horário de Brasília) da última interação, ou com menos de
+    REABERTURA_VIRADA_HORAS de diferença (virada do dia). Sem a hora da última interação: False."""
+    if not ultima_ts:
+        return False
+    agora = datetime.utcfromtimestamp(agora_ts if agora_ts is not None else time.time()) - timedelta(hours=3)
+    ultima = datetime.utcfromtimestamp(float(ultima_ts)) - timedelta(hours=3)
+    if agora < ultima:
+        return True
+    return ultima.date() == agora.date() or (agora - ultima) <= timedelta(hours=REABERTURA_VIRADA_HORAS)
 
 
 FOLLOWUP_A_MINUTOS = int(os.environ.get("FOLLOWUP_A_MINUTOS", "120"))
