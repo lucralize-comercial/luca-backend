@@ -5314,11 +5314,30 @@ def fetch_conversation_history(conversation_id: int) -> list:
             else:
                 history.append({"role": role, "content": content})
 
-        # A API da Anthropic exige que a primeira mensagem seja do user —
-        # descarta turnos iniciais do assistant (ex: template disparado antes
-        # da primeira mensagem do lead)
-        while history and history[0]["role"] == "assistant":
-            history.pop(0)
+        # A API da Anthropic exige que a primeira mensagem seja do user.
+        contexto_ativo = _contexto_ativo()
+        if contexto_ativo and not _contexto_ensaio():
+            # Não descarta o template inicial (o Luca precisa saber o que a Lucralize já disse):
+            # antepõe um turno do lead com o contexto das notas.
+            contexto = contexto_da_conversa(messages)
+            if history and history[0]["role"] == "assistant":
+                history.insert(0, {"role": "user", "content": (contexto + "\n\n" if contexto else "")
+                                   + "[Início do atendimento: a Lucralize enviou a mensagem abaixo antes de o lead escrever.]"})
+            elif history and contexto:
+                history[0] = {"role": "user", "content": contexto + "\n\n" + history[0]["content"]}
+        else:
+            # descarta turnos iniciais do assistant (ex: template disparado antes da primeira mensagem do lead)
+            descartados = 0
+            while history and history[0]["role"] == "assistant":
+                history.pop(0)
+                descartados += 1
+            if contexto_ativo and conversation_id not in _contexto_logados:
+                notas_ctx = contexto_da_conversa(messages)
+                if descartados or notas_ctx:
+                    _contexto_logados.add(conversation_id)
+                    print(f"[contexto][ENSAIO] o histórico passaria a incluir: mensagem inicial da Lucralize="
+                          f"{'sim' if descartados else 'não'}, notas={'sim (' + str(len(notas_ctx)) + ' car.)' if notas_ctx else 'não'} "
+                          f"conv={conversation_id}", flush=True)
 
         return history
     except Exception as e:
@@ -7199,6 +7218,96 @@ def _followup_mensagem_gerada_ensaio() -> bool:
     return os.environ.get("FOLLOWUP_MENSAGEM_GERADA_ENSAIO", "true").strip().lower() not in _VALORES_DESLIGADO
 
 
+# ── Guarda de cobrança + contexto único da conversa (11-13/11/2026, casos Arthur, Luan, Flavia) ─────────
+# A guarda responde "de quem é a vez?" só com fatos, sem IA. Em ensaio (padrão) só registra no log o que
+# bloquearia. O contexto (notas do time e do Luca) vai ao histórico, à IA "parada ou fechada" e às
+# cobranças geradas; em ensaio só registra o que mudaria.
+def _guarda_ativa() -> bool:
+    return _flag("GUARDA_COBRANCA_ATIVO", "true")
+
+
+def _guarda_ensaio() -> bool:
+    return os.environ.get("GUARDA_COBRANCA_ENSAIO", "true").strip().lower() not in _VALORES_DESLIGADO
+
+
+def _contexto_ativo() -> bool:
+    return _flag("CONTEXTO_CONVERSA_ATIVO", "true")
+
+
+def _contexto_ensaio() -> bool:
+    return os.environ.get("CONTEXTO_CONVERSA_ENSAIO", "true").strip().lower() not in _VALORES_DESLIGADO
+
+
+_guarda_logados = set()
+_contexto_logados = set()
+_RE_MARCADORES_NOTA = re.compile(r"\[(?:luca|followup|lembrete):[^\]]*\]")
+GUARDA_VALIDACAO_HORAS = 24
+
+
+def guarda_de_cobranca(conversation_id, cenario, msgs=None, detalhe=None):
+    """(permitido, motivo). Só fatos: quem está atribuído, quem falou por último e se o time ficou de
+    retornar sobre um horário. Em dúvida (erro), NÃO cobra: silêncio custa menos do que cobrar errado."""
+    try:
+        msgs = msgs if msgs is not None else mensagens_da_conversa(conversation_id)
+        detalhe = detalhe if detalhe is not None else (get_conversation_details(conversation_id) or {})
+        assignee = (detalhe.get("meta") or {}).get("assignee")
+        if assignee and assignee.get("type") == "user" and not eh_assignee_bot(assignee):
+            return False, f"atribuída a {assignee.get('name') or 'uma pessoa'}: a vez é do time"
+        dialogo = [m for m in msgs if m.get("message_type") in (0, 1, 3) and not m.get("private")
+                   and (m.get("content") or "").strip()
+                   and not (m.get("additional_attributes") or {}).get("automation_id")]
+        if dialogo and dialogo[-1].get("message_type") == 0:
+            return False, "o lead falou por último: a vez não é dele"
+        for m in reversed(msgs):
+            if m.get("private") and "[luca:validar_horario:" in (m.get("content") or ""):
+                criado = float(m.get("created_at") or 0)
+                if criado and time.time() - criado < GUARDA_VALIDACAO_HORAS * 3600:
+                    return False, "o time ficou de retornar sobre o horário (nota de validação)"
+                break
+        return True, ""
+    except Exception as e:
+        return False, f"não foi possível checar ({type(e).__name__}): em dúvida, não cobra"
+
+
+def aplicar_guarda_cobranca(conversation_id, cenario) -> bool:
+    """True = a cobrança pode seguir. Em ensaio nunca bloqueia (só registra uma vez por motivo)."""
+    if not _guarda_ativa():
+        return True
+    permitido, motivo = guarda_de_cobranca(conversation_id, cenario)
+    if permitido:
+        return True
+    ensaio = _guarda_ensaio()
+    chave = (conversation_id, cenario, motivo)
+    if chave not in _guarda_logados:
+        _guarda_logados.add(chave)
+        print(f"[guarda]{'[ENSAIO]' if ensaio else ''} cobrança do cenário {cenario} "
+              f"{'BLOQUEARIA' if ensaio else 'bloqueada'} conv={conversation_id}: {motivo}", flush=True)
+    return True if ensaio else False
+
+
+def contexto_da_conversa(msgs, max_chars=3000) -> str:
+    """Notas privadas (do time e do Luca) como contexto, sem marcadores técnicos. Vazio se não houver."""
+    notas = []
+    for m in sorted(msgs or [], key=lambda x: x.get("id") or 0):
+        if not m.get("private"):
+            continue
+        txt = _RE_MARCADORES_NOTA.sub("", (m.get("content") or "")).strip()
+        if len(txt) < 15 or txt.startswith("Saudação inicial enviada") or txt.startswith("💬 Conversa via Luca"):
+            continue
+        limite = 1200 if "DADOS DO LEAD" in txt else 600
+        notas.append(txt[:limite])
+    notas = notas[-5:]
+    if not notas:
+        return ""
+    corpo = "\n---\n".join(notas)[-max_chars:]
+    return ("[CONTEXTO INTERNO, não cite nem copie isto ao lead; use só para saber o que já foi combinado e não "
+            "repetir perguntas. Se uma nota diz que o horário já foi combinado e o lead não viu a confirmação, "
+            "confirme com ele em vez de perguntar de novo. Se diz que o time ficou de retornar, não cobre nem "
+            "prometa nada pelo time. Só diga que a reunião está confirmada se houver o link dela na conversa; "
+            "senão diga que o time confirma. Não afirme fatos que não estejam na conversa ou aqui.]\n"
+            f"Notas internas:\n{corpo}\n[FIM DO CONTEXTO INTERNO]")
+
+
 def escolher_texto_followup(conversation_id, primeiro_nome, quem_falou_por_ultimo, texto_fixo) -> str:
     """Texto que vai ao lead nos cenários B e C. Sem a flag: o fixo. Com a flag e em ensaio: gera,
     registra e envia o fixo. Com a flag e fora do ensaio: o gerado (ou o fixo se falhar/reprovar)."""
@@ -7256,8 +7365,10 @@ def texto_followup_gerado(conversation_id, primeiro_nome, quem_falou_por_ultimo)
         transcript = "\n".join(
             f"{'Lead' if m.get('message_type') == 0 else 'Atendimento'}: {(m.get('content') or '').replace(LUCA_MARKER, '').strip()}"
             for m in ultimas)
+        contexto_notas = contexto_da_conversa(msgs) if _contexto_ativo() else ""
         prompt = (
             f"Conversa até agora:\n\n{transcript}\n\n"
+            f"{contexto_notas + chr(10) + chr(10) if contexto_notas else ''}"
             f"A última mensagem foi de {quem} e o lead não respondeu. Primeiro nome do lead: "
             f"{primeiro_nome or '(desconhecido)'}.\n\nEscreva a mensagem de retomada, seguindo estas regras:\n"
             "- 1 ou 2 frases curtas, tom de WhatsApp.\n"
@@ -7267,6 +7378,8 @@ def texto_followup_gerado(conversation_id, primeiro_nome, quem_falou_por_ultimo)
             "pedir só o dia).\n"
             "- Use o primeiro nome no máximo uma vez e não abra com cumprimento (\"Oi\", \"Olá\"): a conversa já está em andamento.\n"
             "- Não sugira dia ou horário específico, deixe o lead escolher. Não fale de preço, desconto ou promessa.\n"
+            "- Não afirme nada que não esteja na conversa ou no contexto (por exemplo, que o sistema normalizou, "
+            "que algo foi enviado ou que algo foi confirmado).\n"
             "- Não use: \"você ainda está por aí\", \"momento ruim\", pedido de desculpa, emoji, link.")
         texto = call_claude([{"role": "user", "content": prompt}], max_tokens=150,
                             system=SYSTEM_FOLLOWUP_GERADO, tentativas=2, tipo="outro")
@@ -8862,7 +8975,25 @@ Responda apenas com uma palavra: PARADA ou FECHADA."""
             system="Você classifica o estado de conversas comerciais. Responda só com uma palavra: PARADA ou FECHADA.",
             model="claude-haiku-4-5-20251001", tipo="classificacao"
         )
-        return "PARADA" in resposta.upper()
+        parada = "PARADA" in resposta.upper()
+        if parada and _contexto_ativo():
+            contexto = contexto_da_conversa(msgs)
+            if contexto:
+                resposta2 = call_claude(
+                    [{"role": "user", "content": prompt.replace("A conversa está genuinamente PARADA",
+                                                                 contexto + "\n\nA conversa está genuinamente PARADA", 1)}],
+                    max_tokens=10,
+                    system="Você classifica o estado de conversas comerciais. Responda só com uma palavra: PARADA ou FECHADA.",
+                    model="claude-haiku-4-5-20251001", tipo="classificacao")
+                parada_com_contexto = "PARADA" in resposta2.upper()
+                if _contexto_ensaio():
+                    if not parada_com_contexto:
+                        print(f"[contexto][ENSAIO] com as notas a conversa seria FECHADA (cobrança evitada) "
+                              f"conv={conversation_id}", flush=True)
+                elif not parada_com_contexto:
+                    print(f"[contexto] conversa fechada segundo as notas — cobrança evitada conv={conversation_id}", flush=True)
+                    return False
+        return parada
     except Exception as e:
         print(f"[followup1h] Erro ao classificar conversa conv={conversation_id}: {e}", flush=True)
         return True  # fail-open: em erro, mantém comportamento anterior (permite envio)
@@ -9033,6 +9164,8 @@ def verificar_followup_1h_silencio():
             print(f"[followup1h] Pulado — humano atribuído conv={conversation_id}", flush=True)
             continue
 
+        if not aplicar_guarda_cobranca(conversation_id, "B"):
+            continue
         if not conversa_parece_estagnada(conversation_id):
             print(f"[followup1h] Pulado — conversa parece concluída naturalmente conv={conversation_id}", flush=True)
             continue
@@ -9124,6 +9257,8 @@ def verificar_followup_4h_silencio_humano():
         if status == "resolved":
             continue
 
+        if not aplicar_guarda_cobranca(conversation_id, "C"):
+            continue
         if not conversa_parece_estagnada(conversation_id):
             print(f"[followup4h] Pulado — conversa parece concluída naturalmente conv={conversation_id}", flush=True)
             continue
